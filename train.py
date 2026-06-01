@@ -84,14 +84,23 @@ use_attnres = False
 attnres_mode = "block"  # "full" or "block"
 attnres_num_blocks = 6  # N blocks for block mode (N≈8 in paper); full mode ignores this
 track_attnres = False   # Track and log AttnRes attention weights to wandb
-# optimizer (AdamW settings)
+# optimizer (Muon + AdamW settings)
+muon_lr = 0.01
 adamw_lr= 0.003
 max_steps = 38147
 max_tokens = int(10e9)
+muon_weight_decay = 0.1
 adamw_weight_decay = 0.0
+cautious = True
 beta1 = 0.9
 beta2 = 0.95
+muon_momentum = 0.95
 grad_clip = 1.0
+# Momentum warmup/cooldown settings
+muon_momentum_warmup_steps = 100
+muon_momentum_cooldown_steps = 100
+muon_momentum_min = 0.85
+muon_momentum_max = 0.95
 # Cross Entropy Loss
 ignore_index = -100
 reduction = "mean"
@@ -118,9 +127,23 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 os.makedirs(out_dir, exist_ok=True)
 
+def get_muon_momentum(step):
+    momentum_cd_start = max_steps - muon_momentum_cooldown_steps
+    if step < muon_momentum_warmup_steps:
+        frac = step / muon_momentum_warmup_steps
+        momentum = muon_momentum_min + frac * (muon_momentum_max - muon_momentum_min)
+    elif step > momentum_cd_start:
+        frac = (step - momentum_cd_start) / muon_momentum_cooldown_steps
+        momentum = muon_momentum_max - frac * (muon_momentum_max - muon_momentum_min)
+    else:
+        momentum = muon_momentum_max
+    return momentum
+
 criterion = get_criterion(config)
-optimizer = get_optimizers(config, model)
-scheduler = get_schedulers(config, optimizer)
+optimizers = get_optimizers(config, model)
+muon_optimizer, adamw_optimizer = optimizers
+schedulers = get_schedulers(config, muon_optimizer, adamw_optimizer)
+muon_scheduler, adamw_scheduler = schedulers
 train_loader, val_loader = get_dataloader(config)
 
 if use_doc_masking:
@@ -132,8 +155,10 @@ if use_doc_masking:
 tokens_processed = 0
 tokens_per_step = batch_size * block_size * grad_accum_steps
 if checkpoint is not None:
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler.load_state_dict(checkpoint["scheduler"])
+    muon_optimizer.load_state_dict(checkpoint["muon_optimizer"])
+    adamw_optimizer.load_state_dict(checkpoint["adamw_optimizer"])
+    muon_scheduler.load_state_dict(checkpoint["muon_scheduler"])
+    adamw_scheduler.load_state_dict(checkpoint["adamw_scheduler"])
     tokens_processed = int(checkpoint["tokens_processed"])
     
 print(f"Tokens per step: {tokens_per_step:,}")
@@ -200,6 +225,7 @@ print("=" * 80)
 train_iter = infinite_dataloader(train_loader)
 
 while tokens_processed < max_tokens and step < max_steps:
+    muon_optimizer.param_groups[0]['momentum'] = get_muon_momentum(step)
     
     if step != 0 and (step % eval_interval == 0 or step == max_steps - 1):
         losses = estimate_loss(step)
@@ -209,7 +235,7 @@ while tokens_processed < max_tokens and step < max_steps:
                 step,
                 float(losses["train"]),
                 float(losses["val"]),
-                scheduler.get_last_lr()[0],
+                muon_scheduler.get_last_lr()[0],
                 tokens_processed
             )
             # Log validation AttnRes attention weights if tracking is enabled
@@ -229,8 +255,10 @@ while tokens_processed < max_tokens and step < max_steps:
                 "step": step,
                 "tokens_processed": tokens_processed,
                 "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
+                "muon_optimizer": muon_optimizer.state_dict(),
+                "adamw_optimizer": adamw_optimizer.state_dict(),
+                "muon_scheduler": muon_scheduler.state_dict(),
+                "adamw_scheduler": adamw_scheduler.state_dict(),
                 "config": config,
                 "model_args": asdict(model_config),
             }
@@ -243,7 +271,7 @@ while tokens_processed < max_tokens and step < max_steps:
     model.train()
     t0 = time.time()
     
-    optimizer.zero_grad(set_to_none=True)
+    for opt in optimizers: opt.zero_grad(set_to_none=True)
     
     loss_accum = 0.0
     attnres_weights = None
@@ -281,8 +309,8 @@ while tokens_processed < max_tokens and step < max_steps:
     if grad_clip > 0.0: norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     else: norm = None
     
-    optimizer.step()
-    scheduler.step()
+    for opt in optimizers: opt.step()
+    for sched in schedulers: sched.step()
     
     tokens_processed += tokens_per_step
     
@@ -295,7 +323,7 @@ while tokens_processed < max_tokens and step < max_steps:
     if wandb_log:
         logger.log_train(
             step, loss_accum, norm, 
-            scheduler.get_last_lr()[0], 
+            muon_scheduler.get_last_lr()[0], 
             ms_per_step, tokens_per_s, tokens_processed
         )
         
@@ -311,7 +339,8 @@ while tokens_processed < max_tokens and step < max_steps:
             f"Tokens/s: {tokens_per_s:.2f}, "
             f"Tokens seen: {tokens_processed:,}, "
             f"Norm: {norm:.2f}, "
-            f"LR: {scheduler.get_last_lr()[0]:.6f}"
+            f"Muon LR: {muon_scheduler.get_last_lr()[0]:.6f}, "
+            f"AdamW LR: {adamw_scheduler.get_last_lr()[0]:.6f}"
         )
     
     step += 1
