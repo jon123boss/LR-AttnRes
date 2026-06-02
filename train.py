@@ -119,7 +119,7 @@ model.to_mixed_precision(dtype=torch.bfloat16)
 
 model = torch.compile(model)
 
-logger = get_logger(config)
+logger = get_logger(config, num_params=model.get_num_params())
 print(f"Device: {device}")
 print(f"Total Parameters: {model.get_num_params():,}")
 print(f"Total Batch Size: {total_batch_size}")
@@ -231,20 +231,19 @@ while tokens_processed < max_tokens and step < max_steps:
         losses = estimate_loss(step)
         print(f"Eval: Step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
+            val_attnres_dict = None
+            if use_attnres and track_attnres and "val_attnres_weights" in losses:
+                val_weights = losses["val_attnres_weights"]
+                if val_weights is not None:
+                    val_attnres_dict = {f"val/{k}": v for k, v in val_weights.items()}
             logger.log_eval(
                 step,
                 float(losses["train"]),
                 float(losses["val"]),
                 muon_scheduler.get_last_lr()[0],
-                tokens_processed
+                tokens_processed,
+                val_attnres_dict=val_attnres_dict
             )
-            # Log validation AttnRes attention weights if tracking is enabled
-            if use_attnres and track_attnres and "val_attnres_weights" in losses:
-                val_weights = losses["val_attnres_weights"]
-                if val_weights is not None:
-                    # Prefix with "val/" to distinguish from train weights
-                    val_weights_prefixed = {f"val/{k}": v for k, v in val_weights.items()}
-                    logger.log_attnres_weights(step, val_weights_prefixed, tokens_processed)
         if eval_only:
             break
 
@@ -324,12 +323,9 @@ while tokens_processed < max_tokens and step < max_steps:
         logger.log_train(
             step, loss_accum, norm,
             muon_scheduler.get_last_lr()[0],
-            ms_per_step, tokens_per_s, tokens_processed
+            ms_per_step, tokens_per_s, tokens_processed,
+            attnres_dict=attnres_weights
         )
-
-        # Log AttnRes attention weights if tracking is enabled
-        if use_attnres and track_attnres and attnres_weights is not None:
-            logger.log_attnres_weights(step, attnres_weights, tokens_processed)
 
     if step % log_interval == 0:
         print(

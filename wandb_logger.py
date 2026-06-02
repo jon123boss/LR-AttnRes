@@ -1,10 +1,10 @@
 import os
 import time
 import pathlib
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 class WandbLogger:
-    def __init__(self, enabled=False, project="", run_name="", config=None, out_dir="out"):
+    def __init__(self, enabled=False, project="", run_name="", config=None, out_dir="out", num_params=None):
         self.enabled = bool(enabled)
         self.project = project or "obpm"
         self.run_name = run_name or ("OBPM-" + str(int(time.time())))
@@ -47,66 +47,62 @@ class WandbLogger:
             except Exception:
                 pass
 
-        self.wandb.define_metric("step")
-        self.wandb.define_metric("train/*", step_metric="step")
-        self.wandb.define_metric("val/*",   step_metric="step")
-        self.wandb.define_metric("lr",      step_metric="step")
-        self.wandb.define_metric("lambdas/*", step_metric="step")
-        
         self.wandb.define_metric("tokens_processed")
         self.wandb.define_metric("train/*", step_metric="tokens_processed")
         self.wandb.define_metric("val/*",   step_metric="tokens_processed")
+        self.wandb.define_metric("lr",      step_metric="tokens_processed")
+        self.wandb.define_metric("grad_norm", step_metric="tokens_processed")
+        self.wandb.define_metric("ms_per_step", step_metric="tokens_processed")
+        self.wandb.define_metric("tokens_per_s", step_metric="tokens_processed")
+        self.wandb.define_metric("lambdas/*", step_metric="tokens_processed")
+        self.wandb.define_metric("attnres/*", step_metric="tokens_processed")
 
         self.active = True
+        if num_params is not None:
+            self.run.config.update({"num_params": num_params})
 
-    def log_train(self, step, iter_loss, grad_norm, lr, ms_per_step, tokens_per_s, tokens_processed):
+    def log_train(self, step, iter_loss, grad_norm, lr, ms_per_step, tokens_per_s, tokens_processed,
+                  attnres_dict: Optional[Dict[str, float]] = None):
         if not self.active:
             return
         gnorm = grad_norm.item() if hasattr(grad_norm, "item") else (float(grad_norm) if grad_norm is not None else 0.0)
-        self.run.log({
-            "step": step,
+        log_dict = {
             "tokens_processed": int(tokens_processed),
             "train/step_loss": float(iter_loss),
             "grad_norm": gnorm,
             "lr": float(lr),
             "ms_per_step": float(ms_per_step),
             "tokens_per_s": float(tokens_per_s),
-        })
+        }
+        if attnres_dict is not None:
+            for key, value in attnres_dict.items():
+                log_dict[f"attnres/{key}"] = float(value)
+        self.run.log(log_dict)
 
-    def log_eval(self, step, train_loss, val_loss, lr, tokens_processed):
+    def log_eval(self, step, train_loss, val_loss, lr, tokens_processed,
+                 val_attnres_dict: Optional[Dict[str, float]] = None):
         if not self.active:
             return
-        self.run.log({
-            "step": step,
+        log_dict = {
             "tokens_processed": int(tokens_processed),
             "train/loss": float(train_loss),
             "val/loss": float(val_loss),
             "lr": float(lr),
-        })
+        }
+        if val_attnres_dict is not None:
+            for key, value in val_attnres_dict.items():
+                log_dict[f"val/{key}"] = float(value)
+        self.run.log(log_dict)
 
     def log_lambda_ratios(self, step, lambda_dict, tokens_processed):
         if not self.active:
             return
         
         log_dict = {
-            "step": step,
             "tokens_processed": int(tokens_processed)
         }
         for key, value in lambda_dict.items():
             log_dict[f"lambdas/{key}"] = float(value)
-        
-        self.run.log(log_dict)
-
-    def log_attnres_weights(self, step, attnres_dict, tokens_processed):
-        if not self.active:
-            return
-        
-        log_dict = {
-            "step": step,
-            "tokens_processed": int(tokens_processed)
-        }
-        for key, value in attnres_dict.items():
-            log_dict[f"attnres/{key}"] = float(value)
         
         self.run.log(log_dict)
 
@@ -131,12 +127,13 @@ class WandbLogger:
                 self.active = False
 
 
-def get_logger(config):
+def get_logger(config, num_params=None):
     logger = WandbLogger(
         enabled=config["wandb_log"],
         project=config["wandb_project"],
         run_name=config["wandb_run_name"],
         config=config,
         out_dir=config["out_dir"],
+        num_params=num_params,
     )
     return logger
