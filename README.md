@@ -25,3 +25,16 @@ Download and preprocess the GPT-2 tokenized FinewebEDU10B dataset:
 ```bash
 python prepdata.py
 ```
+
+## LRID Attention Residuals
+
+LRID can be enabled as a block Attention Residuals variant:
+
+```bash
+python train.py --use_lrid --attnres_type block --lrid_rank 64
+```
+
+`--use_lrid` automatically enables `use_attnres`. The default `--lrid_init zero_query`
+keeps step-0 depth weights uniform while leaving key projections trainable; `zero_both`
+is available for exact spec experiments but is not recommended because it blocks
+query/key gradient flow at initialization.

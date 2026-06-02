@@ -74,6 +74,9 @@ init_cutoff_factor = None
 use_attnres = False
 attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
+use_lrid = False
+lrid_rank = 64
+lrid_init = "zero_query" # zero_query, zero_key, zero_both, normal
 # rope
 rope_theta = 500000.0
 # normalization
@@ -129,6 +132,10 @@ def parse_args():
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
+    parser.add_argument("--use_lrid", type=_str_to_bool, nargs="?", const=True, default=use_lrid)
+    parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
+    parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
+    parser.add_argument("--lrid_init", choices=("zero_query", "zero_key", "zero_both", "normal"), default=lrid_init)
     return parser.parse_args()
 
 
@@ -136,6 +143,11 @@ args = parse_args()
 use_attnres = args.use_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
+use_lrid = args.use_lrid
+lrid_rank = args.lrid_rank
+lrid_init = args.lrid_init
+if use_lrid:
+    use_attnres = True
 
 config = get_config(sys.modules[__name__].__dict__)
 start_step, checkpoint, model, model_config = get_model(config, device)
