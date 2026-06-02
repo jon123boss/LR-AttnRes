@@ -16,7 +16,6 @@ class ModelConfig:
     mlp_hidden_dim: int = None
     mlp_ratio: float = 4.0
     weight_tying: bool = False
-    act_type: str = "gelu"
     rope_theta: float = 500000.0
     rmsnorm_eps: float = 1e-6
     rmsnorm_use_weight: bool = True
@@ -27,33 +26,6 @@ class ModelConfig:
     flash_attention: bool = False
     init_std: float = 0.02
     init_cutoff_factor: float = None
-
-class ActivationFunction(nn.Module):
-    def __init__(self, act_type):
-        super().__init__()
-        self.act_type = act_type.lower()
-        if self.act_type == "relu":
-            self.activation = nn.ReLU()
-        elif self.act_type == "gelu":
-            self.activation = nn.GELU()
-        elif self.act_type == "silu":
-            self.activation = nn.SiLU()
-        elif self.act_type == "swiglu":
-            self.activation = SwiGLU()
-        elif self.act_type == "sigmoid":
-            self.activation = nn.Sigmoid()
-        else:
-            raise ValueError(f"Unsupported activation function: {act_type}")
-    
-    def forward(self, x):
-        return self.activation(x)
-
-
-class SwiGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return F.silu(gate) * x
-
 
 class RMSNorm(nn.Module):
     def __init__(self, config, dim=None):
@@ -227,16 +199,15 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_dim = config.mlp_hidden_dim if config.mlp_hidden_dim is not None else int(config.n_embd * config.mlp_ratio)
-        self.act = ActivationFunction(config.act_type)
-        self.fc1 = nn.Linear(config.n_embd, self.hidden_dim, bias=False)
-        self.fc2 = nn.Linear(self.hidden_dim // 2 if config.act_type.lower() == "swiglu" else self.hidden_dim, config.n_embd, bias=False)
-    
+        self.fc1 = nn.Linear(config.n_embd, self.hidden_dim * 2, bias=False)
+        self.fc2 = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
+
     def forward(self, x):
         x = self.fc1(x)
-        x = self.act(x)
+        x, gate = x.chunk(2, dim=-1)
+        x = F.silu(gate) * x
         x = self.fc2(x)
         return x
-
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx=0):

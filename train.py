@@ -66,7 +66,6 @@ vocab_size = 57601
 mlp_hidden_dim = 2048
 mlp_ratio = None
 weight_tying = False
-act_type = 'swiglu'
 flash_attention = True
 init_std = 0.02
 init_cutoff_factor = None

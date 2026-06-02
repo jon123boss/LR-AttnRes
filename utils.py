@@ -58,7 +58,6 @@ def get_model(config, device):
             mlp_hidden_dim=config["mlp_hidden_dim"],
             mlp_ratio=config["mlp_ratio"],
             weight_tying=config["weight_tying"],
-            act_type=config["act_type"],
             rope_theta=config["rope_theta"],
             rmsnorm_eps=config["rmsnorm_eps"],
             rmsnorm_use_weight=config["rmsnorm_use_weight"],
