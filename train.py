@@ -69,6 +69,10 @@ weight_tying = False
 flash_attention = True
 init_std = 0.02
 init_cutoff_factor = None
+# Attention Residuals
+use_attnres = True
+attnres_type = "full" # "full" or "block"
+attnres_num_blocks = 2
 # rope
 rope_theta = 500000.0
 # normalization

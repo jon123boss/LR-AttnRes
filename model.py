@@ -26,6 +26,9 @@ class ModelConfig:
     flash_attention: bool = False
     init_std: float = 0.02
     init_cutoff_factor: float = None
+    attn_res_type: str = None
+    use_attnres: bool = False
+    attnres_num_blocks: int = 0
 
 class RMSNorm(nn.Module):
     def __init__(self, config, dim=None):
@@ -46,8 +49,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         orig_dtype = x.dtype
         x_float = x.to(torch.float32)
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x_float * torch.rsqrt(variance + self.eps)
+        x_norm = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x_norm = x_norm.to(orig_dtype)
 
         if self.weight is not None:
@@ -226,13 +228,7 @@ class Block(nn.Module):
         if self.norm_pos in {"before", "both"}:
             x = self.attn_norm(x)
         
-        attn_out = self.attn(
-            x,
-            past_kv=past_kv,
-            use_cache=use_cache,
-            cu_doc_len=cu_doc_len,
-            max_doc_len=max_doc_len,
-        )
+        attn_out = self.attn(x, past_kv=past_kv, use_cache=use_cache, cu_doc_len=cu_doc_len, max_doc_len=max_doc_len)
         
         if use_cache:
             x, new_kv = attn_out
