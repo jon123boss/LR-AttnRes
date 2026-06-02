@@ -32,6 +32,7 @@ class ModelConfig:
     use_lrid: bool = False
     lrid_rank: int = 64
     lrid_init: str = "zero_query"
+    lrid_logit_scale: float = None
 
     def __post_init__(self):
         self.attnres_type = (self.attnres_type or "block")
@@ -39,8 +40,12 @@ class ModelConfig:
         self.lrid_init = (self.lrid_init or "zero_query").lower()
         if self.lrid_rank < 1:
             raise ValueError("lrid_rank must be >= 1")
-        if self.lrid_init not in {"zero_query", "zero_key", "zero_both", "normal"}:
-            raise ValueError("lrid_init must be one of: zero_query, zero_key, zero_both, normal")
+        if self.lrid_init not in {"zero_query", "normal"}:
+            raise ValueError("lrid_init must be one of: zero_query, normal")
+        if self.lrid_logit_scale is None:
+            self.lrid_logit_scale = 1.0 / math.sqrt(self.lrid_rank)
+        elif self.lrid_logit_scale <= 0.0:
+            raise ValueError("lrid_logit_scale must be positive")
         if self.use_lrid:
             self.use_attnres = True
 
@@ -111,10 +116,8 @@ class LRIDFusedProjection(nn.Module):
 
     @torch.no_grad()
     def init_lrid(self, mode):
-        if mode in {"zero_query", "zero_both"}:
+        if mode == "zero_query":
             self.proj.weight[self.output_dim:self.output_dim + self.rank].zero_()
-        if mode in {"zero_key", "zero_both"}:
-            self.proj.weight[self.output_dim + self.rank:].zero_()
 
 
 class LRIDSourceKeyProjection(nn.Module):
@@ -128,8 +131,7 @@ class LRIDSourceKeyProjection(nn.Module):
 
     @torch.no_grad()
     def init_lrid(self, mode):
-        if mode in {"zero_key", "zero_both"}:
-            self.proj.weight.zero_()
+        pass
 
 
 class MultiHeadAttention(nn.Module):
@@ -447,7 +449,12 @@ class OBPM(nn.Module):
 
         values = torch.stack([value for value, _ in sources], dim=0)
         keys = torch.stack([key for _, key in sources], dim=0)
-        logits = torch.einsum("sbtr,btr->sbt", keys, query.to(keys.dtype))
+        keys_float = keys.float()
+        keys = (
+            keys_float
+            * torch.rsqrt(keys_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
+        ).to(values.dtype)
+        logits = torch.einsum("sbtr,btr->sbt", keys, query.to(keys.dtype)) * self.config.lrid_logit_scale
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
 

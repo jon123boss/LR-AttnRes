@@ -77,7 +77,8 @@ attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
 use_lrid = False
 lrid_rank = 64
-lrid_init = "zero_query" # zero_query, zero_key, zero_both, normal
+lrid_init = "zero_query" # zero_query or normal
+lrid_logit_scale = None # None defaults to 1 / sqrt(lrid_rank)
 # rope
 rope_theta = 500000.0
 # normalization
@@ -142,7 +143,8 @@ def parse_args():
     parser.add_argument("--use_lrid", type=_str_to_bool, nargs="?", const=True, default=use_lrid)
     parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
     parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
-    parser.add_argument("--lrid_init", choices=("zero_query", "zero_key", "zero_both", "normal"), default=lrid_init)
+    parser.add_argument("--lrid_init", choices=("zero_query", "normal"), default=lrid_init)
+    parser.add_argument("--lrid_logit_scale", type=float, default=lrid_logit_scale)
     parser.add_argument("--interactive_after_train", type=_str_to_bool, nargs="?", const=True, default=interactive_after_train)
     parser.add_argument("--no-interactive_after_train", dest="interactive_after_train", action="store_false")
     return parser.parse_args()
@@ -160,6 +162,7 @@ lrid_rank = args.lrid_rank
 lrid_init = args.lrid_init
 if use_lrid:
     use_attnres = True
+lrid_logit_scale = args.lrid_logit_scale
 interactive_after_train = args.interactive_after_train
 
 config = get_config(sys.modules[__name__].__dict__)
