@@ -68,13 +68,6 @@ def get_model(config, device):
             flash_attention=config["flash_attention"],
             init_std=config["init_std"],
             init_cutoff_factor=config["init_cutoff_factor"],
-            use_attnres = config["use_attnres"],
-            attnres_type = config["attnres_type"],
-            attnres_num_blocks = config["attnres_num_blocks"],
-            use_lrid = config["use_lrid"],
-            lrid_rank = config["lrid_rank"],
-            lrid_init = config["lrid_init"],
-            lrid_logit_scale = config["lrid_logit_scale"],
             )
         model = OBPM(model_config)
     else:

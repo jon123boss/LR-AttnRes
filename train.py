@@ -46,8 +46,8 @@ init_from = 'scratch'
 ckpt_file_name = ''
 # wandb logging
 wandb_log = True
-wandb_project = "LRID"
-wandb_run_name = "LRID"
+wandb_project = "OBPM"
+wandb_run_name = "OBPM"
 # data
 dataset_dir = "finewebedu10B"
 batch_size = 32
@@ -71,14 +71,6 @@ weight_tying = False
 flash_attention = True
 init_std = 0.02
 init_cutoff_factor = None
-# Attention Residuals
-use_attnres = False
-attnres_type = "block" # "full" or "block"
-attnres_num_blocks = 8
-use_lrid = False
-lrid_rank = 64
-lrid_init = "zero_query" # zero_query or normal
-lrid_logit_scale = None # None defaults to 1 / sqrt(lrid_rank)
 # rope
 rope_theta = 500000.0
 # normalization
@@ -136,15 +128,6 @@ def parse_args():
     parser.add_argument("--no-wandb_log", dest="wandb_log", action="store_false")
     parser.add_argument("--use_doc_masking", type=_str_to_bool, nargs="?", const=True, default=use_doc_masking)
     parser.add_argument("--no-use_doc_masking", dest="use_doc_masking", action="store_false")
-    parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
-    parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
-    parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
-    parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
-    parser.add_argument("--use_lrid", type=_str_to_bool, nargs="?", const=True, default=use_lrid)
-    parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
-    parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
-    parser.add_argument("--lrid_init", choices=("zero_query", "normal"), default=lrid_init)
-    parser.add_argument("--lrid_logit_scale", type=float, default=lrid_logit_scale)
     parser.add_argument("--interactive_after_train", type=_str_to_bool, nargs="?", const=True, default=interactive_after_train)
     parser.add_argument("--no-interactive_after_train", dest="interactive_after_train", action="store_false")
     return parser.parse_args()
@@ -154,15 +137,6 @@ args = parse_args()
 eval_only = args.eval_only
 wandb_log = args.wandb_log
 use_doc_masking = args.use_doc_masking
-use_attnres = args.use_attnres
-attnres_type = args.attnres_type
-attnres_num_blocks = args.attnres_num_blocks
-use_lrid = args.use_lrid
-lrid_rank = args.lrid_rank
-lrid_init = args.lrid_init
-if use_lrid:
-    use_attnres = True
-lrid_logit_scale = args.lrid_logit_scale
 interactive_after_train = args.interactive_after_train
 
 config = get_config(sys.modules[__name__].__dict__)
