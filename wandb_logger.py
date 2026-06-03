@@ -55,10 +55,17 @@ class WandbLogger:
         self.wandb.define_metric("ms_per_step", step_metric="tokens_processed")
         self.wandb.define_metric("tokens_per_s", step_metric="tokens_processed")
         self.wandb.define_metric("lambdas/*", step_metric="tokens_processed")
+        self.wandb.define_metric("model/num_params", step_metric="tokens_processed")
 
         self.active = True
         if num_params is not None:
+            num_params = int(num_params)
             self.run.config.update({"num_params": num_params})
+            self.run.summary["num_params"] = num_params
+            self.run.log({
+                "tokens_processed": 0,
+                "model/num_params": num_params,
+            })
 
     def log_train(self, step, iter_loss, grad_norm, lr, ms_per_step, tokens_per_s, tokens_processed):
         if not self.active:
