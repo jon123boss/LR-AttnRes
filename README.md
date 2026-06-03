@@ -2,7 +2,7 @@
 
 ```bash
 git clone https://github.com/jon123boss/LR-AttnRes
-cd LR-AttRes
+cd LR-AttnRes
 ```
 
 ## Prerequisites
