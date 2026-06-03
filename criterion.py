@@ -14,10 +14,10 @@ class CriterionConfig:
 
 
 class CrossEntropyLoss(nn.Module):
-    def __init__(self, config: CriterionConfig, flash_attention = False):
+    def __init__(self, config: CriterionConfig, flash_attention=False):
         super().__init__()
         self.config = config
-        
+
         self.flash_attention = False
         self._flash_ce = None
 
@@ -28,7 +28,6 @@ class CrossEntropyLoss(nn.Module):
                 )
 
                 self._flash_ce = flash_cross_entropy_loss
-
                 self.flash_attention = True
             except Exception:
                 print("Flash attention not installed, using pytorch Cross Entropy Loss")
@@ -42,32 +41,43 @@ class CrossEntropyLoss(nn.Module):
             lse_square_scale=z_loss_weight,
             inplace_backward=False,
             process_group=None,
-            ignore_index=self.config.ignore_index
+            ignore_index=self.config.ignore_index,
         )
 
-        if self.config.reduction == "mean": loss = loss.sum() / mask.sum()
-        if self.config.reduction == "sum": loss = loss.sum()
+        if self.config.reduction == "mean":
+            loss = loss.sum() / mask.sum()
+        if self.config.reduction == "sum":
+            loss = loss.sum()
 
-        if not compute_z_loss: return loss, None
+        if not compute_z_loss:
+            return loss, None
 
-        if self.config.reduction == "mean": z_loss = z_loss.sum() / mask.sum()
-        if self.config.reduction == "sum": z_loss = z_loss.sum()
+        if self.config.reduction == "mean":
+            z_loss = z_loss.sum() / mask.sum()
+        if self.config.reduction == "sum":
+            z_loss = z_loss.sum()
 
         return loss, z_loss
 
     def forward(self, logits, labels):
-        mask = (labels != self.config.ignore_index)
-        
+        if labels.dim() != 1:
+            labels = labels.reshape(-1)
+        if logits.dim() != 2:
+            logits = logits.reshape(-1, logits.size(-1))
+
+        mask = labels != self.config.ignore_index
+
         if self.flash_attention:
             loss, z_loss = self._fused_cel(
                 logits,
                 labels,
                 compute_z_loss=self.config.z_loss,
                 z_loss_weight=self.config.z_loss_weight,
-                mask=mask
+                mask=mask,
             )
 
-            if self.config.z_loss: return loss + z_loss
+            if self.config.z_loss:
+                return loss + z_loss
             return loss
 
         loss = F.cross_entropy(
@@ -77,25 +87,29 @@ class CrossEntropyLoss(nn.Module):
             reduction=self.config.reduction,
         )
 
-        if not self.config.z_loss: return loss
+        if not self.config.z_loss:
+            return loss
 
         z_squared = logits.logsumexp(dim=-1).pow(2)
 
-        if self.config.reduction == "mean": z_squared = (z_squared * mask).sum() / mask.sum()
-        elif self.config.reduction == "sum": z_squared = (z_squared * mask).sum()
-        else: z_squared = z_squared * mask
+        if self.config.reduction == "mean":
+            z_squared = (z_squared * mask).sum() / mask.sum()
+        elif self.config.reduction == "sum":
+            z_squared = (z_squared * mask).sum()
+        else:
+            z_squared = z_squared * mask
 
         z_loss = self.config.z_loss_weight * z_squared
         return loss + z_loss
 
+
 def get_criterion(config):
-    criterion = CrossEntropyLoss(
+    return CrossEntropyLoss(
         CriterionConfig(
             ignore_index=config["ignore_index"],
             reduction=config["reduction"],
             z_loss=config["z_loss"],
             z_loss_weight=config["z_loss_weight"],
-        ), 
-        flash_attention=config["flash_attention"]
-        )
-    return criterion
+        ),
+        flash_attention=config["flash_attention"],
+    )
