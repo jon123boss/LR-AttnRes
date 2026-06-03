@@ -1,8 +1,8 @@
 ## Download Repository
 
 ```bash
-git clone https://github.com/jon123boss/LRID
-cd LRID
+git clone https://github.com/jon123boss/LR-AttRes
+cd LR-AttRes
 ```
 
 ## Prerequisites
