@@ -76,6 +76,7 @@ def get_model(config, device):
             attn_res_query_init = config["attn_res_query_init"],
             use_lrid = config["use_lrid"],
             lrid_rank = config["lrid_rank"],
+            lrid_num_heads = config.get("lrid_num_heads", 1),
             lrid_use_logit_scale = config["lrid_use_logit_scale"],
             lrid_logit_scale = config["lrid_logit_scale"],
             )

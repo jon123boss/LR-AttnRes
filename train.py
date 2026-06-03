@@ -80,8 +80,9 @@ attn_res_query_norm = False
 attn_res_query_init = "zero" # zero, normal, trunc_normal
 use_lrid = False
 lrid_rank = 64
+lrid_num_heads = 1
 lrid_use_logit_scale = True
-lrid_logit_scale = None # None defaults to 1 / sqrt(lrid_rank) when enabled
+lrid_logit_scale = None # None defaults to 1 / sqrt(lrid_rank / lrid_num_heads) when enabled
 # rope
 rope_theta = 500000.0
 # normalization
@@ -151,6 +152,7 @@ def parse_args():
     parser.add_argument("--use_lrid", type=_str_to_bool, nargs="?", const=True, default=use_lrid)
     parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
     parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
+    parser.add_argument("--lrid_num_heads", type=int, default=lrid_num_heads)
     parser.add_argument("--lrid_use_logit_scale", type=_str_to_bool, nargs="?", const=True, default=lrid_use_logit_scale)
     parser.add_argument("--no-lrid_use_logit_scale", "--no-lrid_logit_scale", dest="lrid_use_logit_scale", action="store_false")
     parser.add_argument("--lrid_logit_scale", type=float, default=lrid_logit_scale)
@@ -171,6 +173,7 @@ attn_res_query_norm = args.attn_res_query_norm
 attn_res_query_init = args.attn_res_query_init
 use_lrid = args.use_lrid
 lrid_rank = args.lrid_rank
+lrid_num_heads = args.lrid_num_heads
 lrid_use_logit_scale = args.lrid_use_logit_scale
 if use_lrid:
     use_attnres = True

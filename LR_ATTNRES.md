@@ -75,7 +75,7 @@ embedding_key = Linear(d, k)(embedding)
 For every Attention Residual depth site, LR AttnRes has a learned query:
 
 ```text
-q_r in R^k
+q_r in R^(lrid_num_heads x lrid_rank / lrid_num_heads)
 ```
 
 There are:
@@ -86,6 +86,18 @@ There are:
 
 query parameters, matching the number of depth-aggregation sites in the current AttnRes implementation.
 
+LR AttnRes depth routing can be multi-head:
+
+```text
+m = lrid_num_heads
+key head dim   = k / m
+value head dim = d / m
+```
+
+`lrid_rank` remains the total low-rank key width. The learned query is stored as
+`R^(m x k/m)` per depth site. Source values keep their normal hidden width and
+are reshaped to `R^(m x d/m)` only for the depth-attention weighted sum.
+
 ## Routing Formula
 
 For depth site `r`:
@@ -93,11 +105,14 @@ For depth site `r`:
 ```text
 values = stack(source_value_i)
 keys = stack(source_key_i)
-keys = RMSNorm(keys)
+values = reshape(values, sources, batch, time, m, d/m)
+keys = reshape(keys, sources, batch, time, m, k/m)
+keys = RMSNorm(keys over k/m)
 query = q_r
-logits_i = scale * dot(keys_i, query)
-weights_i = softmax_i(logits)
-output = sum_i weights_i * values_i
+logits_i,h = scale * dot(keys_i,h, query_h)
+weights_i,h = softmax_i(logits_h)
+output_h = sum_i weights_i,h * values_i,h
+output = reshape(output, batch, time, d)
 ```
 
 The low-rank source keys are input-dependent. The query is learned and input-independent.
@@ -110,13 +125,19 @@ Default:
 
 ```text
 lrid_use_logit_scale = True
-lrid_logit_scale = 1 / sqrt(lrid_rank)
+lrid_logit_scale = 1 / sqrt(lrid_rank / lrid_num_heads)
 ```
 
-For `lrid_rank=64`, the default scale is:
+For `lrid_rank=64` and `lrid_num_heads=1`, the default scale is:
 
 ```text
 0.125
+```
+
+For `lrid_rank=64` and `lrid_num_heads=8`, the default scale is:
+
+```text
+0.353553...
 ```
 
 Disable scaling:
@@ -219,6 +240,7 @@ Let:
 d = model hidden size
 h = MLP hidden size
 k = lrid_rank
+m = lrid_num_heads
 L = number of transformer layers
 ```
 
@@ -235,6 +257,10 @@ Once per model, it adds:
 embedding key overhead = k * d
 depth query overhead   = (2L + 1) * k
 ```
+
+When `k` is fixed, increasing `m` does not change these projection or query
+parameter counts. It only splits depth routing into `m` independent source
+weight distributions, with the constraints `k % m == 0` and `d % m == 0`.
 
 For the current default:
 
@@ -286,6 +312,7 @@ attnres_key_norm: bool
 attn_res_query_norm: bool
 attn_res_query_init: "zero" | "normal" | "trunc_normal"
 lrid_rank: int
+lrid_num_heads: int
 lrid_use_logit_scale: bool
 lrid_logit_scale: float | None
 ```
@@ -301,6 +328,7 @@ Training CLI:
 --no-attn_res_query_norm
 --attn_res_query_init
 --lrid_rank
+--lrid_num_heads
 --lrid_use_logit_scale
 --no-lrid_use_logit_scale
 --no-lrid_logit_scale
@@ -344,6 +372,7 @@ baseline
 static block Attention Residuals
 LR AttnRes block, rank 32, scaled
 LR AttnRes block, rank 64, scaled
+LR AttnRes block, rank 64, 8 depth heads, scaled
 LR AttnRes block, rank 64, unscaled
 LR AttnRes full, rank 64, scaled
 ```
@@ -352,7 +381,8 @@ Then sweep:
 
 ```text
 lrid_rank = 16, 32, 64, 128
-lrid_logit_scale = off, 1/sqrt(k), 0.5/sqrt(k)
+lrid_num_heads = 1, 2, 4, 8
+lrid_logit_scale = off, 1/sqrt(k / lrid_num_heads), 0.5/sqrt(k / lrid_num_heads)
 attnres_type = block, full
 ```
 
@@ -360,6 +390,7 @@ Suggested first comparison:
 
 ```bash
 python train.py --use_lrid --attnres_type block --lrid_rank 64
+python train.py --use_lrid --attnres_type block --lrid_rank 64 --lrid_num_heads 8
 python train.py --use_lrid --attnres_type block --lrid_rank 64 --no-lrid_logit_scale
 ```
 

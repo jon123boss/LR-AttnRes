@@ -26,6 +26,9 @@ def configure_optimizers(model, config: OptimizerConfig):
         for name, p in core_model.transformer.named_parameters():
             if name.startswith("wte.") or name.startswith("final_norm."):
                 continue
+            if name.startswith("lrid_queries."):
+                adamw_params.append(p)
+                continue
             if p.ndim >= 2:
                 muon_params.append(p)
             else:

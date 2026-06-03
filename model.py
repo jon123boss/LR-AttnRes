@@ -34,6 +34,7 @@ class ModelConfig:
     attn_res_query_init: str = "zero"
     use_lrid: bool = False
     lrid_rank: int = 64
+    lrid_num_heads: int = 1
     lrid_use_logit_scale: bool = True
     lrid_logit_scale: float = None
 
@@ -45,10 +46,16 @@ class ModelConfig:
             raise ValueError("attn_res_query_init must be one of: zero, normal, trunc_normal")
         if self.lrid_rank < 1:
             raise ValueError("lrid_rank must be >= 1")
+        if self.lrid_num_heads < 1:
+            raise ValueError("lrid_num_heads must be >= 1")
+        if self.lrid_rank % self.lrid_num_heads != 0:
+            raise ValueError("lrid_rank must be divisible by lrid_num_heads")
+        if self.n_embd % self.lrid_num_heads != 0:
+            raise ValueError("n_embd must be divisible by lrid_num_heads")
         if not self.lrid_use_logit_scale:
             self.lrid_logit_scale = 1.0
         elif self.lrid_logit_scale is None:
-            self.lrid_logit_scale = 1.0 / math.sqrt(self.lrid_rank)
+            self.lrid_logit_scale = 1.0 / math.sqrt(self.lrid_rank // self.lrid_num_heads)
         elif self.lrid_logit_scale <= 0.0:
             raise ValueError("lrid_logit_scale must be positive")
         if self.use_lrid:
@@ -84,6 +91,43 @@ class RMSNorm(nn.Module):
         return x_norm
 
 
+class LRIDKeyRMSNorm(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.eps = config.rmsnorm_eps
+        self.rank = config.lrid_rank
+        self.num_heads = config.lrid_num_heads
+        self.head_dim = self.rank // self.num_heads
+
+        if config.rmsnorm_use_weight:
+            self.weight = nn.Parameter(torch.ones(self.rank))
+            if config.rmsnorm_use_bias:
+                self.bias = nn.Parameter(torch.zeros(self.rank))
+            else:
+                self.register_parameter("bias", None)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        x_shape = x.shape
+        x = x.reshape(*x_shape[:-1], self.num_heads, self.head_dim)
+
+        orig_dtype = x.dtype
+        x_float = x.to(torch.float32)
+        x_norm = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x_norm = x_norm.to(orig_dtype)
+
+        if self.weight is not None:
+            weight = self.weight.reshape(self.num_heads, self.head_dim).to(x_norm.dtype)
+            x_norm = x_norm * weight
+        if self.bias is not None:
+            bias = self.bias.reshape(self.num_heads, self.head_dim).to(x_norm.dtype)
+            x_norm = x_norm + bias
+
+        return x_norm.reshape(*x_shape)
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -109,7 +153,7 @@ class LRIDFusedProjection(nn.Module):
         self.output_dim = output_dim
         self.rank = config.lrid_rank
         self.proj = nn.Linear(input_dim, output_dim + self.rank, bias=False)
-        self.key_norm = RMSNorm(config, dim=self.rank) if config.attnres_key_norm else None
+        self.key_norm = LRIDKeyRMSNorm(config) if config.attnres_key_norm else None
 
     def forward(self, x):
         output, key = self.proj(x).split(
@@ -124,8 +168,9 @@ class LRIDFusedProjection(nn.Module):
 class LRIDSourceKeyProjection(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.rank = config.lrid_rank
         self.proj = nn.Linear(config.n_embd, config.lrid_rank, bias=False)
-        self.key_norm = RMSNorm(config, dim=config.lrid_rank) if config.attnres_key_norm else None
+        self.key_norm = LRIDKeyRMSNorm(config) if config.attnres_key_norm else None
 
     def forward(self, x):
         key = self.proj(x)
@@ -417,8 +462,12 @@ class OBPM(nn.Module):
                 raise ValueError("attnres_num_blocks must be >= 1 when using block AttnRes")
             if self.use_lrid:
                 transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
+                key_head_dim = config.lrid_rank // config.lrid_num_heads
                 transformer_modules["lrid_queries"] = nn.ParameterList(
-                    [nn.Parameter(torch.empty(config.lrid_rank)) for _ in range(2 * config.n_layer + 1)]
+                    [
+                        nn.Parameter(torch.empty(config.lrid_num_heads, key_head_dim))
+                        for _ in range(2 * config.n_layer + 1)
+                    ]
                 )
             else:
                 transformer_modules["attn_residuals"] = nn.ModuleList(
@@ -460,6 +509,12 @@ class OBPM(nn.Module):
 
         values = torch.stack([value for value, _ in sources], dim=0)
         keys = torch.stack([key for _, key in sources], dim=0)
+        num_heads = self.config.lrid_num_heads
+        key_head_dim = self.config.lrid_rank // num_heads
+        value_head_dim = self.config.n_embd // num_heads
+
+        keys = keys.reshape(*keys.shape[:-1], num_heads, key_head_dim)
+        values = values.reshape(*values.shape[:-1], num_heads, value_head_dim)
         if self.config.attnres_key_norm:
             keys_float = keys.float()
             keys = (
@@ -469,11 +524,12 @@ class OBPM(nn.Module):
         query = self.transformer.lrid_queries[residual_idx]
         if self.config.attn_res_query_norm:
             query_float = query.float()
-            query = query_float * torch.rsqrt(query_float.pow(2).mean() + self.config.rmsnorm_eps)
+            query = query_float * torch.rsqrt(query_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
         query = query.to(keys.dtype)
-        logits = torch.einsum("sbtr,r->sbt", keys, query) * self.config.lrid_logit_scale
+        logits = torch.einsum("sbthr,hr->sbth", keys, query) * self.config.lrid_logit_scale
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
-        return torch.einsum("sbt,sbtd->btd", weights, values)
+        output = torch.einsum("sbth,sbthd->bthd", weights, values)
+        return output.reshape(output.size(0), output.size(1), self.config.n_embd)
     
     def _init_attnres_query(self, query, std=0.02, init_cutoff_factor=None):
         if self.config.attn_res_query_init == "zero":
