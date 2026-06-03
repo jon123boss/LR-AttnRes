@@ -54,6 +54,7 @@ class WandbLogger:
         self.wandb.define_metric("grad_norm", step_metric="tokens_processed")
         self.wandb.define_metric("ms_per_step", step_metric="tokens_processed")
         self.wandb.define_metric("tokens_per_s", step_metric="tokens_processed")
+        self.wandb.define_metric("gpu/*", step_metric="tokens_processed")
         self.wandb.define_metric("lambdas/*", step_metric="tokens_processed")
         self.wandb.define_metric("model/num_params", step_metric="tokens_processed")
 
@@ -67,7 +68,17 @@ class WandbLogger:
                 "model/num_params": num_params,
             })
 
-    def log_train(self, step, iter_loss, grad_norm, lr, ms_per_step, tokens_per_s, tokens_processed):
+    def log_train(
+        self,
+        step,
+        iter_loss,
+        grad_norm,
+        lr,
+        ms_per_step,
+        tokens_per_s,
+        tokens_processed,
+        peak_gpu_memory_gb=None,
+    ):
         if not self.active:
             return
         gnorm = grad_norm.item() if hasattr(grad_norm, "item") else (float(grad_norm) if grad_norm is not None else 0.0)
@@ -79,6 +90,8 @@ class WandbLogger:
             "ms_per_step": float(ms_per_step),
             "tokens_per_s": float(tokens_per_s),
         }
+        if peak_gpu_memory_gb is not None:
+            log_dict["gpu/peak_memory_gb"] = float(peak_gpu_memory_gb)
         self.run.log(log_dict)
 
     def log_eval(self, step, train_loss, val_loss, lr, tokens_processed):
@@ -90,6 +103,17 @@ class WandbLogger:
             "val/loss": float(val_loss),
             "lr": float(lr),
         }
+        self.run.log(log_dict)
+
+    def log_validation(self, val_loss, tokens_processed, lr=None):
+        if not self.active:
+            return
+        log_dict = {
+            "tokens_processed": int(tokens_processed),
+            "val/loss": float(val_loss),
+        }
+        if lr is not None:
+            log_dict["lr"] = float(lr)
         self.run.log(log_dict)
 
     def log_lambda_ratios(self, step, lambda_dict, tokens_processed):

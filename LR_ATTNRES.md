@@ -95,7 +95,7 @@ The token embedding is also a depth source, so it gets its own low-rank key proj
 embedding_key = Linear(d, k)(embedding)
 ```
 
-By default, every Attention Residual depth site has a learned static query:
+By default, every query-bearing Attention Residual depth site has a learned static query:
 
 ```text
 q_r in R^(lrid_num_heads x lrid_rank / lrid_num_heads)
@@ -104,10 +104,11 @@ q_r in R^(lrid_num_heads x lrid_rank / lrid_num_heads)
 There are:
 
 ```text
-2 * n_layer + 1
+2 * n_layer
 ```
 
-query parameters, matching the number of depth-aggregation sites in the current AttnRes implementation.
+query parameters. The first depth-aggregation site has only the embedding as a
+source, so it is an identity and has no query parameter.
 
 When `lrid_input_dependent_query=True`, the static query parameters are still
 created. The depth site uses a gated hybrid of the static query and the latest
@@ -314,14 +315,14 @@ Once per model, it adds:
 
 ```text
 embedding key overhead = k * d
-depth query overhead   = (2L + 1) * k
+depth query overhead   = (2L) * k
 ```
 
 In input-dependent query mode, static depth queries remain and gates are added:
 
 ```text
-depth query overhead = (2L + 1) * k
-depth gate overhead  = (2L + 1) * m
+depth query overhead = (2L) * k
+depth gate overhead  = (2L) * m
 ```
 
 When `k` is fixed, increasing `m` does not change these projection or query
@@ -346,9 +347,9 @@ per layer = 64 * 768 + 64 * 2048
 
 12 layers = 2,162,688
 embedding key = 49,152
-queries = 25 * 64 = 1,600
+queries = 24 * 64 = 1,536
 
-total extra = 2,213,440
+total extra = 2,213,376
 ```
 
 This is about half the old LRID overhead because the computed-query projection

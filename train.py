@@ -11,7 +11,7 @@ import os, sys
 import copy
 import argparse
 import numpy as np
-from utils import get_config, get_device, get_model, get_dataloader
+from utils import get_config, get_device, get_model, get_dataloader, compute_validation_loss
 from criterion import get_criterion
 from wandb_logger import get_logger
 from optimizer import get_optimizers
@@ -288,6 +288,31 @@ def estimate_loss(current_step):
 
 step = start_step
 
+if eval_only:
+    print("=" * 80)
+    print("Running full validation set evaluation...")
+    print("=" * 80)
+    val_metrics = compute_validation_loss(
+        model,
+        criterion,
+        val_loader,
+        device,
+        vocab_size,
+        use_doc_masking=use_doc_masking,
+    )
+    print(
+        f"Validation loss: {val_metrics['loss']:.4f} "
+        f"({val_metrics['tokens']:,} tokens across {val_metrics['batches']:,} batches)"
+    )
+    if wandb_log:
+        logger.log_validation(
+            float(val_metrics["loss"]),
+            tokens_processed,
+            lr=muon_scheduler.get_last_lr()[0],
+        )
+        logger.finish()
+    raise SystemExit
+
 print("=" * 80)
 print("Starting training...")
 print("=" * 80)
@@ -308,9 +333,6 @@ while tokens_processed < max_tokens and step < max_steps:
                 muon_scheduler.get_last_lr()[0],
                 tokens_processed,
             )
-        if eval_only:
-            break
-
     if save_checkpoint and step > 0:
         should_save = (step % ckpt_interval == 0) or (save_ckpt_at_end and step == max_steps - 1)
         if should_save:
@@ -335,6 +357,8 @@ while tokens_processed < max_tokens and step < max_steps:
     t0 = time.time()
 
     for opt in optimizers: opt.zero_grad(set_to_none=True)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -377,12 +401,16 @@ while tokens_processed < max_tokens and step < max_steps:
 
     tokens_per_s = tokens_per_step / (t1 - t0)
     ms_per_step = (t1 - t0) * 1000.0
+    peak_gpu_memory_gb = None
+    if device.type == "cuda":
+        peak_gpu_memory_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
     if wandb_log:
         logger.log_train(
             step, loss_accum, norm,
             muon_scheduler.get_last_lr()[0],
             ms_per_step, tokens_per_s, tokens_processed,
+            peak_gpu_memory_gb=peak_gpu_memory_gb,
         )
 
     if step % log_interval == 0:

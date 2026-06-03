@@ -365,7 +365,7 @@ class AttentionResidual(nn.Module):
     def forward(self, values):
         keys = self.norm(values) if self.norm is not None else values
         logits = torch.einsum("d,sbtd->sbt", self._query(keys.dtype), keys)
-        weights = F.softmax(logits, dim=0).to(values.dtype)
+        weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
 
 
@@ -501,19 +501,19 @@ class OBPM(nn.Module):
                 transformer_modules["lrid_queries"] = nn.ParameterList(
                     [
                         nn.Parameter(torch.empty(config.lrid_num_heads, key_head_dim))
-                        for _ in range(2 * config.n_layer + 1)
+                        for _ in range(2 * config.n_layer)
                     ]
                 )
                 if config.lrid_input_dependent_query:
                     transformer_modules["lrid_query_gates"] = nn.ParameterList(
                         [
                             nn.Parameter(torch.zeros(config.lrid_num_heads))
-                            for _ in range(2 * config.n_layer + 1)
+                            for _ in range(2 * config.n_layer)
                         ]
                     )
             else:
                 transformer_modules["attn_residuals"] = nn.ModuleList(
-                    [AttentionResidual(config) for _ in range(2 * config.n_layer + 1)]
+                    [AttentionResidual(config) for _ in range(2 * config.n_layer)]
                 )
 
         self.transformer = nn.ModuleDict(transformer_modules)
@@ -542,9 +542,16 @@ class OBPM(nn.Module):
             return None
         return math.ceil((2 * self.config.n_layer) / self.config.attnres_num_blocks)
 
+    def _attnres_query_idx(self, residual_idx):
+        if residual_idx < 1:
+            raise RuntimeError("Residual site 0 has no query because it only reads the embedding source")
+        return residual_idx - 1
+
     def _apply_attnres(self, residual_idx, sources):
+        if len(sources) == 1:
+            return sources[0]
         values = torch.stack(sources, dim=0)
-        return self.transformer.attn_residuals[residual_idx](values)
+        return self.transformer.attn_residuals[self._attnres_query_idx(residual_idx)](values)
 
     def _lrid_source(self, value, key, query=None):
         if self.config.lrid_input_dependent_query:
@@ -573,13 +580,14 @@ class OBPM(nn.Module):
                 * torch.rsqrt(keys_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
             ).to(values.dtype)
 
-        static_query = self.transformer.lrid_queries[residual_idx]
+        query_idx = self._attnres_query_idx(residual_idx)
+        static_query = self.transformer.lrid_queries[query_idx]
         if self.config.lrid_input_dependent_query:
             dynamic_query = query_override if query_override is not None else sources[-1][2]
             if dynamic_query is None:
                 raise RuntimeError("Input-dependent LR AttnRes query is missing for the active source")
             dynamic_query = dynamic_query.reshape(*dynamic_query.shape[:-1], num_heads, key_head_dim)
-            gate = self.transformer.lrid_query_gates[residual_idx].view(1, 1, num_heads, 1)
+            gate = self.transformer.lrid_query_gates[query_idx].view(1, 1, num_heads, 1)
             query = static_query.unsqueeze(0).unsqueeze(0) + gate * dynamic_query
         else:
             query = static_query
@@ -683,8 +691,7 @@ class OBPM(nn.Module):
                         x = self._apply_lrid_attnres(2 * layer_idx, residual_sources)
                     else:
                         attn_res_idx = 2 * layer_idx
-                        in_block_idx = attn_res_idx % block_size
-                        sources = completed_blocks if in_block_idx == 0 else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
+                        sources = completed_blocks if partial_block is None else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
                         x = self._apply_lrid_attnres(attn_res_idx, sources)
 
                     attn_out = block.forward_attention(
@@ -704,6 +711,7 @@ class OBPM(nn.Module):
                         residual_sources.append(self._lrid_source(layer_output, lrid_key, lrid_query if self.config.lrid_input_dependent_query else None))
                         x = self._apply_lrid_attnres(2 * layer_idx + 1, residual_sources)
                     else:
+                        after_attn_idx = 2 * layer_idx + 1
                         if partial_block is None:
                             partial_block = layer_output
                             partial_key = lrid_key
@@ -714,9 +722,19 @@ class OBPM(nn.Module):
                             partial_key = partial_key + lrid_key
                             if self.config.lrid_input_dependent_query:
                                 partial_query = lrid_query
-                        sources = completed_blocks if (2 * layer_idx + 1) % block_size == 0 else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
+                        is_block_end = (
+                            (after_attn_idx % block_size == 0)
+                            or (after_attn_idx == 2 * self.config.n_layer)
+                        )
+                        if is_block_end:
+                            completed_blocks.append(self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None))
+                            partial_block = None
+                            partial_key = None
+                            if self.config.lrid_input_dependent_query:
+                                partial_query = None
+                        sources = completed_blocks if partial_block is None else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
                         x = self._apply_lrid_attnres(
-                            2 * layer_idx + 1,
+                            after_attn_idx,
                             sources,
                             query_override=partial_query if self.config.lrid_input_dependent_query else None,
                         )
@@ -732,11 +750,15 @@ class OBPM(nn.Module):
                     if self.attnres_type == "full":
                         residual_sources.append(self._lrid_source(layer_output, lrid_key, lrid_query if self.config.lrid_input_dependent_query else None))
                     else:
+                        after_mlp_idx = 2 * layer_idx + 2
                         partial_block = layer_output if partial_block is None else partial_block + layer_output
                         partial_key = lrid_key if partial_key is None else partial_key + lrid_key
                         if self.config.lrid_input_dependent_query:
                             partial_query = lrid_query
-                        is_block_end = ((2 * layer_idx + 2) % block_size == 0) or (layer_idx + 1 == self.config.n_layer)
+                        is_block_end = (
+                            (after_mlp_idx % block_size == 0)
+                            or (after_mlp_idx == 2 * self.config.n_layer)
+                        )
                         if is_block_end:
                             completed_blocks.append(self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None))
                             partial_block = None
@@ -748,8 +770,7 @@ class OBPM(nn.Module):
                     x = self._apply_attnres(2 * layer_idx, residual_sources)
                 else:
                     attn_res_idx = 2 * layer_idx
-                    in_block_idx = attn_res_idx % block_size
-                    sources = completed_blocks if in_block_idx == 0 else completed_blocks + [partial_block]
+                    sources = completed_blocks if partial_block is None else completed_blocks + [partial_block]
                     x = self._apply_attnres(2 * layer_idx, sources)
 
                 attn_out = block.forward_attention(
@@ -765,9 +786,17 @@ class OBPM(nn.Module):
                     residual_sources.append(layer_output)
                     x = self._apply_attnres(2 * layer_idx + 1, residual_sources)
                 else:
+                    after_attn_idx = 2 * layer_idx + 1
                     partial_block = layer_output if partial_block is None else partial_block + layer_output
-                    sources = completed_blocks if (2 * layer_idx + 1) % block_size == 0 else completed_blocks + [partial_block]
-                    x = self._apply_attnres(2 * layer_idx + 1, sources)
+                    is_block_end = (
+                        (after_attn_idx % block_size == 0)
+                        or (after_attn_idx == 2 * self.config.n_layer)
+                    )
+                    if is_block_end:
+                        completed_blocks.append(partial_block)
+                        partial_block = None
+                    sources = completed_blocks if partial_block is None else completed_blocks + [partial_block]
+                    x = self._apply_attnres(after_attn_idx, sources)
 
                 mlp_out = block.forward_mlp(x)
                 layer_output = mlp_out
@@ -776,8 +805,12 @@ class OBPM(nn.Module):
                 if self.attnres_type == "full":
                     residual_sources.append(layer_output)
                 else:
+                    after_mlp_idx = 2 * layer_idx + 2
                     partial_block = layer_output if partial_block is None else partial_block + layer_output
-                    is_block_end = ((2 * layer_idx + 2) % block_size == 0) or (layer_idx + 1 == self.config.n_layer)
+                    is_block_end = (
+                        (after_mlp_idx % block_size == 0)
+                        or (after_mlp_idx == 2 * self.config.n_layer)
+                    )
                     if is_block_end:
                         completed_blocks.append(partial_block)
                         partial_block = None

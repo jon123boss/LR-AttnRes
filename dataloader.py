@@ -312,6 +312,45 @@ def create_dataloaders(config: DataLoaderConfig):
     return train_loader, val_loader
 
 
+def create_validation_dataloader(config: DataLoaderConfig):
+    val_dataset = DocumentPackingDataset(
+        data_dir=config.data_dir,
+        split="val",
+        block_size=config.block_size,
+        use_doc_masking=config.use_doc_masking,
+        doc_separator_token=config.doc_separator_token,
+        dtype=config.dtype,
+    )
+
+    collate_fn = collate_with_doc_masking if config.use_doc_masking else collate_simple
+    loader_kwargs = dict(
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        persistent_workers=(config.persistent_workers and config.num_workers > 0),
+        collate_fn=collate_fn,
+    )
+
+    if config.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = config.prefetch_factor
+
+    val_loader = TorchDataLoader(
+        val_dataset,
+        shuffle=False,
+        drop_last=False,
+        **loader_kwargs,
+    )
+
+    print(
+        f"Validation dataloader: sequences={len(val_dataset):,} | "
+        f"Batch_size={config.batch_size} | "
+        f"Workers={config.num_workers} | "
+        f"Prefetch={config.prefetch_factor if config.num_workers > 0 else 'N/A'}"
+    )
+
+    return val_loader
+
+
 def warmup_boundaries(dataset: DocumentPackingDataset, num_shards: Optional[int] = None):
     from concurrent.futures import ThreadPoolExecutor
     

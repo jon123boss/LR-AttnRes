@@ -3,7 +3,7 @@
 
 import argparse
 import os
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -12,24 +12,67 @@ os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 
 import tiktoken
 
-from lm_eval import simple_evaluate
-from lm_eval.api.model import LM
-from lm_eval.api.registry import register_model
+try:
+    from lm_eval import simple_evaluate
+    from lm_eval.api.model import LM
+    from lm_eval.api.registry import register_model
+except ModuleNotFoundError as exc:
+    if exc.name != "lm_eval":
+        raise
+
+    simple_evaluate = None
+    _LM_EVAL_IMPORT_ERROR = exc
+
+    class LM:
+        def __init__(self):
+            self._rank = 0
+            self._world_size = 1
+
+        @property
+        def rank(self):
+            return self._rank
+
+        @property
+        def world_size(self):
+            return self._world_size
+
+    def register_model(*_names):
+        def decorator(cls):
+            return cls
+
+        return decorator
+else:
+    _LM_EVAL_IMPORT_ERROR = None
 
 from model import OBPM, ModelConfig
+from criterion import get_criterion
+from dataloader import warmup_boundaries
+from utils import compute_validation_loss, get_validation_dataloader
 
 OLMES_DEFAULT_SHOTS = 5
 
 TASK_MAPPING = {
+    "mmlu": "mmlu",
+    "MMLU": "mmlu",
+    "arc-c": "arc_challenge",
+    "ARC-C": "arc_challenge",
     "arc_challenge": "arc_challenge",
+    "arc-e": "arc_easy",
+    "ARC-E": "arc_easy",
     "arc_easy": "arc_easy",
     "boolq": "boolq",
+    "CommonSenseQA": "commonsense_qa",
     "commonsense_qa": "commonsense_qa",
+    "HellaSwag": "hellaswag",
     "hellaswag": "hellaswag",
+    "OpenbookQA": "openbookqa",
     "openbookqa": "openbookqa",
+    "PIQA": "piqa",
     "piqa": "piqa",
+    "SIQA": "siqa",
+    "siqa": "siqa",
+    "Winogrande": "winogrande",
     "winogrande": "winogrande",
-    "mmlu": "mmlu",
 }
 
 
@@ -77,13 +120,14 @@ class OBPMWrapper(LM):
         self.max_batch_size = max_batch_size
 
         print(f"Loading checkpoint from: {model_path}")
-        checkpoint = torch.load(model_path, map_location=self._device)
+        checkpoint = torch.load(model_path, map_location=self._device, weights_only=False)
 
         model_args = checkpoint.get("model_args", {})
         if isinstance(model_args, dict):
             config = ModelConfig(**model_args)
         else:
             config = model_args
+        self.checkpoint_config = checkpoint.get("config", {})
 
         self.model = OBPM(config)
 
@@ -111,7 +155,19 @@ class OBPMWrapper(LM):
     def device(self):
         return str(self._device)
 
-    def _truncate_left(self, ids: List[int], split: int) -> tuple[List[int], int]:
+    @property
+    def batch_size(self):
+        return self.batch_size_per_gpu
+
+    @property
+    def max_gen_toks(self):
+        return 256
+
+    @property
+    def tokenizer_name(self):
+        return "tiktoken-gpt2"
+
+    def _truncate_left(self, ids: List[int], split: int) -> Tuple[List[int], int]:
         overflow = len(ids) - self.max_length
         if overflow <= 0:
             return ids, split
@@ -150,7 +206,7 @@ class OBPMWrapper(LM):
 
             x = torch.tensor([full_ids], dtype=torch.long, device=self._device)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.model(x)
                 log_probs = torch.log_softmax(logits, dim=-1)
 
@@ -177,17 +233,18 @@ class OBPMWrapper(LM):
             (text,) = instance.args
             ids = self.tokenizer.encode(text)
 
-            if len(ids) < 2:
+            if len(ids) == 0:
                 out.append(0.0)
                 continue
 
             total = 0.0
-            for t in range(1, len(ids)):
+            scored_ids = [self.eot_token_id] + ids
+            for t in range(1, len(scored_ids)):
                 start = max(0, (t + 1) - self.max_length)
-                window = ids[start : t + 1]
+                window = scored_ids[start : t + 1]
                 x = torch.tensor([window], dtype=torch.long, device=self._device)
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits = self.model(x)
                     log_probs = torch.log_softmax(logits, dim=-1)
 
@@ -236,6 +293,40 @@ class OBPMWrapper(LM):
             yield requests[i : i + chunk_size]
 
 
+def run_validation_loss(lm_obj: OBPMWrapper):
+    config = getattr(lm_obj, "checkpoint_config", None)
+    if not config:
+        raise RuntimeError(
+            "Checkpoint does not contain a training config, so run_eval.py cannot "
+            "build the validation dataloader for validation loss."
+        )
+
+    eval_config = dict(config)
+    eval_config["pin_memory"] = bool(lm_obj._device.type == "cuda" and eval_config.get("pin_memory", False))
+
+    val_loader = get_validation_dataloader(eval_config)
+    if eval_config.get("use_doc_masking", False):
+        print("Warming up validation document boundary cache...")
+        warmup_boundaries(val_loader.dataset)
+        print("Validation boundary warmup complete.")
+
+    criterion = get_criterion(eval_config)
+    val_metrics = compute_validation_loss(
+        lm_obj.model,
+        criterion,
+        val_loader,
+        lm_obj._device,
+        lm_obj.vocab_size,
+        use_doc_masking=eval_config.get("use_doc_masking", False),
+    )
+    print(
+        f"Validation loss: {val_metrics['loss']:.4f} "
+        f"({val_metrics['tokens']:,} tokens across {val_metrics['batches']:,} batches)"
+    )
+    print("-" * 80)
+    return val_metrics
+
+
 def evaluate_checkpoints(checkpoints: List[str], tasks_list: List[str]):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -256,6 +347,13 @@ def evaluate_checkpoints(checkpoints: List[str], tasks_list: List[str]):
         print("=" * 80)
 
         lm_obj = OBPMWrapper(model_path=ckpt, device=device, batch_size=1)
+        val_metrics = run_validation_loss(lm_obj)
+
+        if simple_evaluate is None:
+            raise RuntimeError(
+                "run_eval.py requires lm_eval. Install it with `pip install lm_eval` "
+                "before running downstream evaluations."
+            ) from _LM_EVAL_IMPORT_ERROR
 
         eval_output = simple_evaluate(
             model=lm_obj,
@@ -264,6 +362,7 @@ def evaluate_checkpoints(checkpoints: List[str], tasks_list: List[str]):
             batch_size=1,
             device=device,
         )
+        eval_output["validation_loss"] = val_metrics
 
         results[ckpt] = eval_output
 
@@ -291,13 +390,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     downstream_eval_tasks = [
+        "mmlu",
         "arc_challenge",
         "arc_easy",
+        "commonsense_qa",
         "hellaswag",
         "openbookqa",
         "piqa",
+        "siqa",
         "winogrande",
     ]
 
     evaluate_checkpoints(args.ckpts, downstream_eval_tasks)
-

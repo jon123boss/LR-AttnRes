@@ -4,7 +4,7 @@ from contextlib import nullcontext
 import os
 import tempfile
 from model import OBPM, ModelConfig
-from dataloader import DataLoaderConfig, create_dataloaders
+from dataloader import DataLoaderConfig, create_dataloaders, create_validation_dataloader
 
 def get_config(module_globals=None):
     config_keys = [k for k, v in module_globals.items()  if not k.startswith('_') and isinstance(v, (int, float, bool, str, type(None)))]
@@ -34,7 +34,7 @@ def get_model(config, device):
             step_ckpts.sort(key=extract_step_number)
             ckpt_path = step_ckpts[-1] 
         print(f"Resuming from {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         ckpt_model_args = checkpoint["model_args"]
         model_config = ModelConfig(**ckpt_model_args)
         model = OBPM(model_config)
@@ -103,3 +103,89 @@ def get_dataloader(config):
         persistent_workers=config["persistent_workers"],
     )
     return create_dataloaders(dataloader_config)
+
+
+def get_validation_dataloader(config):
+    dataloader_config = DataLoaderConfig(
+        data_dir=config["dataset_dir"],
+        batch_size=config["batch_size"],
+        block_size=config["block_size"],
+        grad_accum_steps=config["grad_accum_steps"],
+        use_doc_masking=config["use_doc_masking"],
+        doc_separator_token=config["doc_separator_token"],
+        num_workers=config["num_workers"],
+        pin_memory=config["pin_memory"],
+        persistent_workers=config["persistent_workers"],
+    )
+    return create_validation_dataloader(dataloader_config)
+
+
+@torch.no_grad()
+def compute_validation_loss(
+    model,
+    criterion,
+    val_loader,
+    device,
+    vocab_size,
+    use_doc_masking=True,
+    desc="Validation loss",
+):
+    from tqdm import tqdm
+
+    was_training = model.training
+    model.eval()
+
+    ignore_index = getattr(getattr(criterion, "config", None), "ignore_index", -100)
+    reduction = getattr(getattr(criterion, "config", None), "reduction", "mean")
+    total_loss = 0.0
+    total_tokens = 0
+    total_batches = 0
+
+    try:
+        for batch in tqdm(val_loader, desc=desc, leave=False):
+            if use_doc_masking:
+                x, y, cu_seqlens, max_seqlen = batch
+                cu_seqlens = cu_seqlens.to(device)
+            else:
+                x, y = batch[:2]
+                cu_seqlens, max_seqlen = None, None
+
+            if x.max() >= vocab_size or y.max() >= vocab_size:
+                print("ERROR: Out-of-bounds token detected in validation batch!")
+                print(f"  x min/max: {x.min()}/{x.max()}")
+                print(f"  y min/max: {y.min()}/{y.max()}")
+                raise ValueError("Out-of-bounds token detected in validation batch.")
+
+            valid_tokens = int((y != ignore_index).sum().item())
+            if valid_tokens == 0:
+                continue
+
+            x, y = x.to(device), y.to(device)
+
+            logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
+            logits_for_loss = logits.float()
+            loss = criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
+
+            if loss.dim() == 0:
+                loss_value = float(loss.item())
+                if reduction == "sum":
+                    total_loss += loss_value
+                else:
+                    total_loss += loss_value * valid_tokens
+            else:
+                total_loss += float(loss.detach().sum().item())
+
+            total_tokens += valid_tokens
+            total_batches += 1
+    finally:
+        if was_training:
+            model.train()
+
+    if total_tokens == 0:
+        raise RuntimeError("No validation tokens available while computing validation loss.")
+
+    return {
+        "loss": total_loss / total_tokens,
+        "tokens": total_tokens,
+        "batches": total_batches,
+    }

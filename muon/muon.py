@@ -2,6 +2,7 @@
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from typing import Optional
 
 # -----------------------------------------------------------------------------
 # Computed for num_iters=5, safety_factor=1e-2, cushion=0.02
@@ -285,8 +286,7 @@ def polar_express_triton(G: torch.Tensor) -> torch.Tensor:
     return X
 
 
-@torch.compile(dynamic=False, fullgraph=True)
-def polar_express_pytorch(G: torch.Tensor) -> torch.Tensor:
+def _polar_express_pytorch_impl(G: torch.Tensor) -> torch.Tensor:
     """
     Polar Express Sign Method using pure PyTorch (no Triton).
     Reference: https://arxiv.org/pdf/2505.16932
@@ -312,6 +312,27 @@ def polar_express_pytorch(G: torch.Tensor) -> torch.Tensor:
     return X
 
 
+try:
+    _polar_express_pytorch_compiled = torch.compile(_polar_express_pytorch_impl, dynamic=False, fullgraph=True)
+except Exception:
+    _polar_express_pytorch_compiled = None
+
+_polar_express_compile_failed = False
+
+
+def polar_express_pytorch(G: torch.Tensor) -> torch.Tensor:
+    global _polar_express_compile_failed
+
+    if _polar_express_pytorch_compiled is not None and not _polar_express_compile_failed:
+        try:
+            return _polar_express_pytorch_compiled(G)
+        except Exception as exc:
+            _polar_express_compile_failed = True
+            print(f"Polar express torch.compile failed ({type(exc).__name__}), falling back to eager PyTorch.")
+
+    return _polar_express_pytorch_impl(G)
+
+
 def polar_express(G: torch.Tensor, use_triton: bool = True) -> torch.Tensor:
     if use_triton and _TRITON_AVAILABLE:
         return polar_express_triton(G)
@@ -330,7 +351,7 @@ class Muon(torch.optim.Optimizer):
         lr: float = 0.02,
         weight_decay: float = 0.0,
         momentum: float = 0.95,
-        beta2: float | None = 0.95,
+        beta2: Optional[float] = 0.95,
         nesterov: bool = True,
         use_triton: bool = True,
         cautious: bool = True,
