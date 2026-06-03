@@ -497,11 +497,17 @@ class OBPM(nn.Module):
                 raise ValueError("attnres_num_blocks must be >= 1 when using block AttnRes")
             if self.use_lrid:
                 transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
-                if not config.lrid_input_dependent_query:
-                    key_head_dim = config.lrid_rank // config.lrid_num_heads
-                    transformer_modules["lrid_queries"] = nn.ParameterList(
+                key_head_dim = config.lrid_rank // config.lrid_num_heads
+                transformer_modules["lrid_queries"] = nn.ParameterList(
+                    [
+                        nn.Parameter(torch.empty(config.lrid_num_heads, key_head_dim))
+                        for _ in range(2 * config.n_layer + 1)
+                    ]
+                )
+                if config.lrid_input_dependent_query:
+                    transformer_modules["lrid_query_gates"] = nn.ParameterList(
                         [
-                            nn.Parameter(torch.empty(config.lrid_num_heads, key_head_dim))
+                            nn.Parameter(torch.zeros(config.lrid_num_heads))
                             for _ in range(2 * config.n_layer + 1)
                         ]
                     )
@@ -516,13 +522,13 @@ class OBPM(nn.Module):
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         self.apply(partial(self._init_weights, std=config.init_std, init_cutoff_factor=config.init_cutoff_factor))
-        if self.use_lrid and not config.lrid_input_dependent_query:
+        if self.use_lrid:
             for query in self.transformer.lrid_queries:
                 self._init_attnres_query(query, config.init_std, config.init_cutoff_factor)
         if self.use_lrid and config.lrid_input_dependent_query:
             for module in self.modules():
                 if isinstance(module, LRIDFusedProjection):
-                    self._init_lrid_query_projection(module, config.init_std, config.init_cutoff_factor)
+                    self._init_lrid_dynamic_query_projection(module, config.init_std, config.init_cutoff_factor)
     
     def to_mixed_precision(self, dtype=torch.bfloat16):
         self.to(dtype=dtype)
@@ -567,13 +573,16 @@ class OBPM(nn.Module):
                 * torch.rsqrt(keys_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
             ).to(values.dtype)
 
+        static_query = self.transformer.lrid_queries[residual_idx]
         if self.config.lrid_input_dependent_query:
-            query = query_override if query_override is not None else sources[-1][2]
-            if query is None:
+            dynamic_query = query_override if query_override is not None else sources[-1][2]
+            if dynamic_query is None:
                 raise RuntimeError("Input-dependent LR AttnRes query is missing for the active source")
-            query = query.reshape(*query.shape[:-1], num_heads, key_head_dim)
+            dynamic_query = dynamic_query.reshape(*dynamic_query.shape[:-1], num_heads, key_head_dim)
+            gate = self.transformer.lrid_query_gates[residual_idx].view(1, 1, num_heads, 1)
+            query = static_query.unsqueeze(0).unsqueeze(0) + gate * dynamic_query
         else:
-            query = self.transformer.lrid_queries[residual_idx]
+            query = static_query
 
         if self.config.attn_res_query_norm:
             query_float = query.float()
@@ -596,11 +605,15 @@ class OBPM(nn.Module):
             cutoff = (init_cutoff_factor if init_cutoff_factor is not None else 3.0) * std
             nn.init.trunc_normal_(query, mean=0.0, std=std, a=-cutoff, b=cutoff)
 
-    def _init_lrid_query_projection(self, module, std=0.02, init_cutoff_factor=None):
+    def _init_lrid_dynamic_query_projection(self, module, std=0.02, init_cutoff_factor=None):
         if not module.use_query:
             return
         query_weight = module.proj.weight[module.output_dim + module.rank:]
-        self._init_attnres_query(query_weight, std, init_cutoff_factor)
+        if init_cutoff_factor is not None:
+            cutoff = init_cutoff_factor * std
+            nn.init.trunc_normal_(query_weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
+        else:
+            nn.init.normal_(query_weight, mean=0.0, std=std)
 
     def _init_weights(self, module, std=0.02, init_cutoff_factor=None):
         if isinstance(module, nn.Linear):
@@ -700,7 +713,7 @@ class OBPM(nn.Module):
                             partial_block = partial_block + layer_output
                             partial_key = partial_key + lrid_key
                             if self.config.lrid_input_dependent_query:
-                                partial_query = partial_query + lrid_query
+                                partial_query = lrid_query
                         sources = completed_blocks if (2 * layer_idx + 1) % block_size == 0 else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
                         x = self._apply_lrid_attnres(
                             2 * layer_idx + 1,
@@ -722,7 +735,7 @@ class OBPM(nn.Module):
                         partial_block = layer_output if partial_block is None else partial_block + layer_output
                         partial_key = lrid_key if partial_key is None else partial_key + lrid_key
                         if self.config.lrid_input_dependent_query:
-                            partial_query = lrid_query if partial_query is None else partial_query + lrid_query
+                            partial_query = lrid_query
                         is_block_end = ((2 * layer_idx + 2) % block_size == 0) or (layer_idx + 1 == self.config.n_layer)
                         if is_block_end:
                             completed_blocks.append(self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None))

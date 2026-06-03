@@ -109,9 +109,9 @@ There are:
 
 query parameters, matching the number of depth-aggregation sites in the current AttnRes implementation.
 
-When `lrid_input_dependent_query=True`, these static query parameters are not
-created. The depth site instead uses the latest available source query emitted
-by an attention or MLP output projection.
+When `lrid_input_dependent_query=True`, the static query parameters are still
+created. The depth site uses a gated hybrid of the static query and the latest
+available source query emitted by an attention or MLP output projection.
 
 LR AttnRes depth routing can be multi-head:
 
@@ -145,8 +145,10 @@ output = reshape(output, batch, time, d)
 For input-dependent query mode:
 
 ```text
-query = latest_source_query
-query = reshape(query, batch, time, m, k/m)
+dynamic_query = latest_source_query
+dynamic_query = reshape(dynamic_query, batch, time, m, k/m)
+gate_r in R^m
+query = q_r + gate_r * dynamic_query
 logits_i,h = scale * dot(keys_i,h, query_h)
 ```
 
@@ -210,10 +212,17 @@ q_r = 0
 
 At step 0, all depth logits are zero, so depth routing is uniform over available sources. This mirrors normal Attention Residuals and avoids the instability from computed low-rank query projections.
 
-When `lrid_input_dependent_query=True`, the query rows of each LR output
-projection are initialized with the same `attn_res_query_init` setting. The
-default `zero` therefore preserves uniform depth routing at step 0 even though
-the query is computed from the sublayer output.
+When `lrid_input_dependent_query=True`, each depth site also has a learned
+per-head gate:
+
+```text
+gate_r = 0
+```
+
+The dynamic query projection rows are initialized normally, but the zero gate
+makes the effective query exactly static at step 0. This avoids a dead branch:
+the gate can receive gradients immediately, and dynamic query projection rows
+begin receiving gradients once the gate opens.
 
 Attention Residual query initialization is configurable:
 
@@ -308,10 +317,11 @@ embedding key overhead = k * d
 depth query overhead   = (2L + 1) * k
 ```
 
-In input-dependent query mode, the static depth query overhead is removed:
+In input-dependent query mode, static depth queries remain and gates are added:
 
 ```text
-depth query overhead = 0
+depth query overhead = (2L + 1) * k
+depth gate overhead  = (2L + 1) * m
 ```
 
 When `k` is fixed, increasing `m` does not change these projection or query
