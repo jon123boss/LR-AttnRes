@@ -5,6 +5,9 @@ from torch.nn import functional as F
 from dataclasses import dataclass
 from functools import partial
 
+from liger_kernel.transformers import liger_rotary_pos_emb
+from liger_kernel.transformers.functional import liger_rms_norm, liger_swiglu
+
 
 @dataclass
 class ModelConfig:
@@ -18,8 +21,6 @@ class ModelConfig:
     weight_tying: bool = False
     rope_theta: float = 500000.0
     rmsnorm_eps: float = 1e-6
-    rmsnorm_use_weight: bool = True
-    rmsnorm_use_bias: bool = False
     norm_pos: str = "after"
     qk_norm: bool = True
     clip_qkv: float = None
@@ -33,29 +34,17 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = config.rmsnorm_eps
         dim = dim if dim is not None else config.n_embd
-
-        if config.rmsnorm_use_weight:
-            self.weight = nn.Parameter(torch.ones(dim))
-            if config.rmsnorm_use_bias:
-                self.bias = nn.Parameter(torch.zeros(dim))
-            else:
-                self.register_parameter("bias", None)
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        orig_dtype = x.dtype
-        x_float = x.to(torch.float32)
-        x_norm = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x_norm = x_norm.to(orig_dtype)
-
-        if self.weight is not None:
-            x_norm = x_norm * self.weight.to(x_norm.dtype)
-        if self.bias is not None:
-            x_norm = x_norm + self.bias.to(x_norm.dtype)
-
-        return x_norm
+        return liger_rms_norm(
+            X=x,
+            W=self.weight,
+            eps=self.eps,
+            offset=0.0,
+            casting_mode="llama",
+            in_place=False,
+        )
 
 
 class RotaryEmbedding(nn.Module):
@@ -69,12 +58,25 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin", freq.sin()[None, None])
         self.register_buffer("cos", freq.cos()[None, None])
 
-    def forward(self, x, offset=0):
-        T = x.size(-2)
+    @staticmethod
+    def _interleaved_to_half(x):
+        return x.reshape(*x.shape[:-1], -1, 2).transpose(-1, -2).reshape_as(x)
+
+    @staticmethod
+    def _half_to_interleaved(x):
+        return x.reshape(*x.shape[:-1], 2, -1).transpose(-1, -2).reshape_as(x)
+
+    def forward_pair(self, q, k, offset=0):
+        T = q.size(-2)
         sin = self.sin[:, :, offset:offset + T]
         cos = self.cos[:, :, offset:offset + T]
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-        return torch.stack([cos * x1 - sin * x2, sin * x1 + cos * x2], dim=-1).flatten(-2)
+
+        q_liger = self._interleaved_to_half(q)
+        k_liger = self._interleaved_to_half(k)
+        sin_liger = torch.cat((sin[:, 0], sin[:, 0]), dim=-1)
+        cos_liger = torch.cat((cos[:, 0], cos[:, 0]), dim=-1)
+        q_liger, k_liger = liger_rotary_pos_emb(q_liger, k_liger, cos_liger, sin_liger)
+        return self._half_to_interleaved(q_liger), self._half_to_interleaved(k_liger)
 
 
 class MultiHeadAttention(nn.Module):
@@ -188,8 +190,7 @@ class MultiHeadAttention(nn.Module):
         else:
             pos_offset = 0
 
-        q = self.rope(q, offset=pos_offset)
-        k = self.rope(k, offset=pos_offset)
+        q, k = self.rope.forward_pair(q, k, offset=pos_offset)
 
         if past_kv is not None:
             k = torch.cat([past_k, k], dim=2)
@@ -222,7 +223,7 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
-        x = F.silu(gate) * x
+        x = liger_swiglu(gate, x)
         return self.fc2(x)
 
 
@@ -337,7 +338,7 @@ class OBPM(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
 
-    def forward(self, idx, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
+    def forward(self, idx, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None, return_hidden=False):
         _, T = idx.size()
         assert T <= self.config.block_size, f"Token length {T} exceeds max sequence length {self.config.block_size}"
 
@@ -363,6 +364,11 @@ class OBPM(nn.Module):
                 x = block_out
 
         x = self.transformer.final_norm(x)
+
+        if return_hidden:
+            if use_cache:
+                return x, new_kv
+            return x
 
         if self.config.weight_tying:
             logits = F.linear(x, self.transformer.wte.weight, None)

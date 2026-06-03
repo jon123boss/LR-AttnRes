@@ -60,8 +60,6 @@ def get_model(config, device):
             weight_tying=config["weight_tying"],
             rope_theta=config["rope_theta"],
             rmsnorm_eps=config["rmsnorm_eps"],
-            rmsnorm_use_weight=config["rmsnorm_use_weight"],
-            rmsnorm_use_bias=config["rmsnorm_use_bias"],
             norm_pos=config["norm_pos"],
             qk_norm=config["qk_norm"],
             clip_qkv=config["clip_qkv"],
