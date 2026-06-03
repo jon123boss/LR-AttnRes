@@ -1,7 +1,7 @@
 ## Download Repository
 
 ```bash
-git clone https://github.com/jon123boss/LR-AttRes
+git clone https://github.com/jon123boss/LR-AttnRes
 cd LR-AttRes
 ```
 
