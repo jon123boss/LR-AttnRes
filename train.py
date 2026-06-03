@@ -196,29 +196,6 @@ def infinite_dataloader(dataloader):
             yield batch
 
 
-def get_lm_head_params():
-    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    if base_model.config.weight_tying:
-        return base_model.transformer.wte.weight, None
-    return base_model.lm_head.weight, base_model.lm_head.bias
-
-
-def compute_lm_loss(x, y, cu_seqlens, max_seqlen):
-    hidden = model(
-        x,
-        cu_doc_len=cu_seqlens,
-        max_doc_len=max_seqlen,
-        return_hidden=True,
-    )
-    lm_head_weight, lm_head_bias = get_lm_head_params()
-    return criterion(
-        hidden,
-        y,
-        linear_weight=lm_head_weight,
-        linear_bias=lm_head_bias,
-    )
-
-
 @torch.no_grad()
 def estimate_loss(current_step):
     out = {}
@@ -250,7 +227,9 @@ def estimate_loss(current_step):
 
             x, y = x.to(device), y.to(device)
 
-            loss = compute_lm_loss(x, y, cu_seqlens, max_seqlen)
+            logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
+            logits_for_loss = logits.float()
+            loss = criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
 
             losses.append(float(loss.item()))
 
@@ -330,7 +309,8 @@ while tokens_processed < max_tokens and step < max_steps:
 
         x, y = x.to(device), y.to(device)
 
-        loss = compute_lm_loss(x, y, cu_seqlens, max_seqlen)
+        logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
+        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
         loss = loss / grad_accum_steps
 
         loss_accum += loss.detach().item()
