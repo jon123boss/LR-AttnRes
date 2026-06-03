@@ -75,6 +75,9 @@ init_cutoff_factor = None
 use_attnres = False
 attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
+attnres_key_norm = True
+attn_res_query_norm = False
+attn_res_query_init = "zero" # zero, normal, trunc_normal
 use_lrid = False
 lrid_rank = 64
 lrid_use_logit_scale = True
@@ -140,6 +143,11 @@ def parse_args():
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
+    parser.add_argument("--attnres_key_norm", type=_str_to_bool, nargs="?", const=True, default=attnres_key_norm)
+    parser.add_argument("--no-attnres_key_norm", dest="attnres_key_norm", action="store_false")
+    parser.add_argument("--attn_res_query_norm", type=_str_to_bool, nargs="?", const=True, default=attn_res_query_norm)
+    parser.add_argument("--no-attn_res_query_norm", dest="attn_res_query_norm", action="store_false")
+    parser.add_argument("--attn_res_query_init", choices=("zero", "normal", "trunc_normal"), default=attn_res_query_init)
     parser.add_argument("--use_lrid", type=_str_to_bool, nargs="?", const=True, default=use_lrid)
     parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
     parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
@@ -158,6 +166,9 @@ use_doc_masking = args.use_doc_masking
 use_attnres = args.use_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
+attnres_key_norm = args.attnres_key_norm
+attn_res_query_norm = args.attn_res_query_norm
+attn_res_query_init = args.attn_res_query_init
 use_lrid = args.use_lrid
 lrid_rank = args.lrid_rank
 lrid_use_logit_scale = args.lrid_use_logit_scale

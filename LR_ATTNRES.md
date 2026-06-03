@@ -151,6 +151,31 @@ At step 0, all depth logits are zero, so depth routing is uniform over available
 
 There is no `lrid_init` setting anymore because LR AttnRes no longer has a computed query branch to initialize.
 
+Attention Residual query initialization is configurable:
+
+```bash
+--attn_res_query_init zero
+--attn_res_query_init normal
+--attn_res_query_init trunc_normal
+```
+
+`zero` preserves uniform depth routing at step 0. `normal` and `trunc_normal`
+start with non-uniform routing and are useful ablations.
+
+Key normalization and query normalization are also configurable:
+
+```bash
+--attnres_key_norm
+--no-attnres_key_norm
+--attn_res_query_norm
+--no-attn_res_query_norm
+```
+
+These toggles apply to both static Attention Residuals and LR AttnRes. Key
+normalization controls whether source keys are RMS-normalized before depth
+attention. Query normalization controls whether the learned depth query is
+RMS-normalized before scoring.
+
 ## Full vs Block
 
 Full LR AttnRes attends over all previous sublayer sources. It is the most expressive and the most expensive.
@@ -257,6 +282,9 @@ Model config:
 
 ```text
 use_lrid: bool
+attnres_key_norm: bool
+attn_res_query_norm: bool
+attn_res_query_init: "zero" | "normal" | "trunc_normal"
 lrid_rank: int
 lrid_use_logit_scale: bool
 lrid_logit_scale: float | None
@@ -267,6 +295,11 @@ Training CLI:
 ```bash
 --use_lrid
 --no-use_lrid
+--attnres_key_norm
+--no-attnres_key_norm
+--attn_res_query_norm
+--no-attn_res_query_norm
+--attn_res_query_init
 --lrid_rank
 --lrid_use_logit_scale
 --no-lrid_use_logit_scale

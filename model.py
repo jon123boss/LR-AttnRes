@@ -29,6 +29,9 @@ class ModelConfig:
     attnres_type: str = None
     use_attnres: bool = False
     attnres_num_blocks: int = 8
+    attnres_key_norm: bool = True
+    attn_res_query_norm: bool = False
+    attn_res_query_init: str = "zero"
     use_lrid: bool = False
     lrid_rank: int = 64
     lrid_use_logit_scale: bool = True
@@ -37,6 +40,9 @@ class ModelConfig:
     def __post_init__(self):
         self.attnres_type = (self.attnres_type or "block")
         self.attnres_type = self.attnres_type.lower()
+        self.attn_res_query_init = (self.attn_res_query_init or "zero").lower()
+        if self.attn_res_query_init not in {"zero", "normal", "trunc_normal"}:
+            raise ValueError("attn_res_query_init must be one of: zero, normal, trunc_normal")
         if self.lrid_rank < 1:
             raise ValueError("lrid_rank must be >= 1")
         if not self.lrid_use_logit_scale:
@@ -103,24 +109,29 @@ class LRIDFusedProjection(nn.Module):
         self.output_dim = output_dim
         self.rank = config.lrid_rank
         self.proj = nn.Linear(input_dim, output_dim + self.rank, bias=False)
-        self.key_norm = RMSNorm(config, dim=self.rank)
+        self.key_norm = RMSNorm(config, dim=self.rank) if config.attnres_key_norm else None
 
     def forward(self, x):
         output, key = self.proj(x).split(
             (self.output_dim, self.rank),
             dim=-1,
         )
-        return output, self.key_norm(key)
+        if self.key_norm is not None:
+            key = self.key_norm(key)
+        return output, key
 
 
 class LRIDSourceKeyProjection(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.proj = nn.Linear(config.n_embd, config.lrid_rank, bias=False)
-        self.key_norm = RMSNorm(config, dim=config.lrid_rank)
+        self.key_norm = RMSNorm(config, dim=config.lrid_rank) if config.attnres_key_norm else None
 
     def forward(self, x):
-        return self.key_norm(self.proj(x))
+        key = self.proj(x)
+        if self.key_norm is not None:
+            key = self.key_norm(key)
+        return key
 
 class MultiHeadAttention(nn.Module):
     flash_attn_func = None
@@ -276,12 +287,20 @@ class MLP(nn.Module):
 class AttentionResidual(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.norm = RMSNorm(config)
+        self.config = config
+        self.norm = RMSNorm(config) if config.attnres_key_norm else None
         self.query = nn.Parameter(torch.empty(config.n_embd))
 
+    def _query(self, dtype):
+        query = self.query
+        if self.config.attn_res_query_norm:
+            query_float = query.float()
+            query = query_float * torch.rsqrt(query_float.pow(2).mean() + self.config.rmsnorm_eps)
+        return query.to(dtype)
+
     def forward(self, values):
-        keys = self.norm(values)
-        logits = torch.einsum("d,sbtd->sbt", self.query.to(keys.dtype), keys)
+        keys = self.norm(values) if self.norm is not None else values
+        logits = torch.einsum("d,sbtd->sbt", self._query(keys.dtype), keys)
         weights = F.softmax(logits, dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
 
@@ -399,7 +418,7 @@ class OBPM(nn.Module):
             if self.use_lrid:
                 transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
                 transformer_modules["lrid_queries"] = nn.ParameterList(
-                    [nn.Parameter(torch.zeros(config.lrid_rank)) for _ in range(2 * config.n_layer + 1)]
+                    [nn.Parameter(torch.empty(config.lrid_rank)) for _ in range(2 * config.n_layer + 1)]
                 )
             else:
                 transformer_modules["attn_residuals"] = nn.ModuleList(
@@ -412,6 +431,9 @@ class OBPM(nn.Module):
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         self.apply(partial(self._init_weights, std=config.init_std, init_cutoff_factor=config.init_cutoff_factor))
+        if self.use_lrid:
+            for query in self.transformer.lrid_queries:
+                self._init_attnres_query(query, config.init_std, config.init_cutoff_factor)
     
     def to_mixed_precision(self, dtype=torch.bfloat16):
         self.to(dtype=dtype)
@@ -438,16 +460,30 @@ class OBPM(nn.Module):
 
         values = torch.stack([value for value, _ in sources], dim=0)
         keys = torch.stack([key for _, key in sources], dim=0)
-        keys_float = keys.float()
-        keys = (
-            keys_float
-            * torch.rsqrt(keys_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
-        ).to(values.dtype)
-        query = self.transformer.lrid_queries[residual_idx].to(keys.dtype)
+        if self.config.attnres_key_norm:
+            keys_float = keys.float()
+            keys = (
+                keys_float
+                * torch.rsqrt(keys_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
+            ).to(values.dtype)
+        query = self.transformer.lrid_queries[residual_idx]
+        if self.config.attn_res_query_norm:
+            query_float = query.float()
+            query = query_float * torch.rsqrt(query_float.pow(2).mean() + self.config.rmsnorm_eps)
+        query = query.to(keys.dtype)
         logits = torch.einsum("sbtr,r->sbt", keys, query) * self.config.lrid_logit_scale
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
     
+    def _init_attnres_query(self, query, std=0.02, init_cutoff_factor=None):
+        if self.config.attn_res_query_init == "zero":
+            nn.init.zeros_(query)
+        elif self.config.attn_res_query_init == "normal":
+            nn.init.normal_(query, mean=0.0, std=std)
+        elif self.config.attn_res_query_init == "trunc_normal":
+            cutoff = (init_cutoff_factor if init_cutoff_factor is not None else 3.0) * std
+            nn.init.trunc_normal_(query, mean=0.0, std=std, a=-cutoff, b=cutoff)
+
     def _init_weights(self, module, std=0.02, init_cutoff_factor=None):
         if isinstance(module, nn.Linear):
             if init_cutoff_factor is not None:
@@ -462,7 +498,7 @@ class OBPM(nn.Module):
             else:
                 nn.init.normal_(module.weight, mean=0.0, std=std)
         elif isinstance(module, AttentionResidual):
-            nn.init.zeros_(module.query)
+            self._init_attnres_query(module.query, std, init_cutoff_factor)
 
     def _sample_next_token(self, logits, temperature=1.0, top_k=None):
         if temperature < 0.0:

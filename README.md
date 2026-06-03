@@ -38,6 +38,9 @@ python train.py --use_lrid --attnres_type block --lrid_rank 64
 input-independent depth queries as normal Attention Residuals, but routes over
 low-rank input-dependent source keys. Logit scaling defaults to `1 / sqrt(lrid_rank)`;
 disable it with `--no-lrid_logit_scale` or set it explicitly with `--lrid_logit_scale`.
+Attention Residual key normalization, query normalization, and query initialization
+are configurable via `--attnres_key_norm`, `--attn_res_query_norm`, and
+`--attn_res_query_init`.
 
 See [LR_ATTNRES.md](LR_ATTNRES.md) for the full design note, parameter cost,
 stability rationale, and experiment matrix.
