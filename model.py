@@ -35,6 +35,7 @@ class ModelConfig:
     use_lrid: bool = False
     lrid_rank: int = 64
     lrid_num_heads: int = 1
+    lrid_input_dependent_query: bool = False
     lrid_use_logit_scale: bool = True
     lrid_logit_scale: float = None
 
@@ -152,16 +153,27 @@ class LRIDFusedProjection(nn.Module):
         super().__init__()
         self.output_dim = output_dim
         self.rank = config.lrid_rank
-        self.proj = nn.Linear(input_dim, output_dim + self.rank, bias=False)
+        self.use_query = config.lrid_input_dependent_query
+        extra_dim = self.rank * (2 if self.use_query else 1)
+        self.proj = nn.Linear(input_dim, output_dim + extra_dim, bias=False)
         self.key_norm = LRIDKeyRMSNorm(config) if config.attnres_key_norm else None
 
     def forward(self, x):
-        output, key = self.proj(x).split(
-            (self.output_dim, self.rank),
-            dim=-1,
-        )
+        projected = self.proj(x)
+        if self.use_query:
+            output, key, query = projected.split(
+                (self.output_dim, self.rank, self.rank),
+                dim=-1,
+            )
+        else:
+            output, key = projected.split(
+                (self.output_dim, self.rank),
+                dim=-1,
+            )
         if self.key_norm is not None:
             key = self.key_norm(key)
+        if self.use_query:
+            return output, key, query
         return output, key
 
 
@@ -299,15 +311,22 @@ class MultiHeadAttention(nn.Module):
         
         projected = self.c_proj(attention_output)
         if self.config.use_lrid:
-            x, lrid_key = projected
+            if self.config.lrid_input_dependent_query:
+                x, lrid_key, lrid_query = projected
+            else:
+                x, lrid_key = projected
         else:
             x = projected
         
         if use_cache:
             if self.config.use_lrid:
+                if self.config.lrid_input_dependent_query:
+                    return x, (k, v), lrid_key, lrid_query
                 return x, (k, v), lrid_key
             return x, (k, v)
         if self.config.use_lrid:
+            if self.config.lrid_input_dependent_query:
+                return x, lrid_key, lrid_query
             return x, lrid_key
         return x
 
@@ -368,11 +387,18 @@ class Block(nn.Module):
         attn_out = self.attn(x, past_kv=past_kv, use_cache=use_cache, cu_doc_len=cu_doc_len, max_doc_len=max_doc_len)
 
         if self.config.use_lrid:
-            if use_cache:
-                x, new_kv, lrid_key = attn_out
+            if self.config.lrid_input_dependent_query:
+                if use_cache:
+                    x, new_kv, lrid_key, lrid_query = attn_out
+                else:
+                    x, lrid_key, lrid_query = attn_out
+                    new_kv = None
             else:
-                x, lrid_key = attn_out
-                new_kv = None
+                if use_cache:
+                    x, new_kv, lrid_key = attn_out
+                else:
+                    x, lrid_key = attn_out
+                    new_kv = None
         elif use_cache:
             x, new_kv = attn_out
         else:
@@ -384,9 +410,13 @@ class Block(nn.Module):
 
         if use_cache:
             if self.config.use_lrid:
+                if self.config.lrid_input_dependent_query:
+                    return x, new_kv, lrid_key, lrid_query
                 return x, new_kv, lrid_key
             return x, new_kv
         if self.config.use_lrid:
+            if self.config.lrid_input_dependent_query:
+                return x, lrid_key, lrid_query
             return x, lrid_key
         return x
 
@@ -396,7 +426,10 @@ class Block(nn.Module):
 
         mlp_out = self.mlp(x)
         if self.config.use_lrid:
-            x, lrid_key = mlp_out
+            if self.config.lrid_input_dependent_query:
+                x, lrid_key, lrid_query = mlp_out
+            else:
+                x, lrid_key = mlp_out
         else:
             x = mlp_out
 
@@ -404,6 +437,8 @@ class Block(nn.Module):
             x = self.mlp_norm(x)
 
         if self.config.use_lrid:
+            if self.config.lrid_input_dependent_query:
+                return x, lrid_key, lrid_query
             return x, lrid_key
         return x
 
@@ -462,13 +497,14 @@ class OBPM(nn.Module):
                 raise ValueError("attnres_num_blocks must be >= 1 when using block AttnRes")
             if self.use_lrid:
                 transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
-                key_head_dim = config.lrid_rank // config.lrid_num_heads
-                transformer_modules["lrid_queries"] = nn.ParameterList(
-                    [
-                        nn.Parameter(torch.empty(config.lrid_num_heads, key_head_dim))
-                        for _ in range(2 * config.n_layer + 1)
-                    ]
-                )
+                if not config.lrid_input_dependent_query:
+                    key_head_dim = config.lrid_rank // config.lrid_num_heads
+                    transformer_modules["lrid_queries"] = nn.ParameterList(
+                        [
+                            nn.Parameter(torch.empty(config.lrid_num_heads, key_head_dim))
+                            for _ in range(2 * config.n_layer + 1)
+                        ]
+                    )
             else:
                 transformer_modules["attn_residuals"] = nn.ModuleList(
                     [AttentionResidual(config) for _ in range(2 * config.n_layer + 1)]
@@ -480,9 +516,13 @@ class OBPM(nn.Module):
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         self.apply(partial(self._init_weights, std=config.init_std, init_cutoff_factor=config.init_cutoff_factor))
-        if self.use_lrid:
+        if self.use_lrid and not config.lrid_input_dependent_query:
             for query in self.transformer.lrid_queries:
                 self._init_attnres_query(query, config.init_std, config.init_cutoff_factor)
+        if self.use_lrid and config.lrid_input_dependent_query:
+            for module in self.modules():
+                if isinstance(module, LRIDFusedProjection):
+                    self._init_lrid_query_projection(module, config.init_std, config.init_cutoff_factor)
     
     def to_mixed_precision(self, dtype=torch.bfloat16):
         self.to(dtype=dtype)
@@ -500,15 +540,20 @@ class OBPM(nn.Module):
         values = torch.stack(sources, dim=0)
         return self.transformer.attn_residuals[residual_idx](values)
 
-    def _embedding_lrid_source(self, embedding):
-        return embedding, self.transformer.lrid_embedding_key(embedding)
+    def _lrid_source(self, value, key, query=None):
+        if self.config.lrid_input_dependent_query:
+            return value, key, query
+        return value, key
 
-    def _apply_lrid_attnres(self, residual_idx, sources):
+    def _embedding_lrid_source(self, embedding):
+        return self._lrid_source(embedding, self.transformer.lrid_embedding_key(embedding))
+
+    def _apply_lrid_attnres(self, residual_idx, sources, query_override=None):
         if len(sources) == 1:
             return sources[0][0]
 
-        values = torch.stack([value for value, _ in sources], dim=0)
-        keys = torch.stack([key for _, key in sources], dim=0)
+        values = torch.stack([source[0] for source in sources], dim=0)
+        keys = torch.stack([source[1] for source in sources], dim=0)
         num_heads = self.config.lrid_num_heads
         key_head_dim = self.config.lrid_rank // num_heads
         value_head_dim = self.config.n_embd // num_heads
@@ -521,12 +566,23 @@ class OBPM(nn.Module):
                 keys_float
                 * torch.rsqrt(keys_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
             ).to(values.dtype)
-        query = self.transformer.lrid_queries[residual_idx]
+
+        if self.config.lrid_input_dependent_query:
+            query = query_override if query_override is not None else sources[-1][2]
+            if query is None:
+                raise RuntimeError("Input-dependent LR AttnRes query is missing for the active source")
+            query = query.reshape(*query.shape[:-1], num_heads, key_head_dim)
+        else:
+            query = self.transformer.lrid_queries[residual_idx]
+
         if self.config.attn_res_query_norm:
             query_float = query.float()
             query = query_float * torch.rsqrt(query_float.pow(2).mean(dim=-1, keepdim=True) + self.config.rmsnorm_eps)
         query = query.to(keys.dtype)
-        logits = torch.einsum("sbthr,hr->sbth", keys, query) * self.config.lrid_logit_scale
+        if self.config.lrid_input_dependent_query:
+            logits = torch.einsum("sbthr,bthr->sbth", keys, query) * self.config.lrid_logit_scale
+        else:
+            logits = torch.einsum("sbthr,hr->sbth", keys, query) * self.config.lrid_logit_scale
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         output = torch.einsum("sbth,sbthd->bthd", weights, values)
         return output.reshape(output.size(0), output.size(1), self.config.n_embd)
@@ -539,6 +595,12 @@ class OBPM(nn.Module):
         elif self.config.attn_res_query_init == "trunc_normal":
             cutoff = (init_cutoff_factor if init_cutoff_factor is not None else 3.0) * std
             nn.init.trunc_normal_(query, mean=0.0, std=std, a=-cutoff, b=cutoff)
+
+    def _init_lrid_query_projection(self, module, std=0.02, init_cutoff_factor=None):
+        if not module.use_query:
+            return
+        query_weight = module.proj.weight[module.output_dim + module.rank:]
+        self._init_attnres_query(query_weight, std, init_cutoff_factor)
 
     def _init_weights(self, module, std=0.02, init_cutoff_factor=None):
         if isinstance(module, nn.Linear):
@@ -594,6 +656,8 @@ class OBPM(nn.Module):
                 partial_block = None
                 if self.use_lrid:
                     partial_key = None
+                    if self.config.lrid_input_dependent_query:
+                        partial_query = None
         
         if past_kv is None:
             past_kv = [None] * len(self.transformer.layers)
@@ -607,45 +671,65 @@ class OBPM(nn.Module):
                     else:
                         attn_res_idx = 2 * layer_idx
                         in_block_idx = attn_res_idx % block_size
-                        sources = completed_blocks if in_block_idx == 0 else completed_blocks + [(partial_block, partial_key)]
+                        sources = completed_blocks if in_block_idx == 0 else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
                         x = self._apply_lrid_attnres(attn_res_idx, sources)
 
-                    attn_out, lrid_key = block.forward_attention(
+                    attn_out = block.forward_attention(
                         x,
                         past_kv=past_kv[layer_idx],
                         use_cache=False,
                         cu_doc_len=cu_doc_len,
                         max_doc_len=max_doc_len,
                     )
+                    if self.config.lrid_input_dependent_query:
+                        attn_out, lrid_key, lrid_query = attn_out
+                    else:
+                        attn_out, lrid_key = attn_out
                     layer_output = attn_out
 
                     if self.attnres_type == "full":
-                        residual_sources.append((layer_output, lrid_key))
+                        residual_sources.append(self._lrid_source(layer_output, lrid_key, lrid_query if self.config.lrid_input_dependent_query else None))
                         x = self._apply_lrid_attnres(2 * layer_idx + 1, residual_sources)
                     else:
                         if partial_block is None:
                             partial_block = layer_output
                             partial_key = lrid_key
+                            if self.config.lrid_input_dependent_query:
+                                partial_query = lrid_query
                         else:
                             partial_block = partial_block + layer_output
                             partial_key = partial_key + lrid_key
-                        sources = completed_blocks if (2 * layer_idx + 1) % block_size == 0 else completed_blocks + [(partial_block, partial_key)]
-                        x = self._apply_lrid_attnres(2 * layer_idx + 1, sources)
+                            if self.config.lrid_input_dependent_query:
+                                partial_query = partial_query + lrid_query
+                        sources = completed_blocks if (2 * layer_idx + 1) % block_size == 0 else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
+                        x = self._apply_lrid_attnres(
+                            2 * layer_idx + 1,
+                            sources,
+                            query_override=partial_query if self.config.lrid_input_dependent_query else None,
+                        )
 
-                    mlp_out, lrid_key = block.forward_mlp(x)
+                    mlp_out = block.forward_mlp(x)
+                    if self.config.lrid_input_dependent_query:
+                        mlp_out, lrid_key, lrid_query = mlp_out
+                    else:
+                        mlp_out, lrid_key = mlp_out
                     layer_output = mlp_out
                     x = mlp_out
 
                     if self.attnres_type == "full":
-                        residual_sources.append((layer_output, lrid_key))
+                        residual_sources.append(self._lrid_source(layer_output, lrid_key, lrid_query if self.config.lrid_input_dependent_query else None))
                     else:
                         partial_block = layer_output if partial_block is None else partial_block + layer_output
                         partial_key = lrid_key if partial_key is None else partial_key + lrid_key
+                        if self.config.lrid_input_dependent_query:
+                            partial_query = lrid_query if partial_query is None else partial_query + lrid_query
                         is_block_end = ((2 * layer_idx + 2) % block_size == 0) or (layer_idx + 1 == self.config.n_layer)
                         if is_block_end:
-                            completed_blocks.append((partial_block, partial_key))
+                            completed_blocks.append(self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None))
                             partial_block = None
                             partial_key = None
+                            if self.config.lrid_input_dependent_query:
+                                partial_query = None
                     continue
                 elif self.attnres_type == "full":
                     x = self._apply_attnres(2 * layer_idx, residual_sources)
@@ -704,7 +788,7 @@ class OBPM(nn.Module):
                 if self.attnres_type == "full":
                     x = self._apply_lrid_attnres(2 * self.config.n_layer, residual_sources)
                 else:
-                    sources = completed_blocks if partial_block is None else completed_blocks + [(partial_block, partial_key)]
+                    sources = completed_blocks if partial_block is None else completed_blocks + [self._lrid_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None)]
                     x = self._apply_lrid_attnres(2 * self.config.n_layer, sources)
             elif self.attnres_type == "full":
                 x = self._apply_attnres(2 * self.config.n_layer, residual_sources)

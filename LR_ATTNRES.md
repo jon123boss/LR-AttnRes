@@ -35,7 +35,8 @@ Attention Residuals replace fixed residual accumulation with attention over prio
 
 Standard residuals are fixed. Static Attention Residuals are learned, but their depth queries are input-independent. The original LRID idea tried to make both the query and key input-dependent through low-rank projections.
 
-In practice, the input-dependent query path was unstable. LR AttnRes removes that path and keeps the lower-risk part:
+In practice, the input-dependent query path was unstable. LR AttnRes removes
+that path by default and keeps the lower-risk part:
 
 - low-rank input-dependent source keys
 - learned static depth queries
@@ -66,13 +67,35 @@ output_d: normal sublayer output
 key_k:    low-rank source key
 ```
 
+An input-dependent query ablation is available:
+
+```bash
+--lrid_input_dependent_query
+```
+
+When enabled, attention and MLP output projections emit both a source key and a
+source query:
+
+```text
+c_proj: d -> d + 2k
+fc2: hidden -> d + 2k
+```
+
+The split becomes:
+
+```text
+output_d: normal sublayer output
+key_k:    low-rank source key
+query_k:  low-rank query for future depth routing
+```
+
 The token embedding is also a depth source, so it gets its own low-rank key projection:
 
 ```text
 embedding_key = Linear(d, k)(embedding)
 ```
 
-For every Attention Residual depth site, LR AttnRes has a learned query:
+By default, every Attention Residual depth site has a learned static query:
 
 ```text
 q_r in R^(lrid_num_heads x lrid_rank / lrid_num_heads)
@@ -85,6 +108,10 @@ There are:
 ```
 
 query parameters, matching the number of depth-aggregation sites in the current AttnRes implementation.
+
+When `lrid_input_dependent_query=True`, these static query parameters are not
+created. The depth site instead uses the latest available source query emitted
+by an attention or MLP output projection.
 
 LR AttnRes depth routing can be multi-head:
 
@@ -108,14 +135,24 @@ keys = stack(source_key_i)
 values = reshape(values, sources, batch, time, m, d/m)
 keys = reshape(keys, sources, batch, time, m, k/m)
 keys = RMSNorm(keys over k/m)
-query = q_r
+query = q_r                         # static-query mode
 logits_i,h = scale * dot(keys_i,h, query_h)
 weights_i,h = softmax_i(logits_h)
 output_h = sum_i weights_i,h * values_i,h
 output = reshape(output, batch, time, d)
 ```
 
-The low-rank source keys are input-dependent. The query is learned and input-independent.
+For input-dependent query mode:
+
+```text
+query = latest_source_query
+query = reshape(query, batch, time, m, k/m)
+logits_i,h = scale * dot(keys_i,h, query_h)
+```
+
+The low-rank source keys are always input-dependent. The query is learned and
+input-independent by default, and input-dependent only when
+`lrid_input_dependent_query=True`.
 
 ## Logit Scale Toggle
 
@@ -158,11 +195,14 @@ Set a custom scale:
 --lrid_logit_scale 0.0625
 ```
 
-Use the toggle because it is not yet obvious whether the scale is necessary once the query path is static. The scale is useful for conservative stability; the unscaled path may be worth testing because static zero-initialized queries start with zero logits anyway.
+Use the toggle because it is not yet obvious whether the scale is necessary once
+the query path is static. The scale is useful for conservative stability; the
+unscaled path may be worth testing because zero-initialized queries start with
+zero logits anyway.
 
 ## Initialization
 
-LR AttnRes queries are zero-initialized:
+Static LR AttnRes queries are zero-initialized:
 
 ```text
 q_r = 0
@@ -170,7 +210,10 @@ q_r = 0
 
 At step 0, all depth logits are zero, so depth routing is uniform over available sources. This mirrors normal Attention Residuals and avoids the instability from computed low-rank query projections.
 
-There is no `lrid_init` setting anymore because LR AttnRes no longer has a computed query branch to initialize.
+When `lrid_input_dependent_query=True`, the query rows of each LR output
+projection are initialized with the same `attn_res_query_init` setting. The
+default `zero` therefore preserves uniform depth routing at step 0 even though
+the query is computed from the sublayer output.
 
 Attention Residual query initialization is configurable:
 
@@ -251,11 +294,24 @@ attention key overhead = k * d
 MLP key overhead       = k * h
 ```
 
+When `lrid_input_dependent_query=True`, it also adds:
+
+```text
+attention query overhead = k * d
+MLP query overhead       = k * h
+```
+
 Once per model, it adds:
 
 ```text
 embedding key overhead = k * d
 depth query overhead   = (2L + 1) * k
+```
+
+In input-dependent query mode, the static depth query overhead is removed:
+
+```text
+depth query overhead = 0
 ```
 
 When `k` is fixed, increasing `m` does not change these projection or query
@@ -285,11 +341,16 @@ queries = 25 * 64 = 1,600
 total extra = 2,213,440
 ```
 
-This is about half the old LRID overhead because the old computed-query projection branch was removed.
+This is about half the old LRID overhead because the computed-query projection
+branch is disabled by default.
 
 ## Stability Notes
 
-The unstable LRID path computed a query from every sublayer output. That created large gradient norms in training. Static-query LR AttnRes removes that computed query branch.
+The unstable LRID path computed a query from every sublayer output. That created large gradient norms in training. Static-query LR AttnRes removes that computed query branch by default.
+
+`--lrid_input_dependent_query` re-enables this family of behavior as an explicit
+ablation. It should be treated as higher risk than static-query LR AttnRes,
+especially with nonzero query projection initialization.
 
 The last smoke diagnostic for static-query LR AttnRes reported:
 
@@ -313,6 +374,7 @@ attn_res_query_norm: bool
 attn_res_query_init: "zero" | "normal" | "trunc_normal"
 lrid_rank: int
 lrid_num_heads: int
+lrid_input_dependent_query: bool
 lrid_use_logit_scale: bool
 lrid_logit_scale: float | None
 ```
@@ -329,6 +391,8 @@ Training CLI:
 --attn_res_query_init
 --lrid_rank
 --lrid_num_heads
+--lrid_input_dependent_query
+--no-lrid_input_dependent_query
 --lrid_use_logit_scale
 --no-lrid_use_logit_scale
 --no-lrid_logit_scale
@@ -373,6 +437,7 @@ static block Attention Residuals
 LR AttnRes block, rank 32, scaled
 LR AttnRes block, rank 64, scaled
 LR AttnRes block, rank 64, 8 depth heads, scaled
+LR AttnRes block, rank 64, input-dependent query, scaled
 LR AttnRes block, rank 64, unscaled
 LR AttnRes full, rank 64, scaled
 ```
@@ -382,6 +447,7 @@ Then sweep:
 ```text
 lrid_rank = 16, 32, 64, 128
 lrid_num_heads = 1, 2, 4, 8
+lrid_input_dependent_query = false, true
 lrid_logit_scale = off, 1/sqrt(k / lrid_num_heads), 0.5/sqrt(k / lrid_num_heads)
 attnres_type = block, full
 ```
@@ -391,6 +457,7 @@ Suggested first comparison:
 ```bash
 python train.py --use_lrid --attnres_type block --lrid_rank 64
 python train.py --use_lrid --attnres_type block --lrid_rank 64 --lrid_num_heads 8
+python train.py --use_lrid --attnres_type block --lrid_rank 64 --lrid_input_dependent_query
 python train.py --use_lrid --attnres_type block --lrid_rank 64 --no-lrid_logit_scale
 ```
 

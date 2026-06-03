@@ -36,10 +36,12 @@ python train.py --use_lrid --attnres_type block --lrid_rank 64
 
 `--use_lrid` automatically enables `use_attnres`. LR AttnRes uses the same learned,
 input-independent depth queries as normal Attention Residuals, but routes over
-low-rank input-dependent source keys. Depth routing can be split into multiple
-heads with `--lrid_num_heads`; `lrid_rank` remains the total low-rank width.
-Logit scaling defaults to `1 / sqrt(lrid_rank / lrid_num_heads)`; disable it
-with `--no-lrid_logit_scale` or set it explicitly with `--lrid_logit_scale`.
+low-rank input-dependent source keys. An optional ablation can also emit
+input-dependent depth queries with `--lrid_input_dependent_query`, changing LR
+output projections from `d + k` to `d + 2k`. Depth routing can be split into
+multiple heads with `--lrid_num_heads`; `lrid_rank` remains the total low-rank
+width. Logit scaling defaults to `1 / sqrt(lrid_rank / lrid_num_heads)`;
+disable it with `--no-lrid_logit_scale` or set it explicitly with `--lrid_logit_scale`.
 Attention Residual key normalization, query normalization, and query initialization
 are configurable via `--attnres_key_norm`, `--attn_res_query_norm`, and
 `--attn_res_query_init`.
