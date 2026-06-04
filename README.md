@@ -17,6 +17,7 @@ pip install datasets
 pip install lm_eval
 pip install hf_transfer
 pip install wandb  # Optional, for experiment tracking
+pip install liger-kernel  # Optional, for Liger kernel speed/memory ablations
 ```
 
 ## Data Preparation
@@ -80,3 +81,28 @@ with `--attnres_block_average`.
 
 See [LR_ATTNRES.md](LR_ATTNRES.md) for the full design note, parameter cost,
 stability rationale, and experiment matrix.
+
+## Liger Kernel Toggles
+
+Liger kernels are optional and default off. Enable all implemented kernels with:
+
+```bash
+python train.py --use_liger_kernels
+```
+
+Each kernel can also be toggled independently:
+
+```bash
+python train.py \
+  --liger_rms_norm \
+  --liger_rope \
+  --liger_swiglu \
+  --liger_cross_entropy \
+  --liger_fused_linear_cross_entropy \
+  --liger_embedding \
+  --liger_attnres
+```
+
+Use `--no-liger_<name>` to subtract one from the master switch, for example
+`--use_liger_kernels --no-liger_rope`. `--liger_strict` raises instead of
+falling back when a requested Liger kernel is unavailable.

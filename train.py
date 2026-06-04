@@ -10,7 +10,7 @@ import os, sys
 import copy
 import argparse
 import numpy as np
-from utils import get_config, get_device, get_model, get_dataloader, compute_validation_loss
+from utils import get_config, get_device, get_model, get_dataloader, compute_validation_loss, compute_lm_loss
 from criterion import get_criterion
 from wandb_logger import get_logger
 from optimizer import get_optimizers
@@ -18,6 +18,7 @@ from schedulers import get_schedulers
 from dataloader import create_dataloaders, DataLoaderConfig, warmup_boundaries
 from typing import Optional, List, Dict, Any
 from model import OBPM
+from liger_utils import ACCELERATOR_DEVICE_TYPES, report_liger_status
 import torch.nn.functional as F
 from tokenizer_utils import (
     GPT4_EOT_TOKEN as _GPT4_EOT_TOKEN,
@@ -33,7 +34,8 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
 import torch._dynamo as dynamo
-dynamo.config.recompile_limit = 64
+if hasattr(dynamo.config, "recompile_limit"):
+    dynamo.config.recompile_limit = 64
 
 device = get_device()
 # -------------------------------- Config ------------------------------------
@@ -78,6 +80,16 @@ weight_tying = False
 flash_attention = True
 init_std = 0.02
 init_cutoff_factor = None
+# Liger Kernel toggles
+use_liger_kernels = False
+liger_rms_norm = False
+liger_rope = False
+liger_swiglu = False
+liger_cross_entropy = False
+liger_fused_linear_cross_entropy = False
+liger_embedding = False
+liger_attnres = False
+liger_strict = False
 # Attention Residuals
 use_attnres = False
 attnres_type = "block" # "full" or "block"
@@ -146,6 +158,15 @@ def _str_to_bool(value):
     raise argparse.ArgumentTypeError("expected a boolean value")
 
 
+def _add_optional_bool_arg(parser, name):
+    parser.add_argument(f"--{name}", type=_str_to_bool, nargs="?", const=True, default=None)
+    parser.add_argument(f"--no-{name}", dest=name, action="store_false")
+
+
+def _resolve_liger_toggle(value, master):
+    return master if value is None else value
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OBPM.")
     parser.add_argument("--eval_only", type=_str_to_bool, nargs="?", const=True, default=eval_only)
@@ -154,6 +175,17 @@ def parse_args():
     parser.add_argument("--no-wandb_log", dest="wandb_log", action="store_false")
     parser.add_argument("--use_doc_masking", type=_str_to_bool, nargs="?", const=True, default=use_doc_masking)
     parser.add_argument("--no-use_doc_masking", dest="use_doc_masking", action="store_false")
+    parser.add_argument("--use_liger_kernels", type=_str_to_bool, nargs="?", const=True, default=use_liger_kernels)
+    parser.add_argument("--no-use_liger_kernels", dest="use_liger_kernels", action="store_false")
+    _add_optional_bool_arg(parser, "liger_rms_norm")
+    _add_optional_bool_arg(parser, "liger_rope")
+    _add_optional_bool_arg(parser, "liger_swiglu")
+    _add_optional_bool_arg(parser, "liger_cross_entropy")
+    _add_optional_bool_arg(parser, "liger_fused_linear_cross_entropy")
+    _add_optional_bool_arg(parser, "liger_embedding")
+    _add_optional_bool_arg(parser, "liger_attnres")
+    parser.add_argument("--liger_strict", type=_str_to_bool, nargs="?", const=True, default=liger_strict)
+    parser.add_argument("--no-liger_strict", dest="liger_strict", action="store_false")
     parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
@@ -199,6 +231,18 @@ args = parse_args()
 eval_only = args.eval_only
 wandb_log = args.wandb_log
 use_doc_masking = args.use_doc_masking
+use_liger_kernels = args.use_liger_kernels
+liger_rms_norm = _resolve_liger_toggle(args.liger_rms_norm, use_liger_kernels)
+liger_rope = _resolve_liger_toggle(args.liger_rope, use_liger_kernels)
+liger_swiglu = _resolve_liger_toggle(args.liger_swiglu, use_liger_kernels)
+liger_cross_entropy = _resolve_liger_toggle(args.liger_cross_entropy, use_liger_kernels)
+liger_fused_linear_cross_entropy = _resolve_liger_toggle(
+    args.liger_fused_linear_cross_entropy,
+    use_liger_kernels,
+)
+liger_embedding = _resolve_liger_toggle(args.liger_embedding, use_liger_kernels)
+liger_attnres = _resolve_liger_toggle(args.liger_attnres, use_liger_kernels)
+liger_strict = args.liger_strict
 use_attnres = args.use_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
@@ -229,6 +273,18 @@ lrid_logit_scale = args.lrid_logit_scale
 interactive_after_train = args.interactive_after_train
 
 config = get_config(sys.modules[__name__].__dict__)
+liger_enabled = {
+    "rms_norm": liger_rms_norm,
+    "rope": liger_rope,
+    "swiglu": liger_swiglu,
+    "cross_entropy": liger_cross_entropy,
+    "fused_linear_cross_entropy": liger_fused_linear_cross_entropy,
+    "embedding": liger_embedding,
+    "attnres": liger_attnres,
+}
+report_liger_status(liger_enabled, strict=liger_strict)
+if liger_strict and any(liger_enabled.values()) and device.type not in ACCELERATOR_DEVICE_TYPES:
+    raise RuntimeError(f"Liger strict mode requires an accelerator device, got {device.type}")
 start_step, checkpoint, model, model_config = get_model(config, device)
 if device.type == "cuda":
     model.to_mixed_precision(dtype=torch.bfloat16)
@@ -318,9 +374,15 @@ def estimate_loss(current_step):
 
             x, y = x.to(device), y.to(device)
 
-            logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
-            logits_for_loss = logits.float()
-            loss = criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
+            loss = compute_lm_loss(
+                model,
+                criterion,
+                x,
+                y,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cast_logits_to_float=True,
+            )
 
             losses.append(float(loss.item()))
 
@@ -424,8 +486,15 @@ while tokens_processed < max_tokens and step < max_steps:
 
         x, y = x.to(device), y.to(device)
 
-        logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
-        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+        loss = compute_lm_loss(
+            model,
+            criterion,
+            x,
+            y,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cast_logits_to_float=False,
+        )
         loss = loss / grad_accum_steps
 
         loss_accum += loss.detach().item()

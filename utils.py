@@ -86,6 +86,11 @@ def get_model(config, device):
             lrid_query_from_value_shared = config.get("lrid_query_from_value_shared", False),
             lrid_use_logit_scale = config["lrid_use_logit_scale"],
             lrid_logit_scale = config["lrid_logit_scale"],
+            liger_rms_norm = config.get("liger_rms_norm", False),
+            liger_rope = config.get("liger_rope", False),
+            liger_swiglu = config.get("liger_swiglu", False),
+            liger_embedding = config.get("liger_embedding", False),
+            liger_attnres = config.get("liger_attnres", False),
             )
         model = OBPM(model_config)
     else:
@@ -126,6 +131,42 @@ def get_validation_dataloader(config):
         dtype=np.dtype(config.get("data_dtype", "uint32")),
     )
     return create_validation_dataloader(dataloader_config)
+
+
+def get_lm_head_for_loss(model):
+    target = getattr(model, "_orig_mod", model)
+    return target.get_lm_head_weight(), target.get_lm_head_bias()
+
+
+def compute_lm_loss(
+    model,
+    criterion,
+    x,
+    y,
+    cu_seqlens=None,
+    max_seqlen=None,
+    cast_logits_to_float=True,
+):
+    if getattr(criterion, "uses_fused_linear", False):
+        hidden = model(
+            x,
+            cu_doc_len=cu_seqlens,
+            max_doc_len=max_seqlen,
+            return_hidden=True,
+        )
+        weight, bias = get_lm_head_for_loss(model)
+        fallback_logits_dtype = torch.float32 if cast_logits_to_float else None
+        return criterion(
+            hidden,
+            y,
+            lm_head_weight=weight,
+            lm_head_bias=bias,
+            fallback_logits_dtype=fallback_logits_dtype,
+        )
+
+    logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
+    logits_for_loss = logits.float() if cast_logits_to_float else logits
+    return criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
 
 
 @torch.no_grad()
@@ -170,9 +211,14 @@ def compute_validation_loss(
 
             x, y = x.to(device), y.to(device)
 
-            logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
-            logits_for_loss = logits.float()
-            loss = criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
+            loss = compute_lm_loss(
+                model,
+                criterion,
+                x,
+                y,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
 
             if loss.dim() == 0:
                 loss_value = float(loss.item())

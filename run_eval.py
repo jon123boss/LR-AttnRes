@@ -1,8 +1,14 @@
 # run_eval.py
+#   python run_eval.py
 #   python run_eval.py --ckpts out/ckpt_step:38146.pt
+#   python run_eval.py --validation-only
+#   python run_eval.py --tasks-only
 
 import argparse
+import glob
 import os
+import re
+from importlib.metadata import PackageNotFoundError, version
 from typing import List, Tuple, Union
 
 import torch
@@ -51,6 +57,10 @@ from dataloader import warmup_boundaries
 from utils import compute_validation_loss, get_validation_dataloader
 
 OLMES_DEFAULT_SHOTS = 5
+DEFAULT_CKPT_DIR = "out"
+CHECKPOINT_PATTERN = "ckpt_step:*.pt"
+DATASET_SCRIPT_ERROR = "Dataset scripts are no longer supported"
+DATASET_SCRIPT_TASKS = {"siqa", "social_iqa"}
 
 TASK_MAPPING = {
     "mmlu": "mmlu",
@@ -83,6 +93,86 @@ def _parse_batch_size(batch_size: Union[int, str, None]) -> int:
     if isinstance(batch_size, str) and batch_size.isdigit():
         return max(1, int(batch_size))
     return 1
+
+
+def _checkpoint_sort_key(path: str):
+    match = re.search(r"ckpt_step:(\d+)\.pt$", os.path.basename(path))
+    if match:
+        return (0, int(match.group(1)))
+    return (1, path)
+
+
+def discover_checkpoints(ckpt_dir: str) -> List[str]:
+    checkpoints = glob.glob(os.path.join(ckpt_dir, CHECKPOINT_PATTERN))
+    return sorted(checkpoints, key=_checkpoint_sort_key)
+
+
+def _datasets_disables_scripts() -> bool:
+    try:
+        datasets_version = version("datasets")
+    except PackageNotFoundError:
+        return False
+
+    major = datasets_version.split(".", 1)[0]
+    return major.isdigit() and int(major) >= 4
+
+
+def _merge_eval_outputs(combined_output: dict, task_output: dict):
+    for key, value in task_output.items():
+        if isinstance(value, dict):
+            combined_output.setdefault(key, {}).update(value)
+        else:
+            combined_output[key] = value
+
+
+def run_downstream_tasks(lm_obj: "OBPMWrapper", valid_tasks: List[str], device: str):
+    if simple_evaluate is None:
+        raise RuntimeError(
+            "run_eval.py requires lm_eval. Install it with `pip install lm_eval` "
+            "before running downstream evaluations."
+        ) from _LM_EVAL_IMPORT_ERROR
+
+    combined_output = {"results": {}}
+    skipped_tasks = {}
+    datasets_disables_scripts = _datasets_disables_scripts()
+
+    for task in valid_tasks:
+        if datasets_disables_scripts and task in DATASET_SCRIPT_TASKS:
+            reason = (
+                "installed datasets package no longer supports dataset scripts; "
+                "install datasets<4 or omit this task"
+            )
+            print(f"Skipping task {task}: {reason}.")
+            skipped_tasks[task] = reason
+            continue
+
+        print(f"Running task: {task}")
+        try:
+            task_output = simple_evaluate(
+                model=lm_obj,
+                tasks=[task],
+                num_fewshot=OLMES_DEFAULT_SHOTS,
+                batch_size=1,
+                device=device,
+            )
+        except RuntimeError as exc:
+            if DATASET_SCRIPT_ERROR not in str(exc):
+                raise
+
+            reason = (
+                "dataset script is incompatible with the installed datasets package; "
+                "install datasets<4 or omit this task"
+            )
+            print(f"Skipping task {task}: {reason}.")
+            skipped_tasks[task] = reason
+            continue
+
+        _merge_eval_outputs(combined_output, task_output)
+
+    if skipped_tasks:
+        combined_output["skipped_tasks"] = skipped_tasks
+
+    return combined_output
 
 
 def _find_split_token_index(enc: tiktoken.Encoding, full_ids: List[int], context: str) -> int:
@@ -329,13 +419,29 @@ def run_validation_loss(lm_obj: OBPMWrapper):
     return val_metrics
 
 
-def evaluate_checkpoints(checkpoints: List[str], tasks_list: List[str]):
+def evaluate_checkpoints(
+    checkpoints: List[str],
+    tasks_list: List[str],
+    include_validation: bool = True,
+    include_tasks: bool = True,
+):
+    if not include_validation and not include_tasks:
+        raise ValueError("At least one evaluation mode must be enabled.")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    valid_tasks = [TASK_MAPPING.get(t, t) for t in tasks_list]
+    valid_tasks = [TASK_MAPPING.get(t, t) for t in tasks_list] if include_tasks else []
 
-    print(f"Tasks to evaluate: {valid_tasks}")
+    if include_validation and include_tasks:
+        print("Evaluation mode: validation loss + downstream tasks")
+    elif include_validation:
+        print("Evaluation mode: validation loss only")
+    else:
+        print("Evaluation mode: downstream tasks only")
+
+    if include_tasks:
+        print(f"Tasks to evaluate: {valid_tasks}")
     print("-" * 80)
 
     results = {}
@@ -349,37 +455,39 @@ def evaluate_checkpoints(checkpoints: List[str], tasks_list: List[str]):
         print("=" * 80)
 
         lm_obj = OBPMWrapper(model_path=ckpt, device=device, batch_size=1)
-        val_metrics = run_validation_loss(lm_obj)
+        eval_output = {}
 
-        if simple_evaluate is None:
-            raise RuntimeError(
-                "run_eval.py requires lm_eval. Install it with `pip install lm_eval` "
-                "before running downstream evaluations."
-            ) from _LM_EVAL_IMPORT_ERROR
+        if include_validation:
+            val_metrics = run_validation_loss(lm_obj)
+            eval_output["validation_loss"] = val_metrics
 
-        eval_output = simple_evaluate(
-            model=lm_obj,
-            tasks=valid_tasks,
-            num_fewshot=OLMES_DEFAULT_SHOTS,
-            batch_size=1,
-            device=device,
-        )
-        eval_output["validation_loss"] = val_metrics
+        if include_tasks:
+            task_output = run_downstream_tasks(lm_obj, valid_tasks, device)
+            task_output.update(eval_output)
+            eval_output = task_output
 
         results[ckpt] = eval_output
 
         print("\nResults:")
-        res_dict = eval_output.get("results", {})
-        for task_name, metrics in res_dict.items():
-            print(f"  Task: {task_name}")
-            if "acc_norm,none" in metrics:
-                print(f"    acc_norm: {metrics['acc_norm,none']:.4f}")
-            elif "acc_norm" in metrics:
-                print(f"    acc_norm: {metrics['acc_norm']:.4f}")
-            if "acc,none" in metrics:
-                print(f"    acc:      {metrics['acc,none']:.4f}")
-            elif "acc" in metrics:
-                print(f"    acc:      {metrics['acc']:.4f}")
+        if include_validation:
+            val_metrics = eval_output["validation_loss"]
+            print(f"  validation_loss: {val_metrics['loss']:.4f}")
+        if include_tasks:
+            res_dict = eval_output.get("results", {})
+            for task_name, metrics in res_dict.items():
+                print(f"  Task: {task_name}")
+                if "acc_norm,none" in metrics:
+                    print(f"    acc_norm: {metrics['acc_norm,none']:.4f}")
+                elif "acc_norm" in metrics:
+                    print(f"    acc_norm: {metrics['acc_norm']:.4f}")
+                if "acc,none" in metrics:
+                    print(f"    acc:      {metrics['acc,none']:.4f}")
+                elif "acc" in metrics:
+                    print(f"    acc:      {metrics['acc']:.4f}")
+            skipped_tasks = eval_output.get("skipped_tasks", {})
+            for task_name, reason in skipped_tasks.items():
+                print(f"  Skipped task: {task_name}")
+                print(f"    reason: {reason}")
 
         print("-" * 80)
 
@@ -388,7 +496,27 @@ def evaluate_checkpoints(checkpoints: List[str], tasks_list: List[str]):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run OLMES evaluations on OBPM checkpoints.")
-    parser.add_argument("--ckpts", nargs="+", required=True, help="List of checkpoint paths (.pt files)")
+    parser.add_argument(
+        "--ckpts",
+        nargs="+",
+        help="List of checkpoint paths (.pt files). If omitted, every checkpoint in --ckpt-dir is evaluated.",
+    )
+    parser.add_argument(
+        "--ckpt-dir",
+        default=DEFAULT_CKPT_DIR,
+        help=f"Directory to scan when --ckpts is omitted (default: {DEFAULT_CKPT_DIR})",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--validation-only",
+        action="store_true",
+        help="Only compute validation loss; skip downstream task evaluation.",
+    )
+    mode_group.add_argument(
+        "--tasks-only",
+        action="store_true",
+        help="Only run downstream task evaluation; skip validation loss.",
+    )
     args = parser.parse_args()
 
     downstream_eval_tasks = [
@@ -403,4 +531,16 @@ if __name__ == "__main__":
         "winogrande",
     ]
 
-    evaluate_checkpoints(args.ckpts, downstream_eval_tasks)
+    checkpoints = args.ckpts if args.ckpts is not None else discover_checkpoints(args.ckpt_dir)
+    if not checkpoints:
+        raise SystemExit(
+            f"No checkpoints found in {args.ckpt_dir!r}. "
+            f"Expected files matching {os.path.join(args.ckpt_dir, CHECKPOINT_PATTERN)!r}."
+        )
+
+    evaluate_checkpoints(
+        checkpoints,
+        downstream_eval_tasks,
+        include_validation=not args.tasks_only,
+        include_tasks=not args.validation_only,
+    )

@@ -6,16 +6,49 @@ from torch.nn import functional as F
 from dataclasses import dataclass
 from functools import partial
 import math
+from liger_utils import (
+    get_liger_kernel,
+    rms_norm_eps,
+    tensor_supports_liger,
+)
 
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
+def norm(x: Tensor, use_liger: bool = False, eps: float = None):
+    if use_liger and tensor_supports_liger(x):
+        liger_rms_norm = get_liger_kernel("rms_norm")
+        if liger_rms_norm is not None:
+            return liger_rms_norm(
+                x,
+                None,
+                rms_norm_eps(x, eps),
+                0.0,
+                "llama",
+                True,
+            )
+    if hasattr(F, "rms_norm"):
+        return F.rms_norm(x, (x.size(-1),), eps=eps)
+    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + rms_norm_eps(x, eps))
 
 
-def _norm_lrid_key(x: Tensor, num_heads: int):
+def _norm_lrid_key(x: Tensor, num_heads: int, use_liger: bool = False):
     x_shape = x.shape
     x = x.reshape(*x_shape[:-1], num_heads, x_shape[-1] // num_heads)
-    return norm(x).reshape(*x_shape)
+    return norm(x, use_liger=use_liger).reshape(*x_shape)
+
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, use_liger: bool = False):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.use_liger = use_liger
+        self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim))
+
+    def forward(self, idx):
+        liger_embedding = get_liger_kernel("embedding")
+        if self.use_liger and liger_embedding is not None and tensor_supports_liger(idx):
+            return liger_embedding.apply(self.weight, idx)
+        return F.embedding(idx, self.weight)
 
 
 @dataclass
@@ -56,6 +89,11 @@ class ModelConfig:
     lrid_query_from_value_shared: bool = False
     lrid_use_logit_scale: bool = True
     lrid_logit_scale: float = None
+    liger_rms_norm: bool = False
+    liger_rope: bool = False
+    liger_swiglu: bool = False
+    liger_embedding: bool = False
+    liger_attnres: bool = False
 
     def __post_init__(self):
         self.attnres_type = (self.attnres_type or "block")
@@ -113,13 +151,41 @@ class RotaryEmbedding(nn.Module):
         freq = torch.outer(torch.arange(max_seq_len), inv_freq)
         self.register_buffer("sin", freq.sin()[None, None])
         self.register_buffer("cos", freq.cos()[None, None])
+        self.register_buffer("liger_sin", torch.cat([freq.sin(), freq.sin()], dim=-1)[None], persistent=False)
+        self.register_buffer("liger_cos", torch.cat([freq.cos(), freq.cos()], dim=-1)[None], persistent=False)
+        self.use_liger = config.liger_rope
 
-    def forward(self, x, offset=0):
+    def _forward_single(self, x, offset=0):
         T = x.size(-2)
         sin = self.sin[:, :, offset:offset + T]
         cos = self.cos[:, :, offset:offset + T]
         x1, x2 = x[..., 0::2], x[..., 1::2]
         return torch.stack([cos * x1 - sin * x2, sin * x1 + cos * x2], dim=-1).flatten(-2)
+
+    def _forward_liger_math_single(self, x, offset=0):
+        T = x.size(-2)
+        sin = self.sin[:, :, offset:offset + T]
+        cos = self.cos[:, :, offset:offset + T]
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([cos * x1 - sin * x2, sin * x1 + cos * x2], dim=-1)
+
+    def forward(self, q, k=None, offset=0):
+        if k is None:
+            return self._forward_single(q, offset=offset)
+
+        if self.use_liger:
+            liger_rope = get_liger_kernel("rope")
+            if liger_rope is not None and tensor_supports_liger(q):
+                T = q.size(-2)
+                cos = self.liger_cos[:, offset:offset + T]
+                sin = self.liger_sin[:, offset:offset + T]
+                return liger_rope(q, k, cos, sin, unsqueeze_dim=1)
+            return (
+                self._forward_liger_math_single(q, offset=offset),
+                self._forward_liger_math_single(k, offset=offset),
+            )
+
+        return self._forward_single(q, offset=offset), self._forward_single(k, offset=offset)
 
 
 class LRIDFusedProjection(nn.Module):
@@ -143,6 +209,7 @@ class LRIDFusedProjection(nn.Module):
         self.use_key_norm = self.use_key and config.attnres_key_norm
         self.use_value_norm = (self.use_local_value_key or self.use_local_value_query) and config.lrid_key_value_norm
         self.num_heads = config.lrid_num_heads
+        self.use_liger_rms_norm = config.liger_rms_norm
         if self.use_local_value_key:
             self.value_key_proj = nn.Linear(output_dim, config.lrid_rank, bias=False)
         else:
@@ -154,7 +221,7 @@ class LRIDFusedProjection(nn.Module):
 
     def _prepare_value_projection_input(self, value):
         if self.use_value_norm:
-            return norm(value)
+            return norm(value, use_liger=self.use_liger_rms_norm)
         return value
 
     def project_key_from_value(self, value):
@@ -175,7 +242,7 @@ class LRIDFusedProjection(nn.Module):
         if self.use_key:
             key = projected[..., self.key_offset:self.key_offset + self.rank]
             if self.use_key_norm:
-                key = _norm_lrid_key(key, self.num_heads)
+                key = _norm_lrid_key(key, self.num_heads, use_liger=self.use_liger_rms_norm)
         elif self.use_local_value_key:
             key = self.project_key_from_value(output)
         if self.use_fused_query:
@@ -199,6 +266,7 @@ class LRIDSourceKeyProjection(nn.Module):
         )
         self.use_value_norm = uses_value_projection and config.lrid_key_value_norm
         self.proj = nn.Linear(config.n_embd, config.lrid_rank, bias=False)
+        self.use_liger_rms_norm = config.liger_rms_norm
         if config.lrid_input_dependent_query and config.lrid_query_from_value_shared:
             self.query_proj = nn.Linear(config.n_embd, config.lrid_rank, bias=False)
         else:
@@ -207,7 +275,7 @@ class LRIDSourceKeyProjection(nn.Module):
 
     def _prepare_value_projection_input(self, x):
         if self.use_value_norm:
-            return norm(x)
+            return norm(x, use_liger=self.use_liger_rms_norm)
         return x
 
     def forward(self, x):
@@ -215,7 +283,7 @@ class LRIDSourceKeyProjection(nn.Module):
             x = self._prepare_value_projection_input(x)
         key = self.proj(x)
         if self.use_key_norm:
-            key = _norm_lrid_key(key, self.num_heads)
+            key = _norm_lrid_key(key, self.num_heads, use_liger=self.use_liger_rms_norm)
         return key
 
     def project_query_from_value(self, x):
@@ -245,6 +313,7 @@ class MultiHeadAttention(nn.Module):
             self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         
         self.use_qk_norm = config.qk_norm
+        self.use_liger_rms_norm = config.liger_rms_norm
         
         self.clip_qkv = config.clip_qkv
         
@@ -316,8 +385,8 @@ class MultiHeadAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         
         if self.use_qk_norm:
-            q = norm(q)
-            k = norm(k)
+            q = norm(q, use_liger=self.use_liger_rms_norm)
+            k = norm(k, use_liger=self.use_liger_rms_norm)
         
         if past_kv is not None:
             past_k, past_v = past_kv
@@ -325,8 +394,7 @@ class MultiHeadAttention(nn.Module):
         else:
             pos_offset = 0
         
-        q = self.rope(q, offset=pos_offset)
-        k = self.rope(k, offset=pos_offset)
+        q, k = self.rope(q, k, offset=pos_offset)
         
         if past_kv is not None:
             k = torch.cat([past_k, k], dim=2)
@@ -372,11 +440,16 @@ class MLP(nn.Module):
             self.fc2 = LRIDFusedProjection(config, self.hidden_dim, config.n_embd)
         else:
             self.fc2 = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
+        self.use_liger_swiglu = config.liger_swiglu
 
     def forward(self, x):
         x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
-        x = F.silu(gate) * x
+        liger_swiglu = get_liger_kernel("swiglu")
+        if self.use_liger_swiglu and liger_swiglu is not None and tensor_supports_liger(x):
+            x = liger_swiglu(gate, x)
+        else:
+            x = F.silu(gate) * x
         return self.fc2(x)
 
 
@@ -385,16 +458,32 @@ class AttentionResidual(nn.Module):
         super().__init__()
         self.config = config
         self.use_key_norm = config.attnres_key_norm
+        self.use_liger_attnres = config.liger_attnres
+        self.use_liger_rms_norm = config.liger_rms_norm
         self.query = nn.Parameter(torch.empty(config.n_embd))
+        self.register_buffer("norm_weight", torch.ones(config.n_embd), persistent=False)
 
     def _query(self, dtype):
         query = self.query
         if self.config.attn_res_query_norm:
-            query = norm(query.float())
+            query = norm(query.float(), use_liger=self.use_liger_rms_norm)
         return query.to(dtype)
 
     def forward(self, values):
-        keys = norm(values) if self.use_key_norm else values
+        liger_attnres = get_liger_kernel("attnres")
+        if (
+            self.use_liger_attnres
+            and self.use_key_norm
+            and liger_attnres is not None
+            and tensor_supports_liger(values)
+        ):
+            return liger_attnres(
+                values,
+                self._query(values.dtype),
+                self.norm_weight.to(device=values.device, dtype=values.dtype),
+                rms_norm_eps(values),
+            )
+        keys = norm(values, use_liger=self.use_liger_rms_norm) if self.use_key_norm else values
         logits = torch.einsum("d,sbtd->sbt", self._query(keys.dtype), keys)
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
@@ -408,10 +497,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.layer_idx = layer_idx
         self.config = config
+        self.use_liger_rms_norm = config.liger_rms_norm
 
     def forward_attention(self, x, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
         if self.norm_pos in {"before", "both"}:
-            x = norm(x)
+            x = norm(x, use_liger=self.use_liger_rms_norm)
 
         attn_out = self.attn(x, past_kv=past_kv, use_cache=use_cache, cu_doc_len=cu_doc_len, max_doc_len=max_doc_len)
 
@@ -435,7 +525,7 @@ class Block(nn.Module):
             new_kv = None
 
         if self.norm_pos in {"after", "both"}:
-            x = norm(x)
+            x = norm(x, use_liger=self.use_liger_rms_norm)
 
         if use_cache:
             if self.config.use_lrid:
@@ -451,7 +541,7 @@ class Block(nn.Module):
 
     def forward_mlp(self, x):
         if self.norm_pos in {"before", "both"}:
-            x = norm(x)
+            x = norm(x, use_liger=self.use_liger_rms_norm)
 
         mlp_out = self.mlp(x)
         if self.config.use_lrid:
@@ -463,7 +553,7 @@ class Block(nn.Module):
             x = mlp_out
 
         if self.norm_pos in {"after", "both"}:
-            x = norm(x)
+            x = norm(x, use_liger=self.use_liger_rms_norm)
 
         if self.config.use_lrid:
             if self.config.lrid_input_dependent_query:
@@ -510,12 +600,13 @@ class OBPM(nn.Module):
         self.attnres_type = config.attnres_type
         self.use_lrid = config.use_lrid
         self.attnres_block_ends = self._make_attnres_block_ends()
+        self.use_liger_rms_norm = config.liger_rms_norm
         
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         
         transformer_modules = dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            wte=TokenEmbedding(config.vocab_size, config.n_embd, use_liger=config.liger_embedding),
             layers=nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)])
         )
 
@@ -672,7 +763,7 @@ class OBPM(nn.Module):
         keys = keys.reshape(*keys.shape[:-1], num_heads, key_head_dim)
         values = values.reshape(*values.shape[:-1], num_heads, value_head_dim)
         if self.config.attnres_key_norm:
-            keys = norm(keys.float()).to(values.dtype)
+            keys = norm(keys.float(), use_liger=self.use_liger_rms_norm).to(values.dtype)
 
         query_idx = self._attnres_query_idx(residual_idx)
         static_query = self.transformer.lrid_queries[query_idx]
@@ -687,7 +778,7 @@ class OBPM(nn.Module):
             query = static_query
 
         if self.config.attn_res_query_norm:
-            query = norm(query.float())
+            query = norm(query.float(), use_liger=self.use_liger_rms_norm)
         query = query.to(keys.dtype)
         if self.config.lrid_input_dependent_query:
             logits = torch.einsum("sbthr,bthr->sbth", keys, query) * self.config.lrid_logit_scale
@@ -723,7 +814,7 @@ class OBPM(nn.Module):
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
             else:
                 nn.init.normal_(module.weight, mean=0.0, std=std)
-        elif isinstance(module, nn.Embedding):
+        elif isinstance(module, (nn.Embedding, TokenEmbedding)):
             if init_cutoff_factor is not None:
                 cutoff = init_cutoff_factor * std
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
@@ -753,7 +844,23 @@ class OBPM(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
     
-    def forward(self, idx, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
+    def get_lm_head_weight(self):
+        if self.config.weight_tying:
+            return self.transformer.wte.weight
+        return self.lm_head.weight
+
+    def get_lm_head_bias(self):
+        return None
+
+    def forward(
+        self,
+        idx,
+        past_kv=None,
+        use_cache=False,
+        cu_doc_len=None,
+        max_doc_len=None,
+        return_hidden=False,
+    ):
         _, T = idx.size()
         assert T <= self.config.block_size, f"Token length {T} exceeds max sequence length {self.config.block_size}"
         
@@ -980,7 +1087,12 @@ class OBPM(nn.Module):
                 sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count)]
                 x = self._apply_attnres(2 * self.config.n_layer, sources)
         
-        x = norm(x)
+        x = norm(x, use_liger=self.use_liger_rms_norm)
+
+        if return_hidden:
+            if use_cache:
+                return x, new_kv
+            return x
         
         if self.config.weight_tying:
             logits = F.linear(x, self.transformer.wte.weight, None)
