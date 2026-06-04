@@ -1,5 +1,6 @@
 # train.py
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -59,14 +60,23 @@ def setup_distributed():
     if local_rank < 0:
         raise ValueError("LOCAL_RANK must be >= 0")
 
-    if torch.cuda.is_available():
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
         torch.cuda.set_device(local_rank)
     if world_size == 1:
         return False, rank, world_size, local_rank
 
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
-    dist.barrier()
+    backend = "nccl" if cuda_available else "gloo"
+    if cuda_available:
+        device = torch.device("cuda", local_rank)
+        try:
+            dist.init_process_group(backend=backend, device_id=device)
+        except TypeError:
+            dist.init_process_group(backend=backend)
+        dist.barrier(device_ids=[local_rank])
+    else:
+        dist.init_process_group(backend=backend)
+        dist.barrier()
     return True, rank, world_size, local_rank
 
 
@@ -132,6 +142,7 @@ ddp_find_unused_parameters = False
 # torch.compile
 torch_compile = True
 torch_compile_max_autotune = False
+torch_compile_cudagraphs = False
 # Full run automation
 full_run = False
 full_run_hf_repo_id = ""
@@ -206,6 +217,7 @@ ignore_index = -100
 reduction = "mean"
 z_loss = True
 z_loss_weight = 1e-5
+ce_inplace_backward = True
 # Scheduler
 warmup_steps = 100
 warmdown_steps = int(0.2 * max_steps)
@@ -386,6 +398,8 @@ def parse_args():
         dest="torch_compile_max_autotune",
         action="store_false",
     )
+    parser.add_argument("--torch_compile_cudagraphs", type=_str_to_bool, nargs="?", const=True, default=torch_compile_cudagraphs)
+    parser.add_argument("--no-torch_compile_cudagraphs", dest="torch_compile_cudagraphs", action="store_false")
     parser.add_argument("--full_run", type=_str_to_bool, nargs="?", const=True, default=full_run)
     parser.add_argument("--no-full_run", dest="full_run", action="store_false")
     parser.add_argument("--full_run_hf_repo_id", type=str, default=full_run_hf_repo_id)
@@ -442,6 +456,8 @@ def parse_args():
     parser.add_argument("--lrid_logit_scale", type=float, default=lrid_logit_scale)
     parser.add_argument("--interactive_after_train", type=_str_to_bool, nargs="?", const=True, default=interactive_after_train)
     parser.add_argument("--no-interactive_after_train", dest="interactive_after_train", action="store_false")
+    parser.add_argument("--ce_inplace_backward", type=_str_to_bool, nargs="?", const=True, default=ce_inplace_backward)
+    parser.add_argument("--no-ce_inplace_backward", dest="ce_inplace_backward", action="store_false")
     return parser.parse_args()
 
 
@@ -454,6 +470,7 @@ torch_compile = args.torch_compile
 torch_compile_max_autotune = args.torch_compile_max_autotune
 if torch_compile_max_autotune:
     torch_compile = True
+torch_compile_cudagraphs = args.torch_compile_cudagraphs
 full_run = args.full_run
 full_run_hf_repo_id = args.full_run_hf_repo_id
 full_run_hf_private = args.full_run_hf_private
@@ -489,6 +506,7 @@ if use_lrid:
     use_attnres = True
 lrid_logit_scale = args.lrid_logit_scale
 interactive_after_train = args.interactive_after_train
+ce_inplace_backward = args.ce_inplace_backward
 
 if full_run and eval_only:
     raise ValueError("full_run is for training runs; do not combine it with --eval_only.")
@@ -537,7 +555,23 @@ if distributed:
 
 torch_compile_mode = "max-autotune" if torch_compile_max_autotune else None
 if torch_compile:
-    model = torch.compile(model, mode=torch_compile_mode)
+    torch_compile_options = {}
+    if not torch_compile_cudagraphs:
+        torch_compile_options["triton.cudagraphs"] = False
+        try:
+            import torch._inductor.config as inductor_config
+
+            if hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "cudagraphs"):
+                inductor_config.triton.cudagraphs = False
+            if hasattr(inductor_config, "triton") and hasattr(inductor_config.triton, "cudagraph_trees"):
+                inductor_config.triton.cudagraph_trees = False
+        except Exception as exc:
+            print0(f"Could not disable torch.compile CUDA graphs through inductor config: {exc}")
+    model = torch.compile(
+        model,
+        mode=torch_compile_mode,
+        options=torch_compile_options or None,
+    )
 
 if distributed:
     ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
@@ -556,6 +590,7 @@ print0(f"Total Batch Size: {total_batch_size}")
 print0(f"Configured gradient accumulation steps: {configured_grad_accum_steps}")
 print0(f"Local gradient accumulation steps: {grad_accum_steps}")
 print0(f"Torch compile: {torch_compile} | mode: {torch_compile_mode or 'default'}")
+print0(f"Torch compile CUDA graphs: {torch_compile_cudagraphs}")
 print0(f"Full run: {full_run} | HF repo: {full_run_hf_repo_id or 'N/A'}")
 
 def get_muon_momentum(step):

@@ -118,14 +118,23 @@ def setup_distributed():
     if local_rank < 0:
         raise ValueError("LOCAL_RANK must be >= 0")
 
-    if torch.cuda.is_available():
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
         torch.cuda.set_device(local_rank)
     if world_size == 1:
         return False, rank, world_size, local_rank
 
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
-    dist.barrier()
+    backend = "nccl" if cuda_available else "gloo"
+    if cuda_available:
+        device = torch.device("cuda", local_rank)
+        try:
+            dist.init_process_group(backend=backend, device_id=device)
+        except TypeError:
+            dist.init_process_group(backend=backend)
+        dist.barrier(device_ids=[local_rank])
+    else:
+        dist.init_process_group(backend=backend)
+        dist.barrier()
     return True, rank, world_size, local_rank
 
 

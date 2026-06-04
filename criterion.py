@@ -11,6 +11,7 @@ class CriterionConfig:
     reduction: str = "mean"
     z_loss: bool = False
     z_loss_weight: float = 1e-4
+    inplace_backward: bool = True
 
 
 class CrossEntropyLoss(nn.Module):
@@ -62,7 +63,7 @@ class CrossEntropyLoss(nn.Module):
             label_smoothing=0.0,
             logit_scale=1.0,
             lse_square_scale=z_loss_weight,
-            inplace_backward=False,
+            inplace_backward=self.config.inplace_backward,
             process_group=None,
             ignore_index=self.config.ignore_index,
         )
@@ -117,6 +118,7 @@ def get_criterion(config):
             reduction=config["reduction"],
             z_loss=config["z_loss"],
             z_loss_weight=config["z_loss_weight"],
+            inplace_backward=config.get("ce_inplace_backward", True),
         ),
         flash_attention=config["flash_attention"],
     )
