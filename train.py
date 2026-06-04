@@ -1,6 +1,15 @@
 # train.py
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+_DEFAULT_TORCH_COMPILE_CACHE_DIR = (
+    os.environ.get("TORCH_COMPILE_CACHE_DIR")
+    or os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    or "out/torchinductor_cache"
+)
+_EXPLICIT_TRITON_CACHE_DIR = os.environ.get("TRITON_CACHE_DIR")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _DEFAULT_TORCH_COMPILE_CACHE_DIR)
+if _EXPLICIT_TRITON_CACHE_DIR is None:
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(_DEFAULT_TORCH_COMPILE_CACHE_DIR, "triton")
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -143,6 +152,7 @@ ddp_find_unused_parameters = False
 torch_compile = True
 torch_compile_max_autotune = False
 torch_compile_cudagraphs = False
+torch_compile_cache_dir = _DEFAULT_TORCH_COMPILE_CACHE_DIR
 # Full run automation
 full_run = True
 full_run_hf_repo_id = ""
@@ -241,6 +251,18 @@ def _looks_like_hf_token(value: str) -> bool:
     return value.startswith("hf_")
 
 
+def configure_torch_compile_cache(cache_dir: str) -> str:
+    cache_dir = (cache_dir or "").strip()
+    if not cache_dir:
+        return ""
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    if _EXPLICIT_TRITON_CACHE_DIR is None:
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+    return cache_dir
+
+
 def prepare_full_run_hf_repo(repo_id: str, private: bool) -> str:
     try:
         from huggingface_hub import HfApi, login
@@ -331,7 +353,15 @@ def run_full_run_eval(ckpt_path: str, current_step: int):
         return
 
     results_file = os.path.join(out_dir, f"full_run_eval_step:{current_step}.txt")
-    eval_args = ["run_eval.py", "--ckpts", ckpt_path, "--results-file", results_file]
+    eval_args = [
+        "run_eval.py",
+        "--ckpts",
+        ckpt_path,
+        "--results-file",
+        results_file,
+    ]
+    if torch_compile_cache_dir:
+        eval_args.extend(["--torch_compile_cache_dir", torch_compile_cache_dir])
     if full_run_eval_mode == "validation-only":
         eval_args.append("--validation-only")
     elif full_run_eval_mode == "tasks-only":
@@ -413,6 +443,12 @@ def parse_args():
     )
     parser.add_argument("--torch_compile_cudagraphs", type=_str_to_bool, nargs="?", const=True, default=torch_compile_cudagraphs)
     parser.add_argument("--no-torch_compile_cudagraphs", dest="torch_compile_cudagraphs", action="store_false")
+    parser.add_argument(
+        "--torch_compile_cache_dir",
+        type=str,
+        default=torch_compile_cache_dir,
+        help="Directory for TorchInductor/Triton compile caches. Use a large persistent path for max-autotune.",
+    )
     parser.add_argument("--full_run", type=_str_to_bool, nargs="?", const=True, default=full_run)
     parser.add_argument("--no-full_run", dest="full_run", action="store_false")
     parser.add_argument("--full_run_hf_repo_id", type=str, default=full_run_hf_repo_id)
@@ -484,6 +520,7 @@ torch_compile_max_autotune = args.torch_compile_max_autotune
 if torch_compile_max_autotune:
     torch_compile = True
 torch_compile_cudagraphs = args.torch_compile_cudagraphs
+torch_compile_cache_dir = args.torch_compile_cache_dir
 full_run = args.full_run
 full_run_hf_repo_id = args.full_run_hf_repo_id
 full_run_hf_private = args.full_run_hf_private
@@ -570,6 +607,7 @@ torch_compile_mode = None
 if torch_compile_max_autotune:
     torch_compile_mode = "max-autotune" if torch_compile_cudagraphs else "max-autotune-no-cudagraphs"
 if torch_compile:
+    torch_compile_cache_dir = configure_torch_compile_cache(torch_compile_cache_dir)
     if not torch_compile_cudagraphs:
         try:
             import torch._inductor.config as inductor_config
@@ -603,6 +641,7 @@ print0(f"Configured gradient accumulation steps: {configured_grad_accum_steps}")
 print0(f"Local gradient accumulation steps: {grad_accum_steps}")
 print0(f"Torch compile: {torch_compile} | mode: {torch_compile_mode or 'default'}")
 print0(f"Torch compile CUDA graphs: {torch_compile_cudagraphs}")
+print0(f"Torch compile cache dir: {torch_compile_cache_dir or 'default'}")
 print0(f"Full run: {full_run} | HF repo: {full_run_hf_repo_id or 'N/A'}")
 
 def get_muon_momentum(step):

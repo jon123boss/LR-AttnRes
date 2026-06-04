@@ -11,6 +11,16 @@ import re
 from importlib.metadata import PackageNotFoundError, version
 from typing import List, Tuple, Union
 
+_DEFAULT_TORCH_COMPILE_CACHE_DIR = (
+    os.environ.get("TORCH_COMPILE_CACHE_DIR")
+    or os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    or "out/torchinductor_cache"
+)
+_EXPLICIT_TRITON_CACHE_DIR = os.environ.get("TRITON_CACHE_DIR")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _DEFAULT_TORCH_COMPILE_CACHE_DIR)
+if _EXPLICIT_TRITON_CACHE_DIR is None:
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(_DEFAULT_TORCH_COMPILE_CACHE_DIR, "triton")
+
 import torch
 from tqdm import tqdm
 
@@ -98,6 +108,18 @@ def _str_to_bool(value):
     if value in {"false", "0", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError("expected a boolean value")
+
+
+def configure_torch_compile_cache(cache_dir: str) -> str:
+    cache_dir = (cache_dir or "").strip()
+    if not cache_dir:
+        return ""
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    if _EXPLICIT_TRITON_CACHE_DIR is None:
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+    return cache_dir
 
 
 def setup_distributed():
@@ -261,6 +283,7 @@ class OBPMWrapper(LM):
         max_batch_size: int = 64,
         torch_compile: bool = False,
         torch_compile_max_autotune: bool = False,
+        torch_compile_cache_dir: str = _DEFAULT_TORCH_COMPILE_CACHE_DIR,
         verbose: bool = True,
     ):
         super().__init__()
@@ -270,6 +293,7 @@ class OBPMWrapper(LM):
         self.max_batch_size = max_batch_size
         self.torch_compile = bool(torch_compile or torch_compile_max_autotune)
         self.torch_compile_mode = "max-autotune" if torch_compile_max_autotune else None
+        self.torch_compile_cache_dir = torch_compile_cache_dir
         self.verbose = bool(verbose)
 
         if self.verbose:
@@ -298,8 +322,12 @@ class OBPMWrapper(LM):
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
         if self.torch_compile:
+            self.torch_compile_cache_dir = configure_torch_compile_cache(self.torch_compile_cache_dir)
             if self.verbose:
-                print(f"Torch compile enabled for eval | mode: {self.torch_compile_mode or 'default'}")
+                print(
+                    f"Torch compile enabled for eval | mode: {self.torch_compile_mode or 'default'} | "
+                    f"cache: {self.torch_compile_cache_dir or 'default'}"
+                )
             self.model = torch.compile(self.model, mode=self.torch_compile_mode)
 
         self.model.eval()
@@ -505,6 +533,7 @@ def evaluate_checkpoints(
     include_tasks: bool = True,
     torch_compile: bool = False,
     torch_compile_max_autotune: bool = False,
+    torch_compile_cache_dir: str = _DEFAULT_TORCH_COMPILE_CACHE_DIR,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
@@ -523,7 +552,8 @@ def evaluate_checkpoints(
     print0(
         master_process,
         f"Torch compile: {torch_compile or torch_compile_max_autotune} | "
-        f"mode: {'max-autotune' if torch_compile_max_autotune else 'default'}",
+        f"mode: {'max-autotune' if torch_compile_max_autotune else 'default'} | "
+        f"cache: {torch_compile_cache_dir or 'default'}",
     )
 
     valid_tasks = [TASK_MAPPING.get(t, t) for t in tasks_list] if include_tasks else []
@@ -563,6 +593,7 @@ def evaluate_checkpoints(
             batch_size=1,
             torch_compile=torch_compile,
             torch_compile_max_autotune=torch_compile_max_autotune,
+            torch_compile_cache_dir=torch_compile_cache_dir,
             verbose=master_process,
         )
         eval_output = {}
@@ -711,6 +742,12 @@ if __name__ == "__main__":
         dest="torch_compile_max_autotune",
         action="store_false",
     )
+    parser.add_argument(
+        "--torch_compile_cache_dir",
+        type=str,
+        default=_DEFAULT_TORCH_COMPILE_CACHE_DIR,
+        help="Directory for TorchInductor/Triton compile caches. Use a large persistent path for max-autotune.",
+    )
     args = parser.parse_args()
     if args.torch_compile_max_autotune:
         args.torch_compile = True
@@ -745,6 +782,7 @@ if __name__ == "__main__":
         include_tasks=not args.validation_only,
         torch_compile=args.torch_compile,
         torch_compile_max_autotune=args.torch_compile_max_autotune,
+        torch_compile_cache_dir=args.torch_compile_cache_dir,
         distributed=distributed,
         rank=rank,
         world_size=world_size,

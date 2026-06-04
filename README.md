@@ -79,6 +79,16 @@ Enable PyTorch compile max-autotune with:
 python train.py --torch-max-autotune
 ```
 
+Max-autotune writes TorchInductor/Triton autotune caches. By default this repo
+stores them under `out/torchinductor_cache` instead of `/tmp`, which avoids
+small container tmpfs failures. To use a different large/persistent disk:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train.py \
+  --torch-max-autotune \
+  --torch_compile_cache_dir /workspace/LR-AttnRes/out/torchinductor_cache
+```
+
 For a full automated run that prompts for Hugging Face sign-in/repo setup at
 startup, trains, saves the final checkpoint, uploads it to Hugging Face as
 `final_model.pt`, and then runs evaluation:
