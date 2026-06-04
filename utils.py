@@ -3,8 +3,10 @@ import torch.nn as nn
 from contextlib import nullcontext
 import os
 import tempfile
+import numpy as np
 from model import OBPM, ModelConfig
 from dataloader import DataLoaderConfig, create_dataloaders, create_validation_dataloader
+
 
 def get_config(module_globals=None):
     config_keys = [k for k, v in module_globals.items()  if not k.startswith('_') and isinstance(v, (int, float, bool, str, type(None)))]
@@ -42,10 +44,8 @@ def get_model(config, device):
         prefix = '_orig_mod.'
         if any(k.startswith(prefix) for k in model_state_dict.keys()):
             print(f"Detected compiled model checkpoint. Removing '{prefix}' prefix from state dict keys.")
-            new_state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in model_state_dict.items()}
-            model.load_state_dict(new_state_dict, strict=True)
-        else:
-            model.load_state_dict(model_state_dict, strict=True)
+            model_state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in model_state_dict.items()}
+        model.load_state_dict(model_state_dict, strict=True)
         start_step = checkpoint["step"]
     elif config["init_from"] == 'scratch':
         print("Initializing new model from scratch")
@@ -59,9 +59,6 @@ def get_model(config, device):
             mlp_ratio=config["mlp_ratio"],
             weight_tying=config["weight_tying"],
             rope_theta=config["rope_theta"],
-            rmsnorm_eps=config["rmsnorm_eps"],
-            rmsnorm_use_weight=config["rmsnorm_use_weight"],
-            rmsnorm_use_bias=config["rmsnorm_use_bias"],
             norm_pos=config["norm_pos"],
             qk_norm=config["qk_norm"],
             clip_qkv=config["clip_qkv"],
@@ -71,6 +68,7 @@ def get_model(config, device):
             use_attnres = config["use_attnres"],
             attnres_type = config["attnres_type"],
             attnres_num_blocks = config["attnres_num_blocks"],
+            attnres_block_average = config.get("attnres_block_average", False),
             attnres_key_norm = config["attnres_key_norm"],
             attn_res_query_norm = config["attn_res_query_norm"],
             attn_res_query_init = config["attn_res_query_init"],
@@ -78,6 +76,11 @@ def get_model(config, device):
             lrid_rank = config["lrid_rank"],
             lrid_num_heads = config.get("lrid_num_heads", 1),
             lrid_input_dependent_query = config.get("lrid_input_dependent_query", False),
+            lrid_key_from_value = config.get("lrid_key_from_value", False),
+            lrid_key_from_value_shared = config.get("lrid_key_from_value_shared", False),
+            lrid_key_value_norm = config.get("lrid_key_value_norm", True),
+            lrid_query_from_value = config.get("lrid_query_from_value", False),
+            lrid_query_from_value_shared = config.get("lrid_query_from_value_shared", False),
             lrid_use_logit_scale = config["lrid_use_logit_scale"],
             lrid_logit_scale = config["lrid_logit_scale"],
             )
@@ -101,6 +104,7 @@ def get_dataloader(config):
         num_workers=config["num_workers"],
         pin_memory=config["pin_memory"],
         persistent_workers=config["persistent_workers"],
+        dtype=np.dtype(config.get("data_dtype", "uint32")),
     )
     return create_dataloaders(dataloader_config)
 
@@ -116,6 +120,7 @@ def get_validation_dataloader(config):
         num_workers=config["num_workers"],
         pin_memory=config["pin_memory"],
         persistent_workers=config["persistent_workers"],
+        dtype=np.dtype(config.get("data_dtype", "uint32")),
     )
     return create_validation_dataloader(dataloader_config)
 

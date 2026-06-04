@@ -6,7 +6,6 @@ import torch.optim as optim
 from dataclasses import dataclass, asdict
 import math
 import time
-import tiktoken
 import os, sys
 import copy
 import argparse
@@ -20,6 +19,12 @@ from dataloader import create_dataloaders, DataLoaderConfig, warmup_boundaries
 from typing import Optional, List, Dict, Any
 from model import OBPM
 import torch.nn.functional as F
+from tokenizer_utils import (
+    GPT4_EOT_TOKEN as _GPT4_EOT_TOKEN,
+    GPT4_TOKENIZER_MODEL as _GPT4_TOKENIZER_MODEL,
+    GPT4_VOCAB_SIZE as _GPT4_VOCAB_SIZE,
+    get_tiktoken_encoding,
+)
 
 seed = 42
 os.environ["PYTHONHASHSEED"] = str(seed)
@@ -46,17 +51,19 @@ init_from = 'scratch'
 ckpt_file_name = ''
 # wandb logging
 wandb_log = True
-wandb_project = "LRID"
+wandb_project = "LR-AttnRes"
 wandb_run_name = "LRID"
 # data
-dataset_dir = "finewebedu10B"
-batch_size = 32
+dataset_dir = "ultrafineweb20B_gpt4"
+batch_size = 16
 block_size = 2048
-grad_accum_steps = 4
+grad_accum_steps = 8
 total_batch_size = batch_size * block_size * grad_accum_steps
+tokenizer_model = _GPT4_TOKENIZER_MODEL
+data_dtype = "uint32"
 # Document masking (Dataloader)
 use_doc_masking = True
-doc_separator_token = 50256
+doc_separator_token = _GPT4_EOT_TOKEN
 num_workers = 8
 pin_memory = True if device.type == "cuda" else False
 persistent_workers = False
@@ -64,7 +71,7 @@ persistent_workers = False
 n_layer = 12
 n_head = 12
 n_embd = 768
-vocab_size = 57601
+vocab_size = _GPT4_VOCAB_SIZE
 mlp_hidden_dim = 2048
 mlp_ratio = None
 weight_tying = False
@@ -75,21 +82,24 @@ init_cutoff_factor = None
 use_attnres = False
 attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
+attnres_block_average = False
 attnres_key_norm = True
 attn_res_query_norm = False
 attn_res_query_init = "zero" # zero, normal, trunc_normal
 use_lrid = False
-lrid_rank = 64
+lrid_rank = 32
 lrid_num_heads = 1
 lrid_input_dependent_query = False
-lrid_use_logit_scale = True
+lrid_key_from_value = False
+lrid_key_from_value_shared = False
+lrid_key_value_norm = True
+lrid_query_from_value = False
+lrid_query_from_value_shared = False
+lrid_use_logit_scale = False
 lrid_logit_scale = None # None defaults to 1 / sqrt(lrid_rank / lrid_num_heads) when enabled
 # rope
 rope_theta = 500000.0
 # normalization
-rmsnorm_eps = 1e-6
-rmsnorm_use_weight = True
-rmsnorm_use_bias = False
 qk_norm = True
 norm_pos = "before" # before, after, both
 clip_qkv = None
@@ -145,6 +155,8 @@ def parse_args():
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
+    parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=attnres_block_average)
+    parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
     parser.add_argument("--attnres_key_norm", type=_str_to_bool, nargs="?", const=True, default=attnres_key_norm)
     parser.add_argument("--no-attnres_key_norm", dest="attnres_key_norm", action="store_false")
     parser.add_argument("--attn_res_query_norm", type=_str_to_bool, nargs="?", const=True, default=attn_res_query_norm)
@@ -156,6 +168,16 @@ def parse_args():
     parser.add_argument("--lrid_num_heads", type=int, default=lrid_num_heads)
     parser.add_argument("--lrid_input_dependent_query", type=_str_to_bool, nargs="?", const=True, default=lrid_input_dependent_query)
     parser.add_argument("--no-lrid_input_dependent_query", dest="lrid_input_dependent_query", action="store_false")
+    parser.add_argument("--lrid_key_from_value", type=_str_to_bool, nargs="?", const=True, default=lrid_key_from_value)
+    parser.add_argument("--no-lrid_key_from_value", dest="lrid_key_from_value", action="store_false")
+    parser.add_argument("--lrid_key_from_value_shared", type=_str_to_bool, nargs="?", const=True, default=lrid_key_from_value_shared)
+    parser.add_argument("--no-lrid_key_from_value_shared", dest="lrid_key_from_value_shared", action="store_false")
+    parser.add_argument("--lrid_key_value_norm", type=_str_to_bool, nargs="?", const=True, default=lrid_key_value_norm)
+    parser.add_argument("--no-lrid_key_value_norm", dest="lrid_key_value_norm", action="store_false")
+    parser.add_argument("--lrid_query_from_value", type=_str_to_bool, nargs="?", const=True, default=lrid_query_from_value)
+    parser.add_argument("--no-lrid_query_from_value", dest="lrid_query_from_value", action="store_false")
+    parser.add_argument("--lrid_query_from_value_shared", type=_str_to_bool, nargs="?", const=True, default=lrid_query_from_value_shared)
+    parser.add_argument("--no-lrid_query_from_value_shared", dest="lrid_query_from_value_shared", action="store_false")
     parser.add_argument("--lrid_use_logit_scale", type=_str_to_bool, nargs="?", const=True, default=lrid_use_logit_scale)
     parser.add_argument("--no-lrid_use_logit_scale", "--no-lrid_logit_scale", dest="lrid_use_logit_scale", action="store_false")
     parser.add_argument("--lrid_logit_scale", type=float, default=lrid_logit_scale)
@@ -171,6 +193,7 @@ use_doc_masking = args.use_doc_masking
 use_attnres = args.use_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
+attnres_block_average = args.attnres_block_average
 attnres_key_norm = args.attnres_key_norm
 attn_res_query_norm = args.attn_res_query_norm
 attn_res_query_init = args.attn_res_query_init
@@ -178,6 +201,15 @@ use_lrid = args.use_lrid
 lrid_rank = args.lrid_rank
 lrid_num_heads = args.lrid_num_heads
 lrid_input_dependent_query = args.lrid_input_dependent_query
+lrid_key_from_value = args.lrid_key_from_value
+lrid_key_from_value_shared = args.lrid_key_from_value_shared
+if lrid_key_from_value_shared:
+    lrid_key_from_value = True
+lrid_key_value_norm = args.lrid_key_value_norm
+lrid_query_from_value = args.lrid_query_from_value
+lrid_query_from_value_shared = args.lrid_query_from_value_shared
+if lrid_query_from_value_shared:
+    lrid_query_from_value = True
 lrid_use_logit_scale = args.lrid_use_logit_scale
 if use_lrid:
     use_attnres = True
@@ -434,7 +466,7 @@ print("=" * 80)
 if wandb_log: logger.finish()
 
 if interactive_after_train and sys.stdin.isatty():
-    enc = tiktoken.get_encoding("gpt2")
+    enc = get_tiktoken_encoding(tokenizer_model)
 
     with torch.inference_mode():
         print("\nInteractive generation mode. Type your prompt and press Enter.")

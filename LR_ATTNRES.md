@@ -67,6 +67,26 @@ output_d: normal sublayer output
 key_k:    low-rank source key
 ```
 
+An alternate source-key mode is available:
+
+```bash
+--lrid_key_from_value
+```
+
+In this mode the attention and MLP output projections do not fuse source keys
+into the same linear projection. Instead, each LR key is produced by a separate
+value-key projection over the source value itself. With the default
+`--lrid_key_value_norm`, that projection sees stateless
+`rms_norm(source_value)`.
+
+By default this is unshared: each attention and MLP output module keeps its own
+value-key projection. Use `--lrid_key_from_value_shared` to instead share one
+source-value key projection across all LR AttnRes sources.
+
+For block LR AttnRes, the source value is the live partial block or completed
+block summary. This means block keys are projected from the block value instead
+of being sums or averages of per-sublayer keys.
+
 An input-dependent query ablation is available:
 
 ```bash
@@ -88,6 +108,31 @@ output_d: normal sublayer output
 key_k:    low-rank source key
 query_k:  low-rank query for future depth routing
 ```
+
+If `--lrid_key_from_value` and `--lrid_input_dependent_query` are both enabled,
+the fused output projection emits only the normal output and the dynamic query:
+
+```text
+c_proj: d -> d + k
+fc2: hidden -> d + k
+```
+
+The dynamic query can also be moved outside the fused output projection:
+
+```bash
+--lrid_query_from_value
+```
+
+In this mode, each dynamic query is produced from the source value directly,
+using the same value normalization switch as outside keys:
+`--lrid_key_value_norm` / `--no-lrid_key_value_norm`. By default this is
+unshared, so each LR output module has its own value-query projection. Use
+`--lrid_query_from_value_shared` to share one source-value query projection.
+
+For block LR AttnRes, outside dynamic queries are projected from the live
+partial block or completed block source value, mirroring outside source keys.
+When `--attnres_block_average` is enabled, that source value is the current
+block average.
 
 The token embedding is also a depth source, so it gets its own low-rank key projection:
 
@@ -135,7 +180,7 @@ values = stack(source_value_i)
 keys = stack(source_key_i)
 values = reshape(values, sources, batch, time, m, d/m)
 keys = reshape(keys, sources, batch, time, m, k/m)
-keys = RMSNorm(keys over k/m)
+keys = rms_norm(keys over k/m)
 query = q_r                         # static-query mode
 logits_i,h = scale * dot(keys_i,h, query_h)
 weights_i,h = softmax_i(logits_h)
@@ -256,6 +301,20 @@ Full LR AttnRes attends over all previous sublayer sources. It is the most expre
 
 Block LR AttnRes compresses prior sublayer outputs into block summaries. It is the recommended default.
 
+By default, block summaries are sums of the sublayer outputs in that block. The
+optional `--attnres_block_average` flag divides partial and completed block
+summaries by the number of accumulated sublayers before using them as depth
+sources. In LR AttnRes, the same averaging is applied to block source keys; the
+fused dynamic query, when enabled, remains the latest emitted query rather than
+an average.
+
+When `--lrid_key_from_value` is enabled, block keys are not averaged separately.
+The key is projected from the current block source value, so any configured
+block value averaging applies before the key projection.
+
+When `--lrid_query_from_value` is enabled, the same rule applies to dynamic
+queries projected from block source values.
+
 Recommended:
 
 ```bash
@@ -304,6 +363,17 @@ attention key overhead = k * d
 MLP key overhead       = k * h
 ```
 
+With unshared `lrid_key_from_value=True`, each LR-producing module still owns a
+key projection, but that projection is applied to the `d`-wide source value:
+
+```text
+attention value-key overhead = k * d
+MLP value-key overhead       = k * d
+```
+
+With `lrid_key_from_value_shared=True`, these per-layer key overheads are
+removed and replaced by the once-per-model source key projection below.
+
 When `lrid_input_dependent_query=True`, it also adds:
 
 ```text
@@ -311,11 +381,32 @@ attention query overhead = k * d
 MLP query overhead       = k * h
 ```
 
+With unshared `lrid_query_from_value=True`, each LR-producing module still owns
+a dynamic-query projection, but that projection is applied to the `d`-wide
+source value:
+
+```text
+attention value-query overhead = k * d
+MLP value-query overhead       = k * d
+```
+
+With `lrid_query_from_value_shared=True`, these per-layer dynamic-query
+overheads are removed and replaced by a once-per-model source query projection.
+
 Once per model, it adds:
 
 ```text
 embedding key overhead = k * d
 depth query overhead   = (2L) * k
+```
+
+In shared source-key mode, the embedding key projection is reused as the shared
+source-value key projection.
+
+Shared source-query mode adds:
+
+```text
+source query overhead = k * d
 ```
 
 In input-dependent query mode, static depth queries remain and gates are added:
@@ -380,12 +471,18 @@ Model config:
 
 ```text
 use_lrid: bool
+attnres_block_average: bool
 attnres_key_norm: bool
 attn_res_query_norm: bool
 attn_res_query_init: "zero" | "normal" | "trunc_normal"
 lrid_rank: int
 lrid_num_heads: int
 lrid_input_dependent_query: bool
+lrid_key_from_value: bool
+lrid_key_from_value_shared: bool
+lrid_key_value_norm: bool
+lrid_query_from_value: bool
+lrid_query_from_value_shared: bool
 lrid_use_logit_scale: bool
 lrid_logit_scale: float | None
 ```
@@ -395,6 +492,8 @@ Training CLI:
 ```bash
 --use_lrid
 --no-use_lrid
+--attnres_block_average
+--no-attnres_block_average
 --attnres_key_norm
 --no-attnres_key_norm
 --attn_res_query_norm
@@ -404,6 +503,16 @@ Training CLI:
 --lrid_num_heads
 --lrid_input_dependent_query
 --no-lrid_input_dependent_query
+--lrid_key_from_value
+--no-lrid_key_from_value
+--lrid_key_from_value_shared
+--no-lrid_key_from_value_shared
+--lrid_key_value_norm
+--no-lrid_key_value_norm
+--lrid_query_from_value
+--no-lrid_query_from_value
+--lrid_query_from_value_shared
+--no-lrid_query_from_value_shared
 --lrid_use_logit_scale
 --no-lrid_use_logit_scale
 --no-lrid_logit_scale

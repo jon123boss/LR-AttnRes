@@ -11,6 +11,7 @@ from tqdm import tqdm
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 
 import tiktoken
+from tokenizer_utils import GPT4_TOKENIZER_MODEL as _GPT4_TOKENIZER_MODEL, get_tiktoken_encoding
 
 try:
     from lm_eval import simple_evaluate
@@ -145,7 +146,8 @@ class OBPMWrapper(LM):
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
 
-        self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.tokenizer_model = self.checkpoint_config.get("tokenizer_model", _GPT4_TOKENIZER_MODEL)
+        self.tokenizer = get_tiktoken_encoding(self.tokenizer_model)
         self.eot_token_id = self.tokenizer.eot_token
 
         self.vocab_size = int(config.vocab_size)
@@ -165,7 +167,7 @@ class OBPMWrapper(LM):
 
     @property
     def tokenizer_name(self):
-        return "tiktoken-gpt2"
+        return f"tiktoken-{self.tokenizer.name}"
 
     def _truncate_left(self, ids: List[int], split: int) -> Tuple[List[int], int]:
         overflow = len(ids) - self.max_length

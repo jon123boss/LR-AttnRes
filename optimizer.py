@@ -24,7 +24,7 @@ def configure_optimizers(model, config: OptimizerConfig):
     
     if hasattr(core_model, "transformer"):
         for name, p in core_model.transformer.named_parameters():
-            if name.startswith("wte.") or name.startswith("final_norm."):
+            if name.startswith("wte."):
                 continue
             if name.startswith("lrid_queries."):
                 adamw_params.append(p)
@@ -41,11 +41,6 @@ def configure_optimizers(model, config: OptimizerConfig):
     if hasattr(core_model, "lm_head") and core_model.lm_head is not None:
         for p in core_model.lm_head.parameters():
             adamw_params.append(p)
-    
-    if hasattr(core_model.transformer, "final_norm"):
-        for p in core_model.transformer.final_norm.parameters():
-            if p.ndim < 2: 
-                adamw_params.append(p)
     
     optimizers = []
 

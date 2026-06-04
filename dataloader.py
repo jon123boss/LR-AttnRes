@@ -3,7 +3,6 @@ import os
 import glob
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from functools import lru_cache
 
 import numpy as np
 import torch
@@ -12,17 +11,30 @@ from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 
 @dataclass
 class DataLoaderConfig:
-    data_dir: str = "finewebedu10B"
+    data_dir: str = "ultrafineweb20B_gpt4"
     batch_size: int = 4
     block_size: int = 1024
     grad_accum_steps: int = 1
     use_doc_masking: bool = True
-    doc_separator_token: Optional[int] = 50256
+    doc_separator_token: Optional[int] = 100257
     num_workers: int = 8
     pin_memory: bool = True
-    persistent_workers: bool = True 
+    persistent_workers: bool = True
     prefetch_factor: int = 2
-    dtype: np.dtype = np.uint16
+    dtype: np.dtype = np.uint32
+
+    def __post_init__(self):
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if self.block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        if self.grad_accum_steps < 1:
+            raise ValueError("grad_accum_steps must be >= 1")
+        if self.num_workers < 0:
+            raise ValueError("num_workers must be >= 0")
+        if self.prefetch_factor < 1:
+            raise ValueError("prefetch_factor must be >= 1")
+        self.dtype = np.dtype(self.dtype)
 
 
 class DocumentPackingDataset(Dataset):
@@ -33,22 +45,29 @@ class DocumentPackingDataset(Dataset):
         block_size: int,
         use_doc_masking: bool,
         doc_separator_token: Optional[int],
-        dtype=np.uint16,
+        dtype=np.uint32,
     ):
         super().__init__()
 
-        self.split = split
-        self.block_size = block_size
-        self.use_doc_masking = use_doc_masking
-        self.doc_separator_token = doc_separator_token
-        self.dtype = dtype
-
-        pattern = os.path.join(
-            data_dir,
-            f"finewebedu_{split}_*.bin" if split in ("train", "val") else None
-        )
-        if pattern is None:
+        if split not in ("train", "val"):
             raise ValueError(f"Unknown split: {split!r}")
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1")
+
+        self.split = split
+        self.block_size = int(block_size)
+        self.use_doc_masking = bool(use_doc_masking)
+        self.doc_separator_token = doc_separator_token
+        self.dtype = np.dtype(dtype)
+
+        if doc_separator_token is not None and np.issubdtype(self.dtype, np.integer):
+            dtype_info = np.iinfo(self.dtype)
+            if not dtype_info.min <= doc_separator_token <= dtype_info.max:
+                raise ValueError(
+                    f"doc_separator_token={doc_separator_token} is outside dtype={self.dtype} range"
+                )
+
+        pattern = os.path.join(data_dir, f"finewebedu_{split}_*.bin")
 
         shard_paths = sorted(glob.glob(pattern))
         if not shard_paths:
@@ -56,34 +75,39 @@ class DocumentPackingDataset(Dataset):
                 f"No shards found for split={split!r} in {data_dir!r} (pattern: {pattern})"
             )
 
-        self.shards = []
         self.shard_sizes = []
         self.shard_seq_counts = []
-        
         self._shard_paths = []
         self._boundary_cache = {}
 
         for p in shard_paths:
-            mm = np.memmap(p, mode="r", dtype=dtype)
-            n_tokens = mm.shape[0]
-            n_seq = max(0, (n_tokens - 1) // block_size)
+            n_bytes = os.path.getsize(p)
+            if n_bytes % self.dtype.itemsize != 0:
+                raise ValueError(
+                    f"Shard {p!r} size is not divisible by dtype={self.dtype} itemsize"
+                )
+
+            n_tokens = n_bytes // self.dtype.itemsize
+            n_seq = max(0, (n_tokens - 1) // self.block_size)
             
             if n_seq == 0:
                 continue
 
-            self.shards.append(mm)
-            self.shard_sizes.append(n_tokens)
+            self.shard_sizes.append(int(n_tokens))
             self.shard_seq_counts.append(n_seq)
             self._shard_paths.append(p)
 
-        if not self.shards:
+        if not self._shard_paths:
             raise RuntimeError(
-                f"All shards for split={split!r} were too small for block_size={block_size}"
+                f"All shards for split={split!r} were too small for block_size={self.block_size}"
             )
+
+        self.shards = []
+        self._open_shards()
 
         self.shard_seq_offsets = np.cumsum([0] + self.shard_seq_counts).astype(np.int64)
         self._num_sequences = int(self.shard_seq_offsets[-1])
-        self.total_tokens = sum(self.shard_sizes)
+        self.total_tokens = int(sum(self.shard_sizes))
 
         self._shard_seq_offsets_searchable = self.shard_seq_offsets[1:]
 
@@ -95,6 +119,26 @@ class DocumentPackingDataset(Dataset):
             f"doc_masking: {use_doc_masking}"
         )
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["shards"] = []
+        state["_boundary_cache"] = {}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._open_shards()
+
+    def _open_shards(self):
+        self.shards = [
+            np.memmap(path, mode="r", dtype=self.dtype)
+            for path in self._shard_paths
+        ]
+
+    def _ensure_shards_open(self):
+        if len(self.shards) != len(self._shard_paths):
+            self._open_shards()
+
     def _get_boundaries(self, shard_idx: int) -> Optional[np.ndarray]:
         if not self.use_doc_masking or self.doc_separator_token is None:
             return None
@@ -102,6 +146,7 @@ class DocumentPackingDataset(Dataset):
         if shard_idx in self._boundary_cache:
             return self._boundary_cache[shard_idx]
 
+        self._ensure_shards_open()
         tokens = self.shards[shard_idx]
         boundaries = self._find_doc_boundaries_fast(tokens, self.doc_separator_token)
         self._boundary_cache[shard_idx] = boundaries
@@ -123,6 +168,8 @@ class DocumentPackingDataset(Dataset):
             chunk = tokens[start:end]
             
             sep_positions = np.flatnonzero(chunk == separator_token)
+            if start == 0 and len(sep_positions) > 0 and sep_positions[0] == 0:
+                sep_positions = sep_positions[1:]
             
             if len(sep_positions) > 0:
                 needed = write_idx + len(sep_positions)
@@ -180,10 +227,9 @@ class DocumentPackingDataset(Dataset):
             doc_positions[write_pos] = self.block_size
             write_pos += 1
 
-        cu_doc_len = torch.from_numpy(doc_positions[:write_pos].copy())
-        
-        doc_lengths = cu_doc_len[1:] - cu_doc_len[:-1]
-        max_doc_len = int(doc_lengths.max().item())
+        doc_positions = doc_positions[:write_pos]
+        max_doc_len = int(np.diff(doc_positions).max())
+        cu_doc_len = torch.from_numpy(doc_positions)
 
         return cu_doc_len, max_doc_len
 
@@ -192,15 +238,19 @@ class DocumentPackingDataset(Dataset):
             raise IndexError(idx)
 
         shard_idx, local_seq_idx = self._locate(idx)
+        self._ensure_shards_open()
         tokens = self.shards[shard_idx]
 
         start = local_seq_idx * self.block_size
         end = start + self.block_size + 1
         
-        seq = np.asarray(tokens[start:end], dtype=np.int64)
+        seq = torch.from_numpy(np.array(tokens[start:end], dtype=np.int64, copy=True))
         
-        x = torch.from_numpy(seq[:-1].copy())
-        y = torch.from_numpy(seq[1:].copy())
+        x = seq[:-1]
+        y = seq[1:]
+
+        if not self.use_doc_masking:
+            return x, y, None, None
 
         cu_doc_len, max_doc_len = self._get_doc_info_fast(shard_idx, start, end - 1)
 
@@ -228,16 +278,13 @@ def collate_with_doc_masking(batch):
         if max_doc_len > max_doc_len_batch:
             max_doc_len_batch = max_doc_len
         
-        if i == 0:
-            adjusted = cu_doc_len + offset
-            n = len(adjusted)
-            cu_doc_len_batch[cu_write_idx:cu_write_idx + n] = adjusted
-            cu_write_idx += n
-        else:
-            adjusted = cu_doc_len[1:] + offset
-            n = len(adjusted)
-            cu_doc_len_batch[cu_write_idx:cu_write_idx + n] = adjusted
-            cu_write_idx += n
+        cu_doc_len = cu_doc_len if i == 0 else cu_doc_len[1:]
+        n = len(cu_doc_len)
+        target = cu_doc_len_batch[cu_write_idx:cu_write_idx + n]
+        target.copy_(cu_doc_len)
+        if offset:
+            target.add_(offset)
+        cu_write_idx += n
         
         offset += seq_len
 
@@ -357,14 +404,18 @@ def warmup_boundaries(dataset: DocumentPackingDataset, num_shards: Optional[int]
     if not dataset.use_doc_masking:
         return
     
-    n = num_shards or len(dataset.shards)
-    n = min(n, len(dataset.shards))
+    dataset._ensure_shards_open()
+    n = len(dataset.shards) if num_shards is None else num_shards
+    n = max(0, min(n, len(dataset.shards)))
+    if n == 0:
+        print("Warmed up boundaries for 0 shards")
+        return
     
     def compute_boundary(shard_idx):
         dataset._get_boundaries(shard_idx)
         return shard_idx
     
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=min(4, n)) as executor:
         list(executor.map(compute_boundary, range(n)))
     
     print(f"Warmed up boundaries for {n} shards")
