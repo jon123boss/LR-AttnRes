@@ -58,7 +58,7 @@ torchrun --standalone --nproc_per_node=8 train.py
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=8 train.py --full_run
+torchrun --standalone --nproc_per_node=2 train.py --torch-max-autotune --full_run
 ```
 
 

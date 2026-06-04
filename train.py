@@ -119,7 +119,7 @@ log_interval = 1
 eval_steps = 10
 eval_only = False
 save_checkpoint = True
-ckpt_interval = 10000
+ckpt_interval = 2500
 save_ckpt_at_end = True
 interactive_after_train = False
 init_from = 'scratch'
@@ -144,9 +144,9 @@ torch_compile = True
 torch_compile_max_autotune = False
 torch_compile_cudagraphs = False
 # Full run automation
-full_run = False
+full_run = True
 full_run_hf_repo_id = ""
-full_run_hf_private = True
+full_run_hf_private = False
 full_run_eval = True
 full_run_eval_mode = "full" # full, validation-only, tasks-only
 full_run_eval_torch_max_autotune = False
@@ -157,11 +157,11 @@ num_workers = 8
 pin_memory = True if device.type == "cuda" else False
 persistent_workers = False
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
+n_layer = 24
+n_head = 16
+n_embd = 1024
 vocab_size = _GPT4_VOCAB_SIZE
-mlp_hidden_dim = 2048
+mlp_hidden_dim = 2816
 mlp_ratio = None
 weight_tying = False
 flash_attention = True
@@ -196,9 +196,9 @@ qk_norm = True
 norm_pos = "before" # before, after, both
 clip_qkv = None
 # optimizer (Muon + AdamW settings)
-muon_lr = 0.01
-adamw_lr= 0.003
-max_steps = 1000
+muon_lr = 0.001
+adamw_lr= 0.0003
+max_steps = 38146
 max_tokens = int(10e9)
 muon_weight_decay = 0.1
 adamw_weight_decay = 0.0
@@ -208,7 +208,7 @@ beta2 = 0.95
 muon_momentum = 0.95
 grad_clip = 1.0
 # Momentum warmup/cooldown settings
-muon_momentum_warmup_steps = 100
+muon_momentum_warmup_steps = 300
 muon_momentum_cooldown_steps = 100
 muon_momentum_min = 0.85
 muon_momentum_max = 0.95
@@ -219,7 +219,7 @@ z_loss = True
 z_loss_weight = 1e-5
 ce_inplace_backward = True
 # Scheduler
-warmup_steps = 100
+warmup_steps = 2000
 warmdown_steps = int(0.2 * max_steps)
 sched_mode = "linear"
 
