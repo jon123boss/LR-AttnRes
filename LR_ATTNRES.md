@@ -87,6 +87,17 @@ For block LR AttnRes, the source value is the live partial block or completed
 block summary. This means block keys are projected from the block value instead
 of being sums or averages of per-sublayer keys.
 
+The embedding source key can be made input-independent:
+
+```bash
+--lrid_static_embedding_key
+```
+
+With this flag, the embedding depth source uses one learned low-rank key
+parameter broadcast over batch and token positions instead of a key projected
+from the token embedding value. Shared source-key/query projections are still
+created when requested for non-embedding sources.
+
 An input-dependent query ablation is available:
 
 ```bash
@@ -397,9 +408,13 @@ overheads are removed and replaced by a once-per-model source query projection.
 Once per model, it adds:
 
 ```text
-embedding key overhead = k * d
-depth query overhead   = (2L) * k
+embedding key projection overhead = k * d
+depth query overhead              = (2L) * k
 ```
+
+With `lrid_static_embedding_key=True`, the embedding key overhead is `k`
+instead of `k * d`, unless shared source-key/query projections still require
+the embedding/source projection module.
 
 In shared source-key mode, the embedding key projection is reused as the shared
 source-value key projection.
@@ -479,6 +494,7 @@ attn_res_query_init: "zero" | "normal" | "trunc_normal"
 lrid_rank: int
 lrid_num_heads: int
 lrid_input_dependent_query: bool
+lrid_static_embedding_key: bool
 lrid_key_from_value: bool
 lrid_key_from_value_shared: bool
 lrid_key_value_norm: bool
@@ -504,6 +520,8 @@ Training CLI:
 --lrid_num_heads
 --lrid_input_dependent_query
 --no-lrid_input_dependent_query
+--lrid_static_embedding_key
+--no-lrid_static_embedding_key
 --lrid_key_from_value
 --no-lrid_key_from_value
 --lrid_key_from_value_shared

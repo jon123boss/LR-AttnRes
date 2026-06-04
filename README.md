@@ -58,6 +58,8 @@ input-dependent depth queries with `--lrid_input_dependent_query`, changing LR
 output projections from `d + k` to `d + 2k`; this uses a gated hybrid query
 `static_query + gate * dynamic_query`. Depth routing can be split into multiple
 heads with `--lrid_num_heads`; `lrid_rank` remains the total low-rank width.
+Use `--lrid_static_embedding_key` to make the embedding source key a learned,
+input-independent LR key instead of projecting it from token embeddings.
 Use `--lrid_key_from_value` to project LR keys from the source value or block
 summary instead of fusing them into each output projection. This is unshared by
 default, keeping a separate value-key projector per LR output module;

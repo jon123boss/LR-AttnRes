@@ -46,6 +46,7 @@ class ModelConfig:
     lrid_rank: int = 64
     lrid_num_heads: int = 1
     lrid_input_dependent_query: bool = False
+    lrid_static_embedding_key: bool = False
     lrid_key_from_value: bool = False
     lrid_key_from_value_shared: bool = False
     lrid_key_value_norm: bool = True
@@ -80,6 +81,24 @@ class ModelConfig:
             raise ValueError("lrid_logit_scale must be positive")
         if self.use_lrid:
             self.use_attnres = True
+
+
+class LRIDStaticEmbeddingKey(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.key = nn.Parameter(torch.empty(config.lrid_rank))
+
+    def reset_parameters(self, std=0.02, init_cutoff_factor=None):
+        if init_cutoff_factor is not None:
+            cutoff = init_cutoff_factor * std
+            nn.init.trunc_normal_(self.key, mean=0.0, std=std, a=-cutoff, b=cutoff)
+        else:
+            nn.init.normal_(self.key, mean=0.0, std=std)
+
+    def forward(self, reference):
+        return self.key.to(reference.dtype).view(1, 1, -1).expand(reference.size(0), reference.size(1), -1)
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -502,7 +521,15 @@ class OBPM(nn.Module):
             if self.attnres_type == "block" and config.attnres_num_blocks < 1:
                 raise ValueError("attnres_num_blocks must be >= 1 when using block AttnRes")
             if self.use_lrid:
-                transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
+                needs_lrid_source_projection = (
+                    not config.lrid_static_embedding_key
+                    or config.lrid_key_from_value_shared
+                    or (config.lrid_input_dependent_query and config.lrid_query_from_value_shared)
+                )
+                if needs_lrid_source_projection:
+                    transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
+                if config.lrid_static_embedding_key:
+                    transformer_modules["lrid_static_embedding_key"] = LRIDStaticEmbeddingKey(config)
                 key_head_dim = config.lrid_rank // config.lrid_num_heads
                 transformer_modules["lrid_queries"] = nn.ParameterList(
                     [
@@ -584,11 +611,15 @@ class OBPM(nn.Module):
     def _project_lrid_source_query(self, value):
         return self.transformer.lrid_embedding_key.project_query_from_value(value)
 
+    def _static_lrid_embedding_key(self, embedding):
+        return self.transformer.lrid_static_embedding_key(embedding)
+
     def _lrid_source(self, value, key=None, query=None, key_value=None, query_value=None):
-        if self.config.lrid_key_from_value_shared:
-            key = self._project_lrid_source_key(value if key_value is None else key_value)
-        elif key is None:
-            raise RuntimeError("LR AttnRes source key is missing")
+        if key is None:
+            if self.config.lrid_key_from_value_shared:
+                key = self._project_lrid_source_key(value if key_value is None else key_value)
+            else:
+                raise RuntimeError("LR AttnRes source key is missing")
         if self.config.lrid_input_dependent_query:
             if self.config.lrid_query_from_value_shared:
                 query = self._project_lrid_source_query(value if query_value is None else query_value)
@@ -596,7 +627,10 @@ class OBPM(nn.Module):
         return value, key
 
     def _embedding_lrid_source(self, embedding):
-        key = None if self.config.lrid_key_from_value_shared else self._project_lrid_source_key(embedding)
+        if self.config.lrid_static_embedding_key:
+            key = self._static_lrid_embedding_key(embedding)
+        else:
+            key = None if self.config.lrid_key_from_value_shared else self._project_lrid_source_key(embedding)
         return self._lrid_source(embedding, key)
 
     def _apply_lrid_attnres(self, residual_idx, sources, query_override=None):
@@ -669,6 +703,8 @@ class OBPM(nn.Module):
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
             else:
                 nn.init.normal_(module.weight, mean=0.0, std=std)
+        elif isinstance(module, LRIDStaticEmbeddingKey):
+            module.reset_parameters(std, init_cutoff_factor)
         elif isinstance(module, AttentionResidual):
             self._init_attnres_query(module.query, std, init_cutoff_factor)
 
