@@ -566,7 +566,7 @@ class OBPM(nn.Module):
     def _lrid_block_source(self, value, key=None, query=None, count=1):
         if self.config.attnres_block_average:
             value = value / count
-            if not self.config.lrid_key_from_value:
+            if not self.config.lrid_key_from_value and not self.config.attnres_key_norm:
                 key = key / count
         key_value = value if self.config.lrid_key_from_value_shared else None
         query_value = value if self.config.lrid_query_from_value_shared else None

@@ -304,9 +304,10 @@ Block LR AttnRes compresses prior sublayer outputs into block summaries. It is t
 By default, block summaries are sums of the sublayer outputs in that block. The
 optional `--attnres_block_average` flag divides partial and completed block
 summaries by the number of accumulated sublayers before using them as depth
-sources. In LR AttnRes, the same averaging is applied to block source keys; the
-fused dynamic query, when enabled, remains the latest emitted query rather than
-an average.
+sources. In LR AttnRes, emitted block source keys are averaged only when
+`--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
+key by the block count would be removed by the later RMSNorm. The fused dynamic
+query, when enabled, remains the latest emitted query rather than an average.
 
 When `--lrid_key_from_value` is enabled, block keys are not averaged separately.
 The key is projected from the current block source value, so any configured
