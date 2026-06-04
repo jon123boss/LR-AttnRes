@@ -120,9 +120,9 @@ wandb_project = "LR-AttnRes"
 wandb_run_name = "LRID"
 # data
 dataset_dir = "ultrafineweb20B_gpt4"
-batch_size = 32
+batch_size = 16
 block_size = 2048
-grad_accum_steps = 4
+grad_accum_steps = 8
 total_batch_size = batch_size * block_size * grad_accum_steps
 tokenizer_model = _GPT4_TOKENIZER_MODEL
 data_dtype = "uint32"
