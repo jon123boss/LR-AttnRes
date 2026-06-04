@@ -47,6 +47,8 @@ class ModelConfig:
     lrid_num_heads: int = 1
     lrid_input_dependent_query: bool = False
     lrid_static_embedding_key: bool = False
+    lrid_add_static_embedding_key: bool = False
+    lrid_add_static_source_key: bool = False
     lrid_key_from_value: bool = False
     lrid_key_from_value_shared: bool = False
     lrid_key_value_norm: bool = True
@@ -61,6 +63,8 @@ class ModelConfig:
         self.attn_res_query_init = (self.attn_res_query_init or "zero").lower()
         if self.attn_res_query_init not in {"zero", "normal", "trunc_normal"}:
             raise ValueError("attn_res_query_init must be one of: zero, normal, trunc_normal")
+        if self.lrid_static_embedding_key and self.lrid_add_static_embedding_key:
+            raise ValueError("lrid_static_embedding_key and lrid_add_static_embedding_key are mutually exclusive")
         if self.lrid_key_from_value_shared:
             self.lrid_key_from_value = True
         if self.lrid_query_from_value_shared:
@@ -83,7 +87,7 @@ class ModelConfig:
             self.use_attnres = True
 
 
-class LRIDStaticEmbeddingKey(nn.Module):
+class LRIDStaticKey(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.key = nn.Parameter(torch.empty(config.lrid_rank))
@@ -528,8 +532,10 @@ class OBPM(nn.Module):
                 )
                 if needs_lrid_source_projection:
                     transformer_modules["lrid_embedding_key"] = LRIDSourceKeyProjection(config)
-                if config.lrid_static_embedding_key:
-                    transformer_modules["lrid_static_embedding_key"] = LRIDStaticEmbeddingKey(config)
+                if config.lrid_static_embedding_key or config.lrid_add_static_embedding_key:
+                    transformer_modules["lrid_static_embedding_key"] = LRIDStaticKey(config)
+                if config.lrid_add_static_source_key:
+                    transformer_modules["lrid_static_source_key"] = LRIDStaticKey(config)
                 key_head_dim = config.lrid_rank // config.lrid_num_heads
                 transformer_modules["lrid_queries"] = nn.ParameterList(
                     [
@@ -597,7 +603,14 @@ class OBPM(nn.Module):
                 key = key / count
         key_value = value if self.config.lrid_key_from_value_shared else None
         query_value = value if self.config.lrid_query_from_value_shared else None
-        return self._lrid_source(value, key, query, key_value=key_value, query_value=query_value)
+        return self._lrid_source(
+            value,
+            key,
+            query,
+            key_value=key_value,
+            query_value=query_value,
+            add_static_key=True,
+        )
 
     def _apply_attnres(self, residual_idx, sources):
         if len(sources) == 1:
@@ -614,12 +627,24 @@ class OBPM(nn.Module):
     def _static_lrid_embedding_key(self, embedding):
         return self.transformer.lrid_static_embedding_key(embedding)
 
-    def _lrid_source(self, value, key=None, query=None, key_value=None, query_value=None):
+    def _add_static_lrid_embedding_key(self, key):
+        if self.config.lrid_add_static_embedding_key:
+            key = key + self.transformer.lrid_static_embedding_key(key)
+        return key
+
+    def _add_static_lrid_source_key(self, key):
+        if self.config.lrid_add_static_source_key:
+            key = key + self.transformer.lrid_static_source_key(key)
+        return key
+
+    def _lrid_source(self, value, key=None, query=None, key_value=None, query_value=None, add_static_key=False):
         if key is None:
             if self.config.lrid_key_from_value_shared:
                 key = self._project_lrid_source_key(value if key_value is None else key_value)
             else:
                 raise RuntimeError("LR AttnRes source key is missing")
+        if add_static_key:
+            key = self._add_static_lrid_source_key(key)
         if self.config.lrid_input_dependent_query:
             if self.config.lrid_query_from_value_shared:
                 query = self._project_lrid_source_query(value if query_value is None else query_value)
@@ -630,7 +655,8 @@ class OBPM(nn.Module):
         if self.config.lrid_static_embedding_key:
             key = self._static_lrid_embedding_key(embedding)
         else:
-            key = None if self.config.lrid_key_from_value_shared else self._project_lrid_source_key(embedding)
+            key = self._project_lrid_source_key(embedding)
+            key = self._add_static_lrid_embedding_key(key)
         return self._lrid_source(embedding, key)
 
     def _apply_lrid_attnres(self, residual_idx, sources, query_override=None):
@@ -703,7 +729,7 @@ class OBPM(nn.Module):
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
             else:
                 nn.init.normal_(module.weight, mean=0.0, std=std)
-        elif isinstance(module, LRIDStaticEmbeddingKey):
+        elif isinstance(module, LRIDStaticKey):
             module.reset_parameters(std, init_cutoff_factor)
         elif isinstance(module, AttentionResidual):
             self._init_attnres_query(module.query, std, init_cutoff_factor)
@@ -778,7 +804,14 @@ class OBPM(nn.Module):
                     layer_output = attn_out
 
                     if self.attnres_type == "full":
-                        residual_sources.append(self._lrid_source(layer_output, lrid_key, lrid_query if self.config.lrid_input_dependent_query else None))
+                        residual_sources.append(
+                            self._lrid_source(
+                                layer_output,
+                                lrid_key,
+                                lrid_query if self.config.lrid_input_dependent_query else None,
+                                add_static_key=True,
+                            )
+                        )
                         x = self._apply_lrid_attnres(2 * layer_idx + 1, residual_sources)
                     else:
                         after_attn_idx = 2 * layer_idx + 1
@@ -826,7 +859,14 @@ class OBPM(nn.Module):
                     x = mlp_out
 
                     if self.attnres_type == "full":
-                        residual_sources.append(self._lrid_source(layer_output, lrid_key, lrid_query if self.config.lrid_input_dependent_query else None))
+                        residual_sources.append(
+                            self._lrid_source(
+                                layer_output,
+                                lrid_key,
+                                lrid_query if self.config.lrid_input_dependent_query else None,
+                                add_static_key=True,
+                            )
+                        )
                     else:
                         after_mlp_idx = 2 * layer_idx + 2
                         if partial_block is None:

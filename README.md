@@ -60,6 +60,9 @@ output projections from `d + k` to `d + 2k`; this uses a gated hybrid query
 heads with `--lrid_num_heads`; `lrid_rank` remains the total low-rank width.
 Use `--lrid_static_embedding_key` to make the embedding source key a learned,
 input-independent LR key instead of projecting it from token embeddings.
+Use `--lrid_add_static_embedding_key` or `--lrid_add_static_source_key` to add
+a learned static key to the computed embedding key or computed non-embedding
+source keys.
 Use `--lrid_key_from_value` to project LR keys from the source value or block
 summary instead of fusing them into each output projection. This is unshared by
 default, keeping a separate value-key projector per LR output module;

@@ -98,6 +98,20 @@ parameter broadcast over batch and token positions instead of a key projected
 from the token embedding value. Shared source-key/query projections are still
 created when requested for non-embedding sources.
 
+Static keys can also be added to computed keys:
+
+```bash
+--lrid_add_static_embedding_key
+--lrid_add_static_source_key
+```
+
+`--lrid_add_static_embedding_key` uses the normal computed embedding key plus a
+learned input-independent key. It is mutually exclusive with
+`--lrid_static_embedding_key`, which replaces the computed embedding key.
+`--lrid_add_static_source_key` adds one learned input-independent key to each
+computed non-embedding LR source key after the fused, value-from-key, shared,
+full, or block key path has produced that source key.
+
 An input-dependent query ablation is available:
 
 ```bash
@@ -416,6 +430,13 @@ With `lrid_static_embedding_key=True`, the embedding key overhead is `k`
 instead of `k * d`, unless shared source-key/query projections still require
 the embedding/source projection module.
 
+Additive static key modes add:
+
+```text
+static embedding key overhead = k
+static source key overhead    = k
+```
+
 In shared source-key mode, the embedding key projection is reused as the shared
 source-value key projection.
 
@@ -495,6 +516,8 @@ lrid_rank: int
 lrid_num_heads: int
 lrid_input_dependent_query: bool
 lrid_static_embedding_key: bool
+lrid_add_static_embedding_key: bool
+lrid_add_static_source_key: bool
 lrid_key_from_value: bool
 lrid_key_from_value_shared: bool
 lrid_key_value_norm: bool
@@ -522,6 +545,10 @@ Training CLI:
 --no-lrid_input_dependent_query
 --lrid_static_embedding_key
 --no-lrid_static_embedding_key
+--lrid_add_static_embedding_key
+--no-lrid_add_static_embedding_key
+--lrid_add_static_source_key
+--no-lrid_add_static_source_key
 --lrid_key_from_value
 --no-lrid_key_from_value
 --lrid_key_from_value_shared

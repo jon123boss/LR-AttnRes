@@ -91,6 +91,8 @@ lrid_rank = 32
 lrid_num_heads = 1
 lrid_input_dependent_query = False
 lrid_static_embedding_key = False
+lrid_add_static_embedding_key = False
+lrid_add_static_source_key = False
 lrid_key_from_value = False
 lrid_key_from_value_shared = False
 lrid_key_value_norm = True
@@ -171,6 +173,10 @@ def parse_args():
     parser.add_argument("--no-lrid_input_dependent_query", dest="lrid_input_dependent_query", action="store_false")
     parser.add_argument("--lrid_static_embedding_key", type=_str_to_bool, nargs="?", const=True, default=lrid_static_embedding_key)
     parser.add_argument("--no-lrid_static_embedding_key", dest="lrid_static_embedding_key", action="store_false")
+    parser.add_argument("--lrid_add_static_embedding_key", type=_str_to_bool, nargs="?", const=True, default=lrid_add_static_embedding_key)
+    parser.add_argument("--no-lrid_add_static_embedding_key", dest="lrid_add_static_embedding_key", action="store_false")
+    parser.add_argument("--lrid_add_static_source_key", type=_str_to_bool, nargs="?", const=True, default=lrid_add_static_source_key)
+    parser.add_argument("--no-lrid_add_static_source_key", dest="lrid_add_static_source_key", action="store_false")
     parser.add_argument("--lrid_key_from_value", type=_str_to_bool, nargs="?", const=True, default=lrid_key_from_value)
     parser.add_argument("--no-lrid_key_from_value", dest="lrid_key_from_value", action="store_false")
     parser.add_argument("--lrid_key_from_value_shared", type=_str_to_bool, nargs="?", const=True, default=lrid_key_from_value_shared)
@@ -205,6 +211,8 @@ lrid_rank = args.lrid_rank
 lrid_num_heads = args.lrid_num_heads
 lrid_input_dependent_query = args.lrid_input_dependent_query
 lrid_static_embedding_key = args.lrid_static_embedding_key
+lrid_add_static_embedding_key = args.lrid_add_static_embedding_key
+lrid_add_static_source_key = args.lrid_add_static_source_key
 lrid_key_from_value = args.lrid_key_from_value
 lrid_key_from_value_shared = args.lrid_key_from_value_shared
 if lrid_key_from_value_shared:
