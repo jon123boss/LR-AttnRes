@@ -260,7 +260,16 @@ def prepare_full_run_hf_repo(repo_id: str, private: bool) -> str:
         repo_id = f"{username}/{repo_id}"
 
     print(f"full_run: creating or reusing Hugging Face model repo {repo_id!r}")
-    api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+    try:
+        api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "full_run could not create or access the Hugging Face model repo "
+            f"{repo_id!r}. Make sure the token has write permissions and that "
+            "the repo namespace is an account or organization you can write to. "
+            "You can also create the model repo manually on Hugging Face first, "
+            "then rerun with --full_run_hf_repo_id namespace/repo."
+        ) from exc
     return repo_id
 
 
@@ -487,10 +496,16 @@ if full_run and interactive_after_train:
     print0("full_run disables interactive_after_train so upload/eval can run unattended.")
     interactive_after_train = False
 
-if full_run and master_process:
-    full_run_hf_repo_id = prepare_full_run_hf_repo(full_run_hf_repo_id, full_run_hf_private)
-if full_run and distributed:
-    dist.barrier()
+if full_run:
+    try:
+        if master_process:
+            full_run_hf_repo_id = prepare_full_run_hf_repo(full_run_hf_repo_id, full_run_hf_private)
+        if distributed:
+            dist.barrier()
+    except Exception:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
+        raise
 
 configured_grad_accum_steps = grad_accum_steps
 if distributed and ddp_preserve_global_batch:
