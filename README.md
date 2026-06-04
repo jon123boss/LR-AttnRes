@@ -57,6 +57,11 @@ For DDP, launch with `torchrun`:
 torchrun --standalone --nproc_per_node=8 train.py
 ```
 
+```bash
+torchrun --standalone --nproc_per_node=8 train.py --full_run
+```
+
+
 For 8-GPU DDP with PyTorch compile max-autotune:
 
 ```bash
