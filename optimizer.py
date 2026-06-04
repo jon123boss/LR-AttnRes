@@ -5,6 +5,17 @@ from typing import List
 from muon.muon import Muon
 
 
+def unwrap_model(model):
+    while True:
+        if hasattr(model, "module"):
+            model = model.module
+            continue
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+            continue
+        return model
+
+
 @dataclass
 class OptimizerConfig:
     muon_lr: float = 0.03
@@ -15,12 +26,13 @@ class OptimizerConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     muon_momentum: float = 0.95
+    verbose: bool = True
 
 
 def configure_optimizers(model, config: OptimizerConfig):
     muon_params = []
     adamw_params = []
-    core_model = getattr(model, "_orig_mod", model)
+    core_model = unwrap_model(model)
     
     if hasattr(core_model, "transformer"):
         for name, p in core_model.transformer.named_parameters():
@@ -67,8 +79,9 @@ def configure_optimizers(model, config: OptimizerConfig):
         )
         optimizers.append(adamw)
     
-    print(f"Muon optimizer: {len(muon_params)} parameters")
-    print(f"AdamW optimizer: {len(adamw_params)} parameters")
+    if config.verbose:
+        print(f"Muon optimizer: {len(muon_params)} parameters")
+        print(f"AdamW optimizer: {len(adamw_params)} parameters")
     
     return optimizers
 
@@ -83,6 +96,7 @@ def get_optimizers(config, model):
         beta1=config["beta1"],
         beta2=config["beta2"],
         muon_momentum=config["muon_momentum"],
+        verbose=bool(config.get("master_process", True)),
     )
 
     optimizers = configure_optimizers(model, optimizer_config)

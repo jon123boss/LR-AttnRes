@@ -18,6 +18,7 @@ os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 
 import tiktoken
 from tokenizer_utils import GPT4_TOKENIZER_MODEL as _GPT4_TOKENIZER_MODEL, get_tiktoken_encoding
+import torch.distributed as dist
 
 try:
     from lm_eval import simple_evaluate
@@ -54,11 +55,12 @@ else:
 from model import OBPM, ModelConfig
 from criterion import get_criterion
 from dataloader import warmup_boundaries
-from utils import compute_validation_loss, get_validation_dataloader
+from utils import compute_validation_loss, get_validation_dataloader, unwrap_model
 
 OLMES_DEFAULT_SHOTS = 5
 DEFAULT_CKPT_DIR = "out"
 CHECKPOINT_PATTERN = "ckpt_step:*.pt"
+DEFAULT_RESULTS_FILE = os.path.join(DEFAULT_CKPT_DIR, "eval_results.txt")
 DATASET_SCRIPT_ERROR = "Dataset scripts are no longer supported"
 DATASET_SCRIPT_TASKS = {"siqa", "social_iqa"}
 
@@ -85,6 +87,51 @@ TASK_MAPPING = {
     "Winogrande": "winogrande",
     "winogrande": "winogrande",
 }
+
+
+def _str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value")
+
+
+def setup_distributed():
+    has_rank = "RANK" in os.environ
+    has_world_size = "WORLD_SIZE" in os.environ
+    if not has_rank and not has_world_size:
+        return False, 0, 1, 0
+    if not has_rank or not has_world_size:
+        raise RuntimeError("Both RANK and WORLD_SIZE must be set for distributed evaluation.")
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if world_size < 1:
+        raise ValueError("WORLD_SIZE must be >= 1")
+    if rank < 0 or rank >= world_size:
+        raise ValueError("RANK must satisfy 0 <= RANK < WORLD_SIZE")
+    if local_rank < 0:
+        raise ValueError("LOCAL_RANK must be >= 0")
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    if world_size == 1:
+        return False, rank, world_size, local_rank
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+    dist.barrier()
+    return True, rank, world_size, local_rank
+
+
+def print0(master_process: bool, *args, **kwargs):
+    if master_process:
+        print(*args, **kwargs)
 
 
 def _parse_batch_size(batch_size: Union[int, str, None]) -> int:
@@ -203,14 +250,21 @@ class OBPMWrapper(LM):
         device: str = "cuda",
         batch_size: Union[int, str] = 1,
         max_batch_size: int = 64,
+        torch_compile: bool = False,
+        torch_compile_max_autotune: bool = False,
+        verbose: bool = True,
     ):
         super().__init__()
         self._device = torch.device(device)
 
         self.batch_size_per_gpu = _parse_batch_size(batch_size)
         self.max_batch_size = max_batch_size
+        self.torch_compile = bool(torch_compile or torch_compile_max_autotune)
+        self.torch_compile_mode = "max-autotune" if torch_compile_max_autotune else None
+        self.verbose = bool(verbose)
 
-        print(f"Loading checkpoint from: {model_path}")
+        if self.verbose:
+            print(f"Loading checkpoint from: {model_path}")
         checkpoint = torch.load(model_path, map_location=self._device, weights_only=False)
 
         model_args = checkpoint.get("model_args", {})
@@ -231,10 +285,15 @@ class OBPMWrapper(LM):
 
         self.model.load_state_dict(state_dict, strict=True)
         self.model.to(self._device)
-        self.model.eval()
 
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
+        if self.torch_compile:
+            if self.verbose:
+                print(f"Torch compile enabled for eval | mode: {self.torch_compile_mode or 'default'}")
+            self.model = torch.compile(self.model, mode=self.torch_compile_mode)
+
+        self.model.eval()
 
         self.tokenizer_model = self.checkpoint_config.get("tokenizer_model", _GPT4_TOKENIZER_MODEL)
         self.tokenizer = get_tiktoken_encoding(self.tokenizer_model)
@@ -366,7 +425,7 @@ class OBPMWrapper(LM):
             x = torch.tensor([tokens], dtype=torch.long, device=self._device)
 
             with torch.inference_mode():
-                out_idx = self.model.generate(x, max_new_tokens=max_gen_toks, temperature=0.0)
+                out_idx = unwrap_model(self.model).generate(x, max_new_tokens=max_gen_toks, temperature=0.0)
 
             out = out_idx[0].tolist()
             new_tokens = out[len(x[0]) :]
@@ -385,7 +444,13 @@ class OBPMWrapper(LM):
             yield requests[i : i + chunk_size]
 
 
-def run_validation_loss(lm_obj: OBPMWrapper):
+def run_validation_loss(
+    lm_obj: OBPMWrapper,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    master_process: bool = True,
+):
     config = getattr(lm_obj, "checkpoint_config", None)
     if not config:
         raise RuntimeError(
@@ -395,12 +460,15 @@ def run_validation_loss(lm_obj: OBPMWrapper):
 
     eval_config = dict(config)
     eval_config["pin_memory"] = bool(lm_obj._device.type == "cuda" and eval_config.get("pin_memory", False))
+    eval_config["rank"] = rank if distributed else 0
+    eval_config["world_size"] = world_size if distributed else 1
+    eval_config["master_process"] = master_process
 
     val_loader = get_validation_dataloader(eval_config)
     if eval_config.get("use_doc_masking", False):
-        print("Warming up validation document boundary cache...")
-        warmup_boundaries(val_loader.dataset)
-        print("Validation boundary warmup complete.")
+        print0(master_process, "Warming up validation document boundary cache...")
+        warmup_boundaries(val_loader.dataset, verbose=master_process)
+        print0(master_process, "Validation boundary warmup complete.")
 
     criterion = get_criterion(eval_config)
     val_metrics = compute_validation_loss(
@@ -410,12 +478,14 @@ def run_validation_loss(lm_obj: OBPMWrapper):
         lm_obj._device,
         lm_obj.vocab_size,
         use_doc_masking=eval_config.get("use_doc_masking", False),
+        distributed=distributed,
     )
-    print(
+    print0(
+        master_process,
         f"Validation loss: {val_metrics['loss']:.4f} "
         f"({val_metrics['tokens']:,} tokens across {val_metrics['batches']:,} batches)"
     )
-    print("-" * 80)
+    print0(master_process, "-" * 80)
     return val_metrics
 
 
@@ -424,55 +494,93 @@ def evaluate_checkpoints(
     tasks_list: List[str],
     include_validation: bool = True,
     include_tasks: bool = True,
+    torch_compile: bool = False,
+    torch_compile_max_autotune: bool = False,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    local_rank: int = 0,
 ):
     if not include_validation and not include_tasks:
         raise ValueError("At least one evaluation mode must be enabled.")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    master_process = rank == 0
+    if torch.cuda.is_available():
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
+    print0(master_process, f"Device: {device}")
+    print0(master_process, f"Distributed eval: {distributed} | Rank: {rank}/{world_size} | Local rank: {local_rank}")
+    print0(
+        master_process,
+        f"Torch compile: {torch_compile or torch_compile_max_autotune} | "
+        f"mode: {'max-autotune' if torch_compile_max_autotune else 'default'}",
+    )
 
     valid_tasks = [TASK_MAPPING.get(t, t) for t in tasks_list] if include_tasks else []
 
     if include_validation and include_tasks:
-        print("Evaluation mode: validation loss + downstream tasks")
+        print0(master_process, "Evaluation mode: validation loss + downstream tasks")
     elif include_validation:
-        print("Evaluation mode: validation loss only")
+        print0(master_process, "Evaluation mode: validation loss only")
     else:
-        print("Evaluation mode: downstream tasks only")
+        print0(master_process, "Evaluation mode: downstream tasks only")
 
     if include_tasks:
-        print(f"Tasks to evaluate: {valid_tasks}")
-    print("-" * 80)
+        print0(master_process, f"Tasks to evaluate: {valid_tasks}")
+        if distributed:
+            print0(master_process, "Downstream tasks run on rank 0 only; validation loss is sharded across ranks.")
+    print0(master_process, "-" * 80)
 
     results = {}
 
     for ckpt in checkpoints:
         if not os.path.exists(ckpt):
-            print(f"Skipping missing checkpoint: {ckpt}")
+            print0(master_process, f"Skipping missing checkpoint: {ckpt}")
             continue
 
-        print(f"\nEvaluating Checkpoint: {ckpt}")
-        print("=" * 80)
+        print0(master_process, f"\nEvaluating Checkpoint: {ckpt}")
+        print0(master_process, "=" * 80)
 
-        lm_obj = OBPMWrapper(model_path=ckpt, device=device, batch_size=1)
+        needs_model = include_validation or (include_tasks and master_process) or not distributed
+        if not needs_model:
+            if distributed:
+                dist.barrier()
+            continue
+
+        lm_obj = OBPMWrapper(
+            model_path=ckpt,
+            device=device,
+            batch_size=1,
+            torch_compile=torch_compile,
+            torch_compile_max_autotune=torch_compile_max_autotune,
+            verbose=master_process,
+        )
         eval_output = {}
 
         if include_validation:
-            val_metrics = run_validation_loss(lm_obj)
+            val_metrics = run_validation_loss(
+                lm_obj,
+                distributed=distributed,
+                rank=rank,
+                world_size=world_size,
+                master_process=master_process,
+            )
             eval_output["validation_loss"] = val_metrics
 
-        if include_tasks:
+        if include_tasks and master_process:
             task_output = run_downstream_tasks(lm_obj, valid_tasks, device)
             task_output.update(eval_output)
             eval_output = task_output
 
-        results[ckpt] = eval_output
+        if master_process:
+            results[ckpt] = eval_output
 
-        print("\nResults:")
-        if include_validation:
+        print0(master_process, "\nResults:")
+        if include_validation and master_process:
             val_metrics = eval_output["validation_loss"]
             print(f"  validation_loss: {val_metrics['loss']:.4f}")
-        if include_tasks:
+        if include_tasks and master_process:
             res_dict = eval_output.get("results", {})
             for task_name, metrics in res_dict.items():
                 print(f"  Task: {task_name}")
@@ -489,9 +597,57 @@ def evaluate_checkpoints(
                 print(f"  Skipped task: {task_name}")
                 print(f"    reason: {reason}")
 
-        print("-" * 80)
+        print0(master_process, "-" * 80)
+        if distributed:
+            dist.barrier()
 
     return results
+
+
+def _format_metric_value(value):
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def format_results_text(results: dict) -> str:
+    lines = ["OBPM evaluation results", "=" * 80, ""]
+    if not results:
+        lines.append("No checkpoint results were produced.")
+        return "\n".join(lines) + "\n"
+
+    for ckpt, output in results.items():
+        lines.append(f"Checkpoint: {ckpt}")
+        lines.append("-" * 80)
+
+        val_metrics = output.get("validation_loss")
+        if val_metrics:
+            lines.append(f"validation_loss: {_format_metric_value(val_metrics.get('loss'))}")
+            lines.append(f"validation_tokens: {val_metrics.get('tokens')}")
+            lines.append(f"validation_batches: {val_metrics.get('batches')}")
+
+        task_results = output.get("results", {})
+        for task_name, metrics in task_results.items():
+            lines.append(f"Task: {task_name}")
+            for metric_name, metric_value in sorted(metrics.items()):
+                if isinstance(metric_value, (int, float, str, bool)):
+                    lines.append(f"  {metric_name}: {_format_metric_value(metric_value)}")
+
+        skipped_tasks = output.get("skipped_tasks", {})
+        for task_name, reason in skipped_tasks.items():
+            lines.append(f"Skipped task: {task_name}")
+            lines.append(f"  reason: {reason}")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_results_file(results: dict, results_file: str):
+    os.makedirs(os.path.dirname(results_file) or ".", exist_ok=True)
+    with open(results_file, "w", encoding="utf-8") as f:
+        f.write(format_results_text(results))
+    print(f"Saved evaluation results to: {results_file}")
 
 
 if __name__ == "__main__":
@@ -506,6 +662,11 @@ if __name__ == "__main__":
         default=DEFAULT_CKPT_DIR,
         help=f"Directory to scan when --ckpts is omitted (default: {DEFAULT_CKPT_DIR})",
     )
+    parser.add_argument(
+        "--results-file",
+        default=DEFAULT_RESULTS_FILE,
+        help=f"Text file where evaluation results are saved (default: {DEFAULT_RESULTS_FILE})",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--validation-only",
@@ -517,7 +678,35 @@ if __name__ == "__main__":
         action="store_true",
         help="Only run downstream task evaluation; skip validation loss.",
     )
+    parser.add_argument(
+        "--torch_compile",
+        type=_str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Compile the eval model with torch.compile.",
+    )
+    parser.add_argument("--no-torch_compile", dest="torch_compile", action="store_false")
+    parser.add_argument(
+        "--torch_compile_max_autotune",
+        "--torch-max-autotune",
+        type=_str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Compile the eval model with torch.compile(mode='max-autotune').",
+    )
+    parser.add_argument(
+        "--no-torch_compile_max_autotune",
+        "--no-torch-max-autotune",
+        dest="torch_compile_max_autotune",
+        action="store_false",
+    )
     args = parser.parse_args()
+    if args.torch_compile_max_autotune:
+        args.torch_compile = True
+
+    distributed, rank, world_size, local_rank = setup_distributed()
 
     downstream_eval_tasks = [
         "mmlu",
@@ -533,14 +722,26 @@ if __name__ == "__main__":
 
     checkpoints = args.ckpts if args.ckpts is not None else discover_checkpoints(args.ckpt_dir)
     if not checkpoints:
+        if distributed:
+            dist.destroy_process_group()
         raise SystemExit(
             f"No checkpoints found in {args.ckpt_dir!r}. "
             f"Expected files matching {os.path.join(args.ckpt_dir, CHECKPOINT_PATTERN)!r}."
         )
 
-    evaluate_checkpoints(
+    results = evaluate_checkpoints(
         checkpoints,
         downstream_eval_tasks,
         include_validation=not args.tasks_only,
         include_tasks=not args.validation_only,
+        torch_compile=args.torch_compile,
+        torch_compile_max_autotune=args.torch_compile_max_autotune,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
     )
+    if rank == 0:
+        write_results_file(results, args.results_file)
+    if distributed:
+        dist.destroy_process_group()

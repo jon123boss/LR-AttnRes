@@ -6,7 +6,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader, Sampler
+from torch.utils.data.distributed import DistributedSampler
 
 
 @dataclass
@@ -22,6 +23,8 @@ class DataLoaderConfig:
     persistent_workers: bool = True
     prefetch_factor: int = 2
     dtype: np.dtype = np.uint32
+    rank: int = 0
+    world_size: int = 1
 
     def __post_init__(self):
         if self.batch_size < 1:
@@ -34,7 +37,30 @@ class DataLoaderConfig:
             raise ValueError("num_workers must be >= 0")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be >= 1")
+        if self.world_size < 1:
+            raise ValueError("world_size must be >= 1")
+        if self.rank < 0 or self.rank >= self.world_size:
+            raise ValueError("rank must satisfy 0 <= rank < world_size")
         self.dtype = np.dtype(self.dtype)
+
+    @property
+    def distributed(self) -> bool:
+        return self.world_size > 1
+
+
+class DistributedSequentialSampler(Sampler[int]):
+    def __init__(self, dataset: Dataset, rank: int, world_size: int):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        if len(self.dataset) <= self.rank:
+            return 0
+        return (len(self.dataset) - 1 - self.rank) // self.world_size + 1
 
 
 class DocumentPackingDataset(Dataset):
@@ -46,6 +72,7 @@ class DocumentPackingDataset(Dataset):
         use_doc_masking: bool,
         doc_separator_token: Optional[int],
         dtype=np.uint32,
+        verbose: bool = True,
     ):
         super().__init__()
 
@@ -59,6 +86,7 @@ class DocumentPackingDataset(Dataset):
         self.use_doc_masking = bool(use_doc_masking)
         self.doc_separator_token = doc_separator_token
         self.dtype = np.dtype(dtype)
+        self.verbose = bool(verbose)
 
         if doc_separator_token is not None and np.issubdtype(self.dtype, np.integer):
             dtype_info = np.iinfo(self.dtype)
@@ -111,13 +139,14 @@ class DocumentPackingDataset(Dataset):
 
         self._shard_seq_offsets_searchable = self.shard_seq_offsets[1:]
 
-        print(
-            f"Dataset split: {split} | "
-            f"shards: {len(self.shards)} | "
-            f"total_tokens: {self.total_tokens:,} | "
-            f"sequences: {self._num_sequences:,} | "
-            f"doc_masking: {use_doc_masking}"
-        )
+        if self.verbose:
+            print(
+                f"Dataset split: {split} | "
+                f"shards: {len(self.shards)} | "
+                f"total_tokens: {self.total_tokens:,} | "
+                f"sequences: {self._num_sequences:,} | "
+                f"doc_masking: {use_doc_masking}"
+            )
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -304,6 +333,7 @@ def create_dataloaders(config: DataLoaderConfig):
         use_doc_masking=config.use_doc_masking,
         doc_separator_token=config.doc_separator_token,
         dtype=config.dtype,
+        verbose=(config.rank == 0),
     )
 
     val_dataset = DocumentPackingDataset(
@@ -313,6 +343,7 @@ def create_dataloaders(config: DataLoaderConfig):
         use_doc_masking=config.use_doc_masking,
         doc_separator_token=config.doc_separator_token,
         dtype=config.dtype,
+        verbose=(config.rank == 0),
     )
 
     if config.use_doc_masking:
@@ -331,9 +362,27 @@ def create_dataloaders(config: DataLoaderConfig):
     if config.num_workers > 0:
         loader_kwargs["prefetch_factor"] = config.prefetch_factor
 
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=config.world_size,
+            rank=config.rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        if config.distributed
+        else None
+    )
+    val_sampler = (
+        DistributedSequentialSampler(val_dataset, config.rank, config.world_size)
+        if config.distributed
+        else None
+    )
+
     train_loader = TorchDataLoader(
         train_dataset,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         drop_last=True,
         **loader_kwargs,
     )
@@ -341,20 +390,24 @@ def create_dataloaders(config: DataLoaderConfig):
     val_loader = TorchDataLoader(
         val_dataset,
         shuffle=False,
+        sampler=val_sampler,
         drop_last=False,
         **loader_kwargs,
     )
 
-    iters_per_epoch = len(train_dataset) // (config.batch_size * config.grad_accum_steps)
+    train_samples_per_rank = len(train_sampler) if train_sampler is not None else len(train_dataset)
+    iters_per_epoch = train_samples_per_rank // (config.batch_size * config.grad_accum_steps)
 
-    print(
-        f"Dataloader: 1 epoch ≈ {iters_per_epoch} iterations | "
-        f"Train sequences={len(train_dataset):,} | "
-        f"Batch_size={config.batch_size} | "
-        f"Grad_accum_steps={config.grad_accum_steps} | "
-        f"Workers={config.num_workers} | "
-        f"Prefetch={config.prefetch_factor if config.num_workers > 0 else 'N/A'}"
-    )
+    if config.rank == 0:
+        print(
+            f"Dataloader: 1 epoch ≈ {iters_per_epoch} iterations | "
+            f"Train sequences={len(train_dataset):,} | "
+            f"Batch_size={config.batch_size} | "
+            f"Grad_accum_steps={config.grad_accum_steps} | "
+            f"World_size={config.world_size} | "
+            f"Workers={config.num_workers} | "
+            f"Prefetch={config.prefetch_factor if config.num_workers > 0 else 'N/A'}"
+        )
 
     return train_loader, val_loader
 
@@ -367,6 +420,7 @@ def create_validation_dataloader(config: DataLoaderConfig):
         use_doc_masking=config.use_doc_masking,
         doc_separator_token=config.doc_separator_token,
         dtype=config.dtype,
+        verbose=(config.rank == 0),
     )
 
     collate_fn = collate_with_doc_masking if config.use_doc_masking else collate_simple
@@ -381,24 +435,37 @@ def create_validation_dataloader(config: DataLoaderConfig):
     if config.num_workers > 0:
         loader_kwargs["prefetch_factor"] = config.prefetch_factor
 
+    val_sampler = (
+        DistributedSequentialSampler(val_dataset, config.rank, config.world_size)
+        if config.distributed
+        else None
+    )
+
     val_loader = TorchDataLoader(
         val_dataset,
         shuffle=False,
+        sampler=val_sampler,
         drop_last=False,
         **loader_kwargs,
     )
 
-    print(
-        f"Validation dataloader: sequences={len(val_dataset):,} | "
-        f"Batch_size={config.batch_size} | "
-        f"Workers={config.num_workers} | "
-        f"Prefetch={config.prefetch_factor if config.num_workers > 0 else 'N/A'}"
-    )
+    if config.rank == 0:
+        print(
+            f"Validation dataloader: sequences={len(val_dataset):,} | "
+            f"Batch_size={config.batch_size} | "
+            f"World_size={config.world_size} | "
+            f"Workers={config.num_workers} | "
+            f"Prefetch={config.prefetch_factor if config.num_workers > 0 else 'N/A'}"
+        )
 
     return val_loader
 
 
-def warmup_boundaries(dataset: DocumentPackingDataset, num_shards: Optional[int] = None):
+def warmup_boundaries(
+    dataset: DocumentPackingDataset,
+    num_shards: Optional[int] = None,
+    verbose: bool = True,
+):
     from concurrent.futures import ThreadPoolExecutor
     
     if not dataset.use_doc_masking:
@@ -408,7 +475,8 @@ def warmup_boundaries(dataset: DocumentPackingDataset, num_shards: Optional[int]
     n = len(dataset.shards) if num_shards is None else num_shards
     n = max(0, min(n, len(dataset.shards)))
     if n == 0:
-        print("Warmed up boundaries for 0 shards")
+        if verbose:
+            print("Warmed up boundaries for 0 shards")
         return
     
     def compute_boundary(shard_idx):
@@ -418,4 +486,5 @@ def warmup_boundaries(dataset: DocumentPackingDataset, num_shards: Optional[int]
     with ThreadPoolExecutor(max_workers=min(4, n)) as executor:
         list(executor.map(compute_boundary, range(n)))
     
-    print(f"Warmed up boundaries for {n} shards")
+    if verbose:
+        print(f"Warmed up boundaries for {n} shards")

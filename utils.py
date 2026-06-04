@@ -13,16 +13,32 @@ def get_config(module_globals=None):
     config = {k: module_globals[k] for k in config_keys} 
     return config
 
-def get_device():
+def get_device(local_rank=None, distributed=False):
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        if local_rank is None:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device("cuda", local_rank)
+    elif distributed:
+        device = torch.device("cpu")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
     return device
 
+
+def unwrap_model(model):
+    while True:
+        if hasattr(model, "module"):
+            model = model.module
+            continue
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+            continue
+        return model
+
 def get_model(config, device):
+    verbose = bool(config.get("master_process", True))
     start_step = 0
     checkpoint = None
     if config["init_from"] == 'resume':
@@ -35,7 +51,8 @@ def get_model(config, device):
                 return int(match.group(1)) if match else 0
             step_ckpts.sort(key=extract_step_number)
             ckpt_path = step_ckpts[-1] 
-        print(f"Resuming from {ckpt_path}")
+        if verbose:
+            print(f"Resuming from {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         ckpt_model_args = checkpoint["model_args"]
         model_config = ModelConfig(**ckpt_model_args)
@@ -43,12 +60,14 @@ def get_model(config, device):
         model_state_dict = checkpoint['model']
         prefix = '_orig_mod.'
         if any(k.startswith(prefix) for k in model_state_dict.keys()):
-            print(f"Detected compiled model checkpoint. Removing '{prefix}' prefix from state dict keys.")
+            if verbose:
+                print(f"Detected compiled model checkpoint. Removing '{prefix}' prefix from state dict keys.")
             model_state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in model_state_dict.items()}
         model.load_state_dict(model_state_dict, strict=True)
         start_step = checkpoint["step"]
     elif config["init_from"] == 'scratch':
-        print("Initializing new model from scratch")
+        if verbose:
+            print("Initializing new model from scratch")
         model_config = ModelConfig(
             n_layer=config["n_layer"],
             n_head=config["n_head"],
@@ -86,11 +105,6 @@ def get_model(config, device):
             lrid_query_from_value_shared = config.get("lrid_query_from_value_shared", False),
             lrid_use_logit_scale = config["lrid_use_logit_scale"],
             lrid_logit_scale = config["lrid_logit_scale"],
-            liger_rms_norm = config.get("liger_rms_norm", False),
-            liger_rope = config.get("liger_rope", False),
-            liger_swiglu = config.get("liger_swiglu", False),
-            liger_embedding = config.get("liger_embedding", False),
-            liger_attnres = config.get("liger_attnres", False),
             )
         model = OBPM(model_config)
     else:
@@ -113,6 +127,8 @@ def get_dataloader(config):
         pin_memory=config["pin_memory"],
         persistent_workers=config["persistent_workers"],
         dtype=np.dtype(config.get("data_dtype", "uint32")),
+        rank=int(config.get("rank", 0)),
+        world_size=int(config.get("world_size", 1)),
     )
     return create_dataloaders(dataloader_config)
 
@@ -129,13 +145,10 @@ def get_validation_dataloader(config):
         pin_memory=config["pin_memory"],
         persistent_workers=config["persistent_workers"],
         dtype=np.dtype(config.get("data_dtype", "uint32")),
+        rank=int(config.get("rank", 0)),
+        world_size=int(config.get("world_size", 1)),
     )
     return create_validation_dataloader(dataloader_config)
-
-
-def get_lm_head_for_loss(model):
-    target = getattr(model, "_orig_mod", model)
-    return target.get_lm_head_weight(), target.get_lm_head_bias()
 
 
 def compute_lm_loss(
@@ -147,26 +160,18 @@ def compute_lm_loss(
     max_seqlen=None,
     cast_logits_to_float=True,
 ):
-    if getattr(criterion, "uses_fused_linear", False):
-        hidden = model(
-            x,
-            cu_doc_len=cu_seqlens,
-            max_doc_len=max_seqlen,
-            return_hidden=True,
-        )
-        weight, bias = get_lm_head_for_loss(model)
-        fallback_logits_dtype = torch.float32 if cast_logits_to_float else None
-        return criterion(
-            hidden,
-            y,
-            lm_head_weight=weight,
-            lm_head_bias=bias,
-            fallback_logits_dtype=fallback_logits_dtype,
-        )
-
     logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
     logits_for_loss = logits.float() if cast_logits_to_float else logits
     return criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
+
+
+def loss_to_token_sum(loss, valid_tokens, reduction="mean"):
+    if loss.dim() == 0:
+        loss_value = float(loss.detach().item())
+        if reduction == "sum":
+            return loss_value
+        return loss_value * valid_tokens
+    return float(loss.detach().sum().item())
 
 
 @torch.no_grad()
@@ -178,6 +183,7 @@ def compute_validation_loss(
     vocab_size,
     use_doc_masking=True,
     desc="Validation loss",
+    distributed=False,
 ):
     from tqdm import tqdm
 
@@ -189,9 +195,15 @@ def compute_validation_loss(
     total_loss = 0.0
     total_tokens = 0
     total_batches = 0
+    disable_tqdm = False
+    if distributed:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            disable_tqdm = dist.get_rank() != 0
 
     try:
-        for batch in tqdm(val_loader, desc=desc, leave=False):
+        for batch in tqdm(val_loader, desc=desc, leave=False, disable=disable_tqdm):
             if use_doc_masking:
                 x, y, cu_seqlens, max_seqlen = batch
                 cu_seqlens = cu_seqlens.to(device)
@@ -220,20 +232,27 @@ def compute_validation_loss(
                 max_seqlen=max_seqlen,
             )
 
-            if loss.dim() == 0:
-                loss_value = float(loss.item())
-                if reduction == "sum":
-                    total_loss += loss_value
-                else:
-                    total_loss += loss_value * valid_tokens
-            else:
-                total_loss += float(loss.detach().sum().item())
+            total_loss += loss_to_token_sum(loss, valid_tokens, reduction)
 
             total_tokens += valid_tokens
             total_batches += 1
     finally:
         if was_training:
             model.train()
+
+    if distributed:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            stats = torch.tensor(
+                [total_loss, float(total_tokens), float(total_batches)],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            total_loss = float(stats[0].item())
+            total_tokens = int(stats[1].item())
+            total_batches = int(stats[2].item())
 
     if total_tokens == 0:
         raise RuntimeError("No validation tokens available while computing validation loss.")

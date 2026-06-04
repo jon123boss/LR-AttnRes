@@ -17,7 +17,6 @@ pip install datasets
 pip install lm_eval
 pip install hf_transfer
 pip install wandb  # Optional, for experiment tracking
-pip install liger-kernel  # Optional, for Liger kernel speed/memory ablations
 ```
 
 ## Data Preparation
@@ -42,6 +41,80 @@ After the shards are uploaded, download them for training:
 
 ```bash
 python prepdata.py --repo-id <your-hf-username>/Ultra-FineWeb-en-20B-gpt4
+```
+
+## Training
+
+Single-process training still works with:
+
+```bash
+python train.py
+```
+
+For DDP, launch with `torchrun`:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train.py
+```
+
+For 8-GPU DDP with PyTorch compile max-autotune:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train.py --torch-max-autotune
+```
+
+By default, DDP preserves the configured global batch size by dividing
+`grad_accum_steps` across ranks, so the default `8` accumulation steps becomes
+`1` local accumulation step on 8 GPUs. Use `--no-ddp_preserve_global_batch` if
+you want global batch size to scale with `WORLD_SIZE`.
+
+Enable PyTorch compile max-autotune with:
+
+```bash
+python train.py --torch-max-autotune
+```
+
+For a full automated run that prompts for Hugging Face sign-in/repo setup at
+startup, trains, saves the final checkpoint, uploads it to Hugging Face as
+`final_model.pt`, and then runs evaluation:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train.py \
+  --torch-max-autotune \
+  --full_run \
+  --full_run_hf_repo_id <your-hf-username>/<model-repo>
+```
+
+If `--full_run_hf_repo_id` is omitted, `full_run` prompts for it at startup.
+Evaluation results from the automatic eval are saved to
+`out/full_run_eval_step:<step>.txt`.
+
+## Evaluation
+
+`run_eval.py` can load checkpoints produced by DDP training because checkpoints
+save the unwrapped model state on rank 0. A normal eval run is single-process:
+
+```bash
+python run_eval.py --ckpts out/ckpt_step:1000.pt
+```
+
+Every `run_eval.py` invocation saves a text report by default:
+
+```bash
+python run_eval.py --ckpts out/ckpt_step:1000.pt --results-file out/eval_results.txt
+```
+
+For multi-GPU validation loss, launch with `torchrun`:
+
+```bash
+torchrun --standalone --nproc_per_node=8 run_eval.py --validation-only
+```
+
+Validation loss is sharded across ranks and reduced exactly. Downstream lm-eval
+tasks currently run on rank 0 only. Eval compile is opt-in:
+
+```bash
+python run_eval.py --ckpts out/ckpt_step:1000.pt --torch-max-autotune
 ```
 
 ## LR AttnRes
@@ -81,28 +154,3 @@ with `--attnres_block_average`.
 
 See [LR_ATTNRES.md](LR_ATTNRES.md) for the full design note, parameter cost,
 stability rationale, and experiment matrix.
-
-## Liger Kernel Toggles
-
-Liger kernels are optional and default off. Enable all implemented kernels with:
-
-```bash
-python train.py --use_liger_kernels
-```
-
-Each kernel can also be toggled independently:
-
-```bash
-python train.py \
-  --liger_rms_norm \
-  --liger_rope \
-  --liger_swiglu \
-  --liger_cross_entropy \
-  --liger_fused_linear_cross_entropy \
-  --liger_embedding \
-  --liger_attnres
-```
-
-Use `--no-liger_<name>` to subtract one from the master switch, for example
-`--use_liger_kernels --no-liger_rope`. `--liger_strict` raises instead of
-falling back when a requested Liger kernel is unavailable.
