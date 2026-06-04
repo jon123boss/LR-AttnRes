@@ -236,6 +236,11 @@ def _str_to_bool(value):
     raise argparse.ArgumentTypeError("expected a boolean value")
 
 
+def _looks_like_hf_token(value: str) -> bool:
+    value = (value or "").strip()
+    return value.startswith("hf_")
+
+
 def prepare_full_run_hf_repo(repo_id: str, private: bool) -> str:
     try:
         from huggingface_hub import HfApi, login
@@ -261,10 +266,18 @@ def prepare_full_run_hf_repo(repo_id: str, private: bool) -> str:
                 "full_run needs a Hugging Face repo id in non-interactive runs. "
                 "Pass --full_run_hf_repo_id username/repo or set HF_REPO_ID."
             )
-        prompt = "Hugging Face model repo id"
+        prompt = "Hugging Face model repo id (namespace/name, not a token)"
         if default_repo:
             prompt += f" [{default_repo}]"
         repo_id = input(f"{prompt}: ").strip() or default_repo
+
+    if _looks_like_hf_token(repo_id):
+        raise RuntimeError(
+            "That looks like a Hugging Face token, not a model repo id. "
+            "The token belongs in the earlier Hugging Face login prompt. "
+            "Use a repo id like `username/model-name`, and revoke any token "
+            "that was pasted into terminal logs or a repo name."
+        )
 
     if "/" not in repo_id:
         if not username:
@@ -553,11 +566,11 @@ if distributed:
         dist.broadcast(buffer.detach(), src=0)
 # -----------------------------------------------------------------------------
 
-torch_compile_mode = "max-autotune" if torch_compile_max_autotune else None
+torch_compile_mode = None
+if torch_compile_max_autotune:
+    torch_compile_mode = "max-autotune" if torch_compile_cudagraphs else "max-autotune-no-cudagraphs"
 if torch_compile:
-    torch_compile_options = {}
     if not torch_compile_cudagraphs:
-        torch_compile_options["triton.cudagraphs"] = False
         try:
             import torch._inductor.config as inductor_config
 
@@ -567,11 +580,10 @@ if torch_compile:
                 inductor_config.triton.cudagraph_trees = False
         except Exception as exc:
             print0(f"Could not disable torch.compile CUDA graphs through inductor config: {exc}")
-    model = torch.compile(
-        model,
-        mode=torch_compile_mode,
-        options=torch_compile_options or None,
-    )
+    compile_kwargs = {}
+    if torch_compile_mode is not None:
+        compile_kwargs["mode"] = torch_compile_mode
+    model = torch.compile(model, **compile_kwargs)
 
 if distributed:
     ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
@@ -865,8 +877,18 @@ while tokens_processed < max_tokens and step < max_steps:
     tokens_per_s = tokens_per_step / elapsed
     ms_per_step = elapsed * 1000.0
     peak_gpu_memory_gb = None
+    peak_gpu_memory_reserved_gb = None
     if device.type == "cuda":
         peak_gpu_memory_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        peak_gpu_memory_gb = reduce_float(
+            peak_gpu_memory_gb,
+            op=dist.ReduceOp.MAX if distributed else None,
+        )
+        peak_gpu_memory_reserved_gb = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        peak_gpu_memory_reserved_gb = reduce_float(
+            peak_gpu_memory_reserved_gb,
+            op=dist.ReduceOp.MAX if distributed else None,
+        )
 
     if wandb_log:
         logger.log_train(
@@ -874,10 +896,16 @@ while tokens_processed < max_tokens and step < max_steps:
             muon_scheduler.get_last_lr()[0],
             ms_per_step, tokens_per_s, tokens_processed,
             peak_gpu_memory_gb=peak_gpu_memory_gb,
+            peak_gpu_memory_reserved_gb=peak_gpu_memory_reserved_gb,
         )
 
     if step % log_interval == 0:
         norm_str = f"{norm:.2f}" if norm is not None else "N/A"
+        peak_memory_str = (
+            f"Peak VRAM: {peak_gpu_memory_gb:.2f}GB, "
+            if peak_gpu_memory_gb is not None
+            else ""
+        )
         print0(
             f"Step {step}, "
             f"Loss: {loss_accum:.4f}, "
@@ -885,6 +913,7 @@ while tokens_processed < max_tokens and step < max_steps:
             f"Tokens/s: {tokens_per_s:.2f}, "
             f"Tokens seen: {tokens_processed:,}, "
             f"Norm: {norm_str}, "
+            f"{peak_memory_str}"
             f"Muon LR: {muon_scheduler.get_last_lr()[0]:.6f}, "
             f"AdamW LR: {adamw_scheduler.get_last_lr()[0]:.6f}"
         )

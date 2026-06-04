@@ -78,6 +78,7 @@ class WandbLogger:
         tokens_per_s,
         tokens_processed,
         peak_gpu_memory_gb=None,
+        peak_gpu_memory_reserved_gb=None,
     ):
         if not self.active:
             return
@@ -92,6 +93,9 @@ class WandbLogger:
         }
         if peak_gpu_memory_gb is not None:
             log_dict["gpu/peak_memory_gb"] = float(peak_gpu_memory_gb)
+            log_dict["gpu/peak_allocated_gb"] = float(peak_gpu_memory_gb)
+        if peak_gpu_memory_reserved_gb is not None:
+            log_dict["gpu/peak_reserved_gb"] = float(peak_gpu_memory_reserved_gb)
         self.run.log(log_dict)
 
     def log_eval(self, step, train_loss, val_loss, lr, tokens_processed):
