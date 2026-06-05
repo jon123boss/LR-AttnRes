@@ -79,9 +79,9 @@ Enable PyTorch compile max-autotune with:
 python train.py --torch-max-autotune
 ```
 
-Max-autotune writes TorchInductor/Triton autotune caches. By default this repo
-stores them under `out/torchinductor_cache` instead of `/tmp`, which avoids
-small container tmpfs failures. To use a different large/persistent disk:
+Max-autotune writes TorchInductor/Triton autotune caches. By default this uses
+PyTorch/Triton's normal cache locations. To force a specific large/persistent
+disk:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py \
