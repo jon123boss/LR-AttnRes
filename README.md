@@ -126,7 +126,9 @@ torchrun --standalone --nproc_per_node=8 run_eval.py --validation-only
 ```
 
 Validation loss is sharded across ranks and reduced exactly. Downstream lm-eval
-tasks currently run on rank 0 only. Eval compile is opt-in:
+tasks run on rank 0 only; when both validation and downstream tasks are enabled,
+`run_eval.py` tears down the process group after validation before rank 0 starts
+the long task pass. Eval compile is opt-in:
 
 ```bash
 python run_eval.py --ckpts out/ckpt_step:1000.pt --torch-max-autotune

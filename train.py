@@ -816,7 +816,7 @@ if eval_only:
             lr=muon_scheduler.get_last_lr()[0],
         )
         logger.finish()
-    if distributed:
+    if distributed and dist.is_initialized():
         dist.destroy_process_group()
     raise SystemExit
 
@@ -970,12 +970,12 @@ if master_process and (full_run or (save_checkpoint and save_ckpt_at_end)):
     if wandb_log:
         logger.log_checkpoint(step, final_ckpt_path, config=config)
 
-if distributed:
+if distributed and dist.is_initialized():
     dist.barrier()
 
 if wandb_log: logger.finish()
 
-if distributed:
+if distributed and dist.is_initialized():
     dist.destroy_process_group()
 
 if master_process and full_run:

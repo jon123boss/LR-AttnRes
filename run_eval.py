@@ -573,6 +573,102 @@ def evaluate_checkpoints(
 
     results = {}
 
+    if distributed and include_tasks:
+        if include_validation:
+            print0(
+                master_process,
+                "Running distributed validation first; non-rank0 processes will exit before downstream tasks.",
+            )
+            for ckpt in checkpoints:
+                if not os.path.exists(ckpt):
+                    print0(master_process, f"Skipping missing checkpoint: {ckpt}")
+                    continue
+
+                print0(master_process, f"\nEvaluating validation for checkpoint: {ckpt}")
+                print0(master_process, "=" * 80)
+
+                lm_obj = OBPMWrapper(
+                    model_path=ckpt,
+                    device=device,
+                    batch_size=1,
+                    torch_compile=torch_compile,
+                    torch_compile_max_autotune=torch_compile_max_autotune,
+                    torch_compile_cache_dir=torch_compile_cache_dir,
+                    verbose=master_process,
+                )
+                val_metrics = run_validation_loss(
+                    lm_obj,
+                    distributed=True,
+                    rank=rank,
+                    world_size=world_size,
+                    master_process=master_process,
+                )
+                if master_process:
+                    results[ckpt] = {"validation_loss": val_metrics}
+                    print("\nResults:")
+                    print(f"  validation_loss: {val_metrics['loss']:.4f}")
+                    print("-" * 80)
+                del lm_obj
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+        if not master_process:
+            return results
+
+        print0(master_process, "Running downstream tasks on rank 0 with no active process group.")
+        print0(master_process, "-" * 80)
+        for ckpt in checkpoints:
+            if not os.path.exists(ckpt):
+                print0(master_process, f"Skipping missing checkpoint: {ckpt}")
+                continue
+
+            print0(master_process, f"\nEvaluating downstream tasks for checkpoint: {ckpt}")
+            print0(master_process, "=" * 80)
+
+            lm_obj = OBPMWrapper(
+                model_path=ckpt,
+                device=device,
+                batch_size=1,
+                torch_compile=torch_compile,
+                torch_compile_max_autotune=torch_compile_max_autotune,
+                torch_compile_cache_dir=torch_compile_cache_dir,
+                verbose=True,
+            )
+            eval_output = results.get(ckpt, {})
+            task_output = run_downstream_tasks(lm_obj, valid_tasks, device)
+            task_output.update(eval_output)
+            results[ckpt] = task_output
+
+            print("\nResults:")
+            if include_validation and "validation_loss" in eval_output:
+                val_metrics = eval_output["validation_loss"]
+                print(f"  validation_loss: {val_metrics['loss']:.4f}")
+            res_dict = task_output.get("results", {})
+            for task_name, metrics in res_dict.items():
+                print(f"  Task: {task_name}")
+                if "acc_norm,none" in metrics:
+                    print(f"    acc_norm: {metrics['acc_norm,none']:.4f}")
+                elif "acc_norm" in metrics:
+                    print(f"    acc_norm: {metrics['acc_norm']:.4f}")
+                if "acc,none" in metrics:
+                    print(f"    acc:      {metrics['acc,none']:.4f}")
+                elif "acc" in metrics:
+                    print(f"    acc:      {metrics['acc']:.4f}")
+            skipped_tasks = task_output.get("skipped_tasks", {})
+            for task_name, reason in skipped_tasks.items():
+                print(f"  Skipped task: {task_name}")
+                print(f"    reason: {reason}")
+
+            print("-" * 80)
+            del lm_obj
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return results
+
     for ckpt in checkpoints:
         if not os.path.exists(ckpt):
             print0(master_process, f"Skipping missing checkpoint: {ckpt}")
@@ -580,12 +676,6 @@ def evaluate_checkpoints(
 
         print0(master_process, f"\nEvaluating Checkpoint: {ckpt}")
         print0(master_process, "=" * 80)
-
-        needs_model = include_validation or (include_tasks and master_process) or not distributed
-        if not needs_model:
-            if distributed:
-                dist.barrier()
-            continue
 
         lm_obj = OBPMWrapper(
             model_path=ckpt,
@@ -638,8 +728,9 @@ def evaluate_checkpoints(
                 print(f"    reason: {reason}")
 
         print0(master_process, "-" * 80)
-        if distributed:
-            dist.barrier()
+        del lm_obj
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return results
 
@@ -768,7 +859,7 @@ if __name__ == "__main__":
 
     checkpoints = args.ckpts if args.ckpts is not None else discover_checkpoints(args.ckpt_dir)
     if not checkpoints:
-        if distributed:
+        if distributed and dist.is_initialized():
             dist.destroy_process_group()
         raise SystemExit(
             f"No checkpoints found in {args.ckpt_dir!r}. "
@@ -790,5 +881,5 @@ if __name__ == "__main__":
     )
     if rank == 0:
         write_results_file(results, args.results_file)
-    if distributed:
+    if distributed and dist.is_initialized():
         dist.destroy_process_group()
