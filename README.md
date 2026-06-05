@@ -104,6 +104,13 @@ If `--full_run_hf_repo_id` is omitted, `full_run` prompts for it at startup.
 Evaluation results from the automatic eval are saved to
 `out/full_run_eval_step:<step>.txt`.
 
+To resume after an interrupted run, leave `--ckpt_file_name` empty to pick the
+highest-numbered `ckpt_step:<step>.pt` in `out_dir`:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train.py --init_from resume --ckpt_file_name ""
+```
+
 ## Evaluation
 
 `run_eval.py` can load checkpoints produced by DDP training because checkpoints

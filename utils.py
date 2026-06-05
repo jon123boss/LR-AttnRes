@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from contextlib import nullcontext
 import os
 import tempfile
@@ -42,15 +43,27 @@ def get_model(config, device):
     start_step = 0
     checkpoint = None
     if config["init_from"] == 'resume':
-        ckpt_path = os.path.join(config["out_dir"], config["ckpt_file_name"])
-        if not os.path.exists(ckpt_path):
-            import glob, re
-            step_ckpts = glob.glob(os.path.join(config["out_dir"], 'ckpt_step:*.pt'))
-            def extract_step_number(path):
-                match = re.search(r'ckpt_step:(\d+)\.pt', path)
-                return int(match.group(1)) if match else 0
+        import glob
+        import re
+
+        def extract_step_number(path):
+            match = re.search(r'ckpt_step:(\d+)\.pt', os.path.basename(path))
+            return int(match.group(1)) if match else -1
+
+        def latest_checkpoint_path(out_dir):
+            step_ckpts = glob.glob(os.path.join(out_dir, 'ckpt_step:*.pt'))
+            if not step_ckpts:
+                raise FileNotFoundError(f"No ckpt_step:*.pt checkpoints found in {out_dir!r}")
             step_ckpts.sort(key=extract_step_number)
-            ckpt_path = step_ckpts[-1] 
+            return step_ckpts[-1]
+
+        ckpt_file_name = (config.get("ckpt_file_name") or "").strip()
+        if ckpt_file_name:
+            ckpt_path = ckpt_file_name if os.path.isabs(ckpt_file_name) else os.path.join(config["out_dir"], ckpt_file_name)
+            if not os.path.exists(ckpt_path):
+                raise FileNotFoundError(f"Requested checkpoint does not exist: {ckpt_path}")
+        else:
+            ckpt_path = latest_checkpoint_path(config["out_dir"])
         if verbose:
             print(f"Resuming from {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -151,6 +164,50 @@ def get_validation_dataloader(config):
     return create_validation_dataloader(dataloader_config)
 
 
+def get_lm_head_for_loss(model):
+    core_model = unwrap_model(model)
+    return core_model.get_lm_head_weight(), core_model.get_lm_head_bias()
+
+
+def _compute_chunked_lm_loss(
+    hidden,
+    y,
+    criterion,
+    lm_head_weight,
+    lm_head_bias=None,
+    cast_logits_to_float=True,
+):
+    labels = y.reshape(-1)
+    hidden = hidden.reshape(-1, hidden.size(-1))
+    chunk_size = int(getattr(criterion.config, "lm_head_chunk_size", 0))
+
+    if chunk_size <= 0 or chunk_size >= hidden.size(0):
+        logits = F.linear(hidden, lm_head_weight, lm_head_bias)
+        logits = logits.float() if cast_logits_to_float else logits
+        return criterion(logits, labels)
+
+    ignore_index = getattr(criterion.config, "ignore_index", -100)
+    reduction = getattr(criterion.config, "reduction", "mean")
+    if reduction not in {"mean", "sum"}:
+        logits = F.linear(hidden, lm_head_weight, lm_head_bias)
+        logits = logits.float() if cast_logits_to_float else logits
+        return criterion(logits, labels)
+
+    total_loss = hidden.new_zeros((), dtype=torch.float32)
+    total_tokens = hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, hidden.size(0), chunk_size):
+        end = min(start + chunk_size, hidden.size(0))
+        logits = F.linear(hidden[start:end], lm_head_weight, lm_head_bias)
+        logits = logits.float() if cast_logits_to_float else logits
+        chunk_labels = labels[start:end]
+        total_loss = total_loss + criterion.sum_loss(logits, chunk_labels)
+        total_tokens = total_tokens + (chunk_labels != ignore_index).sum().to(total_tokens.dtype)
+
+    if reduction == "sum":
+        return total_loss
+    return total_loss / total_tokens.clamp_min(1.0)
+
+
 def compute_lm_loss(
     model,
     criterion,
@@ -160,6 +217,24 @@ def compute_lm_loss(
     max_seqlen=None,
     cast_logits_to_float=True,
 ):
+    chunk_size = int(getattr(getattr(criterion, "config", None), "lm_head_chunk_size", 0))
+    if chunk_size > 0 and hasattr(unwrap_model(model), "get_lm_head_weight"):
+        hidden = model(
+            x,
+            cu_doc_len=cu_seqlens,
+            max_doc_len=max_seqlen,
+            return_hidden=True,
+        )
+        lm_head_weight, lm_head_bias = get_lm_head_for_loss(model)
+        return _compute_chunked_lm_loss(
+            hidden,
+            y,
+            criterion,
+            lm_head_weight,
+            lm_head_bias=lm_head_bias,
+            cast_logits_to_float=cast_logits_to_float,
+        )
+
     logits = model(x, cu_doc_len=cu_seqlens, max_doc_len=max_seqlen)
     logits_for_loss = logits.float() if cast_logits_to_float else logits
     return criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))

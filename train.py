@@ -228,6 +228,7 @@ reduction = "mean"
 z_loss = True
 z_loss_weight = 1e-5
 ce_inplace_backward = True
+lm_head_chunk_size = 1024
 # Scheduler
 warmup_steps = 2000
 warmdown_steps = int(0.2 * max_steps)
@@ -419,6 +420,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train OBPM.")
     parser.add_argument("--eval_only", type=_str_to_bool, nargs="?", const=True, default=eval_only)
     parser.add_argument("--no-eval_only", dest="eval_only", action="store_false")
+    parser.add_argument("--init_from", "--init-from", choices=("scratch", "resume"), default=init_from)
+    parser.add_argument("--ckpt_file_name", "--ckpt-file-name", type=str, default=ckpt_file_name)
     parser.add_argument("--wandb_log", type=_str_to_bool, nargs="?", const=True, default=wandb_log)
     parser.add_argument("--no-wandb_log", dest="wandb_log", action="store_false")
     parser.add_argument("--ddp_preserve_global_batch", type=_str_to_bool, nargs="?", const=True, default=ddp_preserve_global_batch)
@@ -507,11 +510,19 @@ def parse_args():
     parser.add_argument("--no-interactive_after_train", dest="interactive_after_train", action="store_false")
     parser.add_argument("--ce_inplace_backward", type=_str_to_bool, nargs="?", const=True, default=ce_inplace_backward)
     parser.add_argument("--no-ce_inplace_backward", dest="ce_inplace_backward", action="store_false")
+    parser.add_argument(
+        "--lm_head_chunk_size",
+        type=int,
+        default=lm_head_chunk_size,
+        help="Number of flattened tokens per LM-head loss chunk. Set 0 to materialize full logits.",
+    )
     return parser.parse_args()
 
 
 args = parse_args()
 eval_only = args.eval_only
+init_from = args.init_from
+ckpt_file_name = args.ckpt_file_name
 wandb_log = args.wandb_log
 ddp_preserve_global_batch = args.ddp_preserve_global_batch
 ddp_find_unused_parameters = args.ddp_find_unused_parameters
@@ -557,6 +568,15 @@ if use_lrid:
 lrid_logit_scale = args.lrid_logit_scale
 interactive_after_train = args.interactive_after_train
 ce_inplace_backward = args.ce_inplace_backward
+lm_head_chunk_size = args.lm_head_chunk_size
+if lm_head_chunk_size < 0:
+    raise ValueError("lm_head_chunk_size must be >= 0")
+if distributed and ddp_find_unused_parameters and lm_head_chunk_size > 0:
+    raise ValueError(
+        "lm_head_chunk_size > 0 computes the LM-head loss outside the DDP forward, "
+        "which is incompatible with ddp_find_unused_parameters=True. "
+        "Use --no-ddp_find_unused_parameters or set --lm_head_chunk_size 0."
+    )
 
 if full_run and eval_only:
     raise ValueError("full_run is for training runs; do not combine it with --eval_only.")

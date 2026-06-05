@@ -12,6 +12,7 @@ class CriterionConfig:
     z_loss: bool = False
     z_loss_weight: float = 1e-4
     inplace_backward: bool = True
+    lm_head_chunk_size: int = 1024
 
 
 class CrossEntropyLoss(nn.Module):
@@ -110,6 +111,41 @@ class CrossEntropyLoss(nn.Module):
 
         return self._standard_ce(logits, labels, mask)
 
+    def sum_loss(self, logits, labels):
+        if labels.dim() != 1:
+            labels = labels.reshape(-1)
+        if logits.dim() != 2:
+            logits = logits.reshape(-1, logits.size(-1))
+
+        mask = labels != self.config.ignore_index
+
+        if self.flash_attention:
+            loss, z_loss = self._flash_ce(
+                logits,
+                labels,
+                label_smoothing=0.0,
+                logit_scale=1.0,
+                lse_square_scale=self.config.z_loss_weight if self.config.z_loss else 0.0,
+                inplace_backward=self.config.inplace_backward,
+                process_group=None,
+                ignore_index=self.config.ignore_index,
+            )
+            loss = loss.sum()
+            if self.config.z_loss:
+                loss = loss + z_loss.sum()
+            return loss
+
+        loss = F.cross_entropy(
+            logits,
+            labels,
+            ignore_index=self.config.ignore_index,
+            reduction="sum",
+        )
+        if self.config.z_loss:
+            z_squared = logits.logsumexp(dim=-1).pow(2)
+            loss = loss + self.config.z_loss_weight * (z_squared * mask).sum()
+        return loss
+
 
 def get_criterion(config):
     return CrossEntropyLoss(
@@ -119,6 +155,7 @@ def get_criterion(config):
             z_loss=config["z_loss"],
             z_loss_weight=config["z_loss_weight"],
             inplace_backward=config.get("ce_inplace_backward", True),
+            lm_head_chunk_size=int(config.get("lm_head_chunk_size", 1024)),
         ),
         flash_attention=config["flash_attention"],
     )
