@@ -26,7 +26,8 @@ class WandbLogger:
 
         run_id_file = os.path.join(self.out_dir, "wandb_run_id.txt")
         run_id = None
-        if os.path.exists(run_id_file):
+        resume_wandb = self.config.get("init_from") == "resume"
+        if resume_wandb and os.path.exists(run_id_file):
             try:
                 run_id = open(run_id_file).read().strip()
             except Exception:
@@ -41,7 +42,7 @@ class WandbLogger:
             save_code=True,
             reinit="finish_previous",
         )
-        if run_id is None:
+        if not resume_wandb or run_id is None:
             try:
                 pathlib.Path(run_id_file).write_text(self.run.id)
             except Exception:
@@ -61,7 +62,7 @@ class WandbLogger:
         self.active = True
         if num_params is not None:
             num_params = int(num_params)
-            self.run.config.update({"num_params": num_params})
+            self.run.config.update({"num_params": num_params}, allow_val_change=resume_wandb)
             self.run.summary["num_params"] = num_params
             self.run.log({
                 "tokens_processed": 0,

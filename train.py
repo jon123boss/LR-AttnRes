@@ -256,6 +256,8 @@ def configure_torch_compile_cache(cache_dir: str) -> str:
     cache_dir = (cache_dir or "").strip()
     if not cache_dir:
         return ""
+    if world_size > 1:
+        cache_dir = os.path.join(cache_dir, f"rank{rank}")
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
     if _EXPLICIT_TRITON_CACHE_DIR is None:
         os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
