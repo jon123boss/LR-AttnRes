@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Plot validation-set FFN/attention output magnitudes for the n=8 Avg/no-Avg models.
+Plot validation-set effective AttnRes contribution magnitudes for the n=8 Avg/no-Avg models.
 
-The default indexing is:
+The default probe records ||alpha_i v_i||_2 for each source i at each residual
+read site, where alpha_i is the depth-attention weight and v_i is the source
+value. This directly measures how much each source contributes to the residual
+read.
+
+The legacy raw-write probe is still available with --measure write. Its indexing is:
     0 = input token embedding
     1 = layer 0 attention output
     2 = layer 0 FFN output
@@ -46,11 +51,12 @@ os.environ.setdefault("XDG_CACHE_HOME", _XDG_CACHE_DIR)
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.nn import functional as F
 from huggingface_hub import HfApi, hf_hub_download
 from tqdm import tqdm
 
 from dataloader import DataLoaderConfig, create_validation_dataloader, warmup_boundaries
-from model import OBPM, ModelConfig
+from model import OBPM, ModelConfig, norm
 from utils import get_device
 
 
@@ -71,6 +77,22 @@ DISPLAY_NAMES = {
 COLORS = {
     "avg": "#3CB44B",      # green
     "no_avg": "#2E86DE",   # blue
+}
+
+CONTRIBUTION_LINESTYLES = {
+    "completed": "-",
+    "partial": "--",
+    "embedding": ":",
+    "previous": "-.",
+    "all": "-",
+}
+
+CONTRIBUTION_DISPLAY_NAMES = {
+    "completed": "completed",
+    "partial": "partial",
+    "embedding": "embedding",
+    "previous": "previous",
+    "all": "all",
 }
 
 PREFERRED_CHECKPOINT_FILES = (
@@ -140,6 +162,7 @@ class MagnitudeProfile:
     variance: np.ndarray
     count: np.ndarray
     label: str
+    category: str = "all"
 
     @property
     def std(self) -> np.ndarray:
@@ -345,12 +368,13 @@ class MagnitudeRecorder:
         self.model = model
         self.measure = measure
         self.magnitude = magnitude
-        self.stats: dict[int, RunningMoments] = {}
+        self.stats: dict[str, dict[int, RunningMoments]] = {}
         self.originals: list[tuple[Any, str, Any]] = []
 
-    def update(self, depth_idx: int, tensor: torch.Tensor) -> None:
+    def update(self, depth_idx: int, tensor: torch.Tensor, category: str = "all") -> None:
         magnitudes = compute_magnitude(tensor, self.magnitude)
-        self.stats.setdefault(int(depth_idx), RunningMoments()).update_tensor(magnitudes)
+        category_stats = self.stats.setdefault(category, {})
+        category_stats.setdefault(int(depth_idx), RunningMoments()).update_tensor(magnitudes)
 
     def _wrap_instance_method(self, obj: Any, name: str, wrapped: Any) -> None:
         original = getattr(obj, name)
@@ -358,7 +382,9 @@ class MagnitudeRecorder:
         setattr(obj, name, wrapped(original))
 
     def install(self) -> None:
-        if self.measure == "read":
+        if self.measure == "contribution":
+            self._wrap_effective_contributions()
+        elif self.measure == "read":
             self._wrap_read_outputs()
         elif self.measure == "write":
             self._wrap_write_outputs()
@@ -422,18 +448,157 @@ class MagnitudeRecorder:
             self._wrap_instance_method(block.attn, "forward", wrap_attention)
             self._wrap_instance_method(block.mlp, "forward", wrap_mlp)
 
-    def profile(self, label: str) -> MagnitudeProfile:
+    def _source_categories(self, residual_idx: int, num_sources: int) -> list[str]:
+        if num_sources == 1:
+            return ["embedding"]
+
+        if self.model.attnres_type == "block":
+            block_ends = self.model.attnres_block_ends or frozenset()
+            partial_present = residual_idx > 0 and residual_idx not in block_ends
+            categories = []
+            for source_idx in range(num_sources):
+                if source_idx == 0:
+                    categories.append("embedding")
+                elif partial_present and source_idx == num_sources - 1:
+                    categories.append("partial")
+                else:
+                    categories.append("completed")
+            return categories
+
+        return ["embedding"] + ["previous"] * (num_sources - 1)
+
+    def _record_lrid_effective_contributions(
+        self,
+        residual_idx: int,
+        sources: list[Any],
+        query_override: Optional[torch.Tensor] = None,
+    ) -> None:
+        if len(sources) == 1:
+            self.update(residual_idx, sources[0][0], category="embedding")
+            self.update(residual_idx, sources[0][0], category="all")
+            return
+
+        values = torch.stack([source[0] for source in sources], dim=0)
+        keys = torch.stack([source[1] for source in sources], dim=0)
+        num_heads = self.model.config.lrid_num_heads
+        key_head_dim = self.model.config.lrid_rank // num_heads
+        value_head_dim = self.model.config.n_embd // num_heads
+
+        keys = keys.reshape(*keys.shape[:-1], num_heads, key_head_dim)
+        values_by_head = values.reshape(*values.shape[:-1], num_heads, value_head_dim)
+        if self.model.config.attnres_key_norm:
+            keys = norm(keys.float()).to(values_by_head.dtype)
+
+        query_idx = self.model._attnres_query_idx(residual_idx)
+        static_query = self.model.transformer.lrid_queries[query_idx]
+        if self.model.config.lrid_input_dependent_query:
+            dynamic_query = query_override if query_override is not None else sources[-1][2]
+            if dynamic_query is None:
+                raise RuntimeError("Input-dependent LR AttnRes query is missing for contribution recording")
+            dynamic_query = dynamic_query.reshape(*dynamic_query.shape[:-1], num_heads, key_head_dim)
+            gate = self.model.transformer.lrid_query_gates[query_idx].view(1, 1, num_heads, 1)
+            query = static_query.unsqueeze(0).unsqueeze(0) + gate * dynamic_query
+        else:
+            query = static_query
+
+        if self.model.config.attn_res_query_norm:
+            query = norm(query.float())
+        query = query.to(keys.dtype)
+
+        if self.model.config.lrid_input_dependent_query:
+            logits = torch.einsum("sbthr,bthr->sbth", keys, query) * self.model.config.lrid_logit_scale
+        else:
+            logits = torch.einsum("sbthr,hr->sbth", keys, query) * self.model.config.lrid_logit_scale
+        weights = F.softmax(logits.float(), dim=0).to(values_by_head.dtype)
+        contributions = (weights.unsqueeze(-1) * values_by_head).reshape_as(values)
+        self.update(residual_idx, contributions, category="all")
+
+        for source_idx, category in enumerate(self._source_categories(residual_idx, len(sources))):
+            self.update(residual_idx, contributions[source_idx], category=category)
+
+    def _record_attnres_effective_contributions(
+        self,
+        residual_idx: int,
+        sources: list[torch.Tensor],
+    ) -> None:
+        if len(sources) == 1:
+            self.update(residual_idx, sources[0], category="embedding")
+            self.update(residual_idx, sources[0], category="all")
+            return
+
+        values = torch.stack(sources, dim=0)
+        residual_module = self.model.transformer.attn_residuals[
+            self.model._attnres_query_idx(residual_idx)
+        ]
+        keys = norm(values) if residual_module.use_key_norm else values
+        logits = torch.einsum("d,sbtd->sbt", residual_module._query(keys.dtype), keys)
+        weights = F.softmax(logits.float(), dim=0).to(values.dtype)
+        contributions = weights.unsqueeze(-1) * values
+        self.update(residual_idx, contributions, category="all")
+
+        for source_idx, category in enumerate(self._source_categories(residual_idx, len(sources))):
+            self.update(residual_idx, contributions[source_idx], category=category)
+
+    def _wrap_effective_contributions(self) -> None:
+        if hasattr(self.model, "_apply_attnres"):
+            def wrap_attnres(original):
+                def wrapped(residual_idx, sources, *args, **kwargs):
+                    self._record_attnres_effective_contributions(int(residual_idx), sources)
+                    return original(residual_idx, sources, *args, **kwargs)
+                return wrapped
+
+            self._wrap_instance_method(self.model, "_apply_attnres", wrap_attnres)
+
+        if hasattr(self.model, "_apply_lrid_attnres"):
+            def wrap_lrid(original):
+                def wrapped(residual_idx, sources, *args, **kwargs):
+                    query_override = kwargs.get("query_override", args[0] if args else None)
+                    self._record_lrid_effective_contributions(
+                        int(residual_idx),
+                        sources,
+                        query_override=query_override,
+                    )
+                    return original(residual_idx, sources, *args, **kwargs)
+                return wrapped
+
+            self._wrap_instance_method(self.model, "_apply_lrid_attnres", wrap_lrid)
+
+    def profiles(
+        self,
+        label: str,
+        categories: Optional[list[str]] = None,
+    ) -> list[MagnitudeProfile]:
         if not self.stats:
             raise RuntimeError(
                 "No activations were recorded. Check that the model path is correct "
                 "and that --measure matches the architecture."
             )
 
-        depth = np.array(sorted(self.stats), dtype=np.int64)
-        mean = np.array([self.stats[int(i)].mean for i in depth], dtype=np.float64)
-        variance = np.array([self.stats[int(i)].variance for i in depth], dtype=np.float64)
-        count = np.array([self.stats[int(i)].count for i in depth], dtype=np.int64)
-        return MagnitudeProfile(depth=depth, mean=mean, variance=variance, count=count, label=label)
+        selected_categories = categories if categories is not None else sorted(self.stats)
+        profiles = []
+        for category in selected_categories:
+            category_stats = self.stats.get(category)
+            if not category_stats:
+                continue
+
+            depth = np.array(sorted(category_stats), dtype=np.int64)
+            mean = np.array([category_stats[int(i)].mean for i in depth], dtype=np.float64)
+            variance = np.array([category_stats[int(i)].variance for i in depth], dtype=np.float64)
+            count = np.array([category_stats[int(i)].count for i in depth], dtype=np.int64)
+            profiles.append(
+                MagnitudeProfile(
+                    depth=depth,
+                    mean=mean,
+                    variance=variance,
+                    count=count,
+                    label=label,
+                    category=category,
+                )
+            )
+
+        if not profiles:
+            raise RuntimeError(f"No activations were recorded for categories: {selected_categories}")
+        return profiles
 
 
 @torch.no_grad()
@@ -444,7 +609,7 @@ def collect_profile(
     args: argparse.Namespace,
     device: torch.device,
     label: str,
-) -> MagnitudeProfile:
+) -> list[MagnitudeProfile]:
     recorder = MagnitudeRecorder(
         loaded.model,
         measure=args.measure,
@@ -480,7 +645,8 @@ def collect_profile(
     finally:
         recorder.restore()
 
-    return recorder.profile(label)
+    categories = args.contribution_categories if args.measure == "contribution" else None
+    return recorder.profiles(label, categories=categories)
 
 
 # =============================================================================
@@ -570,6 +736,8 @@ def y_label_for_magnitude(mode: str) -> str:
 
 
 def x_label_for_measure(measure: str) -> str:
+    if measure == "contribution":
+        return "Residual Read Site"
     if measure == "read":
         return "Residual Depth Site"
     if measure == "write":
@@ -577,44 +745,68 @@ def x_label_for_measure(measure: str) -> str:
     return "Depth"
 
 
+def y_label_for_measure(measure: str, magnitude: str) -> str:
+    if measure == "contribution":
+        if magnitude == "l2":
+            return "Effective Contribution Magnitude (L2 Norm)"
+        if magnitude == "rms":
+            return "Effective Contribution Magnitude (RMS)"
+        if magnitude == "mean_abs":
+            return "Effective Contribution Magnitude (Mean Abs.)"
+        return "Effective Contribution Magnitude"
+    return y_label_for_magnitude(magnitude)
+
+
+def title_for_measure(measure: str, band: str) -> str:
+    title_suffix = "shaded +/- 1 std. dev." if band == "std" else "shaded +/- variance"
+    if measure == "contribution":
+        return f"Effective AttnRes Contribution Across Read Sites ({title_suffix})"
+    if measure == "write":
+        return f"Output Magnitude Across Layers ({title_suffix})"
+    return f"Residual Read Magnitude Across Depth ({title_suffix})"
+
+
 def plot_profiles(
-    profiles: dict[str, MagnitudeProfile],
+    profiles: dict[str, list[MagnitudeProfile]],
     args: argparse.Namespace,
 ) -> None:
     configure_matplotlib()
     fig, ax = plt.subplots(figsize=FIGSIZE, dpi=DPI)
 
     for key in ["no_avg", "avg"]:
-        profile = profiles[key]
-        color = COLORS[key]
-        label = DISPLAY_NAMES[key]
-        band = profile.std if args.band == "std" else profile.variance
-        lower = np.maximum(profile.mean - band, 0.0)
-        upper = profile.mean + band
+        for profile in profiles[key]:
+            color = COLORS[key]
+            linestyle = CONTRIBUTION_LINESTYLES.get(profile.category, "-")
+            category_label = CONTRIBUTION_DISPLAY_NAMES.get(profile.category, profile.category)
+            label = DISPLAY_NAMES[key] if profile.category == "all" else f"{DISPLAY_NAMES[key]} ({category_label})"
+            band = profile.std if args.band == "std" else profile.variance
+            lower = np.maximum(profile.mean - band, 0.0)
+            upper = profile.mean + band
 
-        ax.fill_between(
-            profile.depth,
-            lower,
-            upper,
-            color=color,
-            alpha=0.12,
-            linewidth=0,
-            zorder=1,
-        )
-        ax.plot(
-            profile.depth,
-            profile.mean,
-            color=color,
-            linewidth=2.45,
-            alpha=0.97,
-            label=label,
-            zorder=3,
-        )
+            ax.fill_between(
+                profile.depth,
+                lower,
+                upper,
+                color=color,
+                alpha=0.08 if profile.category != "all" else 0.12,
+                linewidth=0,
+                zorder=1,
+            )
+            ax.plot(
+                profile.depth,
+                profile.mean,
+                color=color,
+                linewidth=2.45 if profile.category in {"all", "completed"} else 2.05,
+                linestyle=linestyle,
+                alpha=0.97,
+                label=label,
+                zorder=3,
+            )
 
     style_axis(
         ax,
         x_label=x_label_for_measure(args.measure),
-        y_label=y_label_for_magnitude(args.magnitude),
+        y_label=y_label_for_measure(args.measure, args.magnitude),
         panel_label=args.panel_label,
     )
 
@@ -630,13 +822,7 @@ def plot_profiles(
     legend.get_frame().set_edgecolor("#cccccc")
     legend.get_frame().set_alpha(0.95)
 
-    title_suffix = "shaded +/- 1 std. dev." if args.band == "std" else "shaded +/- variance"
-    ax.set_title(
-        f"Output Magnitude Across Layers ({title_suffix})",
-        fontsize=12,
-        fontweight="bold",
-        pad=10,
-    )
+    ax.set_title(title_for_measure(args.measure, args.band), fontsize=12, fontweight="bold", pad=10)
 
     apply_limits(ax, args.x_min, args.x_max, args.y_min, args.y_max)
     fig.tight_layout()
@@ -653,25 +839,25 @@ def plot_profiles(
     print(f"Saved {png_path}")
 
 
-def save_profiles_csv(profiles: dict[str, MagnitudeProfile], args: argparse.Namespace) -> None:
+def save_profiles_csv(profiles: dict[str, list[MagnitudeProfile]], args: argparse.Namespace) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, f"{args.output_basename}.csv")
 
     keys = ["no_avg", "avg"]
-    rows = ["model_key,display_name,depth,mean,variance,std,count"]
+    rows = ["model_key,display_name,source_category,depth,mean,variance,std,count"]
     for key in keys:
-        profile = profiles[key]
-        for depth, mean, variance, std, count in zip(
-            profile.depth,
-            profile.mean,
-            profile.variance,
-            profile.std,
-            profile.count,
-        ):
-            rows.append(
-                f"{key},{DISPLAY_NAMES[key]},{int(depth)},"
-                f"{mean:.10g},{variance:.10g},{std:.10g},{int(count)}"
-            )
+        for profile in profiles[key]:
+            for depth, mean, variance, std, count in zip(
+                profile.depth,
+                profile.mean,
+                profile.variance,
+                profile.std,
+                profile.count,
+            ):
+                rows.append(
+                    f"{key},{DISPLAY_NAMES[key]},{profile.category},{int(depth)},"
+                    f"{mean:.10g},{variance:.10g},{std:.10g},{int(count)}"
+                )
 
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write("\n".join(rows) + "\n")
@@ -692,11 +878,24 @@ def parse_optional_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError("expected a boolean value")
 
 
+def parse_category_list(value: str) -> list[str]:
+    categories = [item.strip().lower() for item in value.split(",") if item.strip()]
+    allowed = {"completed", "partial", "embedding", "previous", "all"}
+    unknown = sorted(set(categories) - allowed)
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown contribution categories {unknown}; allowed: {sorted(allowed)}"
+        )
+    if not categories:
+        raise argparse.ArgumentTypeError("at least one contribution category is required")
+    return categories
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Download the Avg/no-Avg LR-AttnRes checkpoints from Hugging Face, "
-            "run them over the validation set, and plot FFN/attention output magnitudes."
+            "run them over the validation set, and plot effective AttnRes contribution magnitudes."
         )
     )
     parser.add_argument("--avg-repo", type=str, default=MODEL_REPOS["avg"])
@@ -726,9 +925,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", choices=("auto", "float32", "bfloat16", "float16"), default="auto")
-    parser.add_argument("--measure", choices=("read", "write"), default="write")
+    parser.add_argument("--measure", choices=("contribution", "read", "write"), default="contribution")
     parser.add_argument("--magnitude", choices=("l2", "rms", "mean_abs"), default="l2")
     parser.add_argument("--band", choices=("std", "variance"), default="std")
+    parser.add_argument(
+        "--contribution-categories",
+        type=parse_category_list,
+        default=parse_category_list("completed,partial"),
+        help=(
+            "Comma-separated source categories to plot for --measure contribution. "
+            "Use completed,partial by default; other options are embedding,previous,all."
+        ),
+    )
 
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--output-basename", type=str, default=OUTPUT_BASENAME)
@@ -796,7 +1004,7 @@ def main() -> None:
         ),
     }
 
-    profiles: dict[str, MagnitudeProfile] = {}
+    profiles: dict[str, list[MagnitudeProfile]] = {}
     val_loader = None
     use_doc_masking = None
 
