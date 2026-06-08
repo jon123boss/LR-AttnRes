@@ -49,6 +49,7 @@ class QueryAnalysis:
     repo_id: str
     model_dir: Path
     checkpoint_path: Path
+    query_kind: str
     config: dict
     raw_queries: object
     effective_queries: object
@@ -125,6 +126,26 @@ def extract_indexed_tensors(state_dict, base_name):
     return torch.stack([tensors[idx] for idx in range(max_idx + 1)], dim=0).numpy()
 
 
+def extract_module_parameter_tensors(state_dict, module_name, parameter_name):
+    pattern = re.compile(
+        rf"^{re.escape(module_name)}\.(\d+)\.{re.escape(parameter_name)}$"
+    )
+    tensors = {}
+    for key, value in state_dict.items():
+        match = pattern.match(clean_state_key(key))
+        if match is None:
+            continue
+        tensors[int(match.group(1))] = value.detach().cpu().float()
+    if not tensors:
+        return None
+
+    max_idx = max(tensors)
+    missing = [idx for idx in range(max_idx + 1) if idx not in tensors]
+    if missing:
+        raise ValueError(f"Missing {module_name} entries: {missing}")
+    return torch.stack([tensors[idx] for idx in range(max_idx + 1)], dim=0).numpy()
+
+
 def rms_norm_last_dim(array):
     eps = np.finfo(np.float32).eps
     return array / np.sqrt(np.mean(array * array, axis=-1, keepdims=True) + eps)
@@ -163,14 +184,25 @@ def load_query_analysis(repo_id, local_root):
 
     for candidate in checkpoint_candidates(model_dir):
         checkpoint, state_dict = load_checkpoint_or_state_dict(candidate)
+        query_kind = "lrid"
         queries = extract_indexed_tensors(state_dict, "transformer.lrid_queries")
         gates = extract_indexed_tensors(state_dict, "transformer.lrid_query_gates")
+        if queries is None:
+            query_kind = "attnres"
+            queries = extract_module_parameter_tensors(
+                state_dict,
+                "transformer.attn_residuals",
+                "query",
+            )
+            gates = None
         if queries is None:
             del checkpoint, state_dict
             gc.collect()
             continue
 
         config = merged_config(checkpoint, config_json)
+        if query_kind == "attnres" and queries.ndim == 2:
+            queries = queries[:, None, :]
         effective = rms_norm_last_dim(queries) if config.get("attn_res_query_norm", False) else queries.copy()
         flat_effective = effective.reshape(effective.shape[0], -1)
 
@@ -180,6 +212,7 @@ def load_query_analysis(repo_id, local_root):
             repo_id=repo_id,
             model_dir=model_dir,
             checkpoint_path=candidate,
+            query_kind=query_kind,
             config=config,
             raw_queries=queries,
             effective_queries=effective,
@@ -187,7 +220,10 @@ def load_query_analysis(repo_id, local_root):
             gates=gates,
         )
 
-    raise FileNotFoundError(f"No checkpoint with transformer.lrid_queries.* found in {model_dir}")
+    raise FileNotFoundError(
+        "No checkpoint with either transformer.lrid_queries.* or "
+        f"transformer.attn_residuals.*.query found in {model_dir}"
+    )
 
 
 def layer_site_labels(num_sites):
@@ -253,6 +289,7 @@ def summarize_analysis(analysis, rel_thresholds):
     print(f"checkpoint: {analysis.checkpoint_path}")
     print(
         "config: "
+        f"query_kind={analysis.query_kind} | "
         f"attnres_type={analysis.config.get('attnres_type', 'unknown')} | "
         f"n_layer={analysis.config.get('n_layer', num_sites // 2)} | "
         f"sites={num_sites} | "
@@ -356,7 +393,7 @@ def plot_heatmaps(analyses, output_path, clip_percentile, absolute, show):
         short_name = analysis.repo_id.split("/")[-1]
         heads = analysis.effective_queries.shape[1]
         head_dim = analysis.effective_queries.shape[2]
-        axis.set_title(f"{short_name}\neffective static query")
+        axis.set_title(f"{short_name}\n{analysis.query_kind} effective static query")
         axis.set_xlabel("query dimension")
         axis.set_ylabel("residual site")
 
