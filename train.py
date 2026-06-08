@@ -178,14 +178,19 @@ init_std = 0.02
 init_cutoff_factor = None
 # Attention Residuals
 use_attnres = False
+use_fused_attnres = False
 attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
 attnres_block_average = False
 attnres_key_norm = True
 attn_res_query_norm = False
 attn_res_query_init = "zero" # zero, normal, trunc_normal
+attnres_training_cache_phase1 = True
+attnres_training_torch_phase2 = True
+attnres_fuse_read_norm = True
 use_lrid = False
 lrid_rank = 32
+lrid_projection_rank = None
 lrid_num_heads = 1
 lrid_input_dependent_query = False
 lrid_static_embedding_key = False
@@ -471,6 +476,8 @@ def parse_args():
     parser.add_argument("--no-use_doc_masking", dest="use_doc_masking", action="store_false")
     parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
+    parser.add_argument("--use_fused_attnres", type=_str_to_bool, nargs="?", const=True, default=use_fused_attnres)
+    parser.add_argument("--no-use_fused_attnres", dest="use_fused_attnres", action="store_false")
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=attnres_block_average)
@@ -480,9 +487,16 @@ def parse_args():
     parser.add_argument("--attn_res_query_norm", type=_str_to_bool, nargs="?", const=True, default=attn_res_query_norm)
     parser.add_argument("--no-attn_res_query_norm", dest="attn_res_query_norm", action="store_false")
     parser.add_argument("--attn_res_query_init", choices=("zero", "normal", "trunc_normal"), default=attn_res_query_init)
+    parser.add_argument("--attnres_training_cache_phase1", type=_str_to_bool, nargs="?", const=True, default=attnres_training_cache_phase1)
+    parser.add_argument("--no-attnres_training_cache_phase1", dest="attnres_training_cache_phase1", action="store_false")
+    parser.add_argument("--attnres_training_torch_phase2", type=_str_to_bool, nargs="?", const=True, default=attnres_training_torch_phase2)
+    parser.add_argument("--no-attnres_training_torch_phase2", dest="attnres_training_torch_phase2", action="store_false")
+    parser.add_argument("--attnres_fuse_read_norm", type=_str_to_bool, nargs="?", const=True, default=attnres_fuse_read_norm)
+    parser.add_argument("--no-attnres_fuse_read_norm", dest="attnres_fuse_read_norm", action="store_false")
     parser.add_argument("--use_lrid", type=_str_to_bool, nargs="?", const=True, default=use_lrid)
     parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
     parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
+    parser.add_argument("--lrid_projection_rank", type=int, default=lrid_projection_rank)
     parser.add_argument("--lrid_num_heads", type=int, default=lrid_num_heads)
     parser.add_argument("--lrid_input_dependent_query", type=_str_to_bool, nargs="?", const=True, default=lrid_input_dependent_query)
     parser.add_argument("--no-lrid_input_dependent_query", dest="lrid_input_dependent_query", action="store_false")
@@ -539,14 +553,19 @@ full_run_eval_mode = args.full_run_eval_mode
 full_run_eval_torch_max_autotune = args.full_run_eval_torch_max_autotune
 use_doc_masking = args.use_doc_masking
 use_attnres = args.use_attnres
+use_fused_attnres = args.use_fused_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
 attnres_key_norm = args.attnres_key_norm
 attn_res_query_norm = args.attn_res_query_norm
 attn_res_query_init = args.attn_res_query_init
+attnres_training_cache_phase1 = args.attnres_training_cache_phase1
+attnres_training_torch_phase2 = args.attnres_training_torch_phase2
+attnres_fuse_read_norm = args.attnres_fuse_read_norm
 use_lrid = args.use_lrid
 lrid_rank = args.lrid_rank
+lrid_projection_rank = args.lrid_projection_rank
 lrid_num_heads = args.lrid_num_heads
 lrid_input_dependent_query = args.lrid_input_dependent_query
 lrid_static_embedding_key = args.lrid_static_embedding_key
