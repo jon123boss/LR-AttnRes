@@ -147,6 +147,46 @@ def direct_lrid_check(device: torch.device, dtype: torch.dtype, force_triton: bo
     assert_close("lrid grad query", query_fused.grad, query_ref.grad, atol, rtol)
 
 
+def direct_lrid_output_tail_check(
+    device: torch.device,
+    dtype: torch.dtype,
+    force_triton: bool,
+    atol: float,
+    rtol: float,
+) -> None:
+    torch.manual_seed(25)
+    num_heads = 2
+    rank = 32
+    n_embd = 128
+    values_ref = [torch.randn(2, 6, n_embd, device=device, dtype=dtype, requires_grad=True) for _ in range(6)]
+    values_fused = clone_leaf_list(values_ref)
+    query_ref = torch.randn(num_heads, rank // num_heads, device=device, dtype=dtype, requires_grad=True)
+    query_fused = query_ref.detach().clone().requires_grad_(True)
+    keys_ref = [value[..., -rank:].contiguous() for value in values_ref]
+    keys_fused = [value[..., -rank:].contiguous() for value in values_fused]
+
+    expected = lrid_attention_residual_read_torch(values_ref, keys_ref, query_ref, num_heads, 0.25, True)
+    actual = lrid_attention_residual_read(
+        values_fused,
+        keys_fused,
+        query_fused,
+        num_heads,
+        0.25,
+        True,
+        force_triton=force_triton,
+    )
+    upstream = torch.randn_like(expected)
+    expected.backward(upstream)
+    actual.backward(upstream)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    assert_close("lrid output-tail forward", actual, expected, atol, rtol)
+    for idx, (actual_value, expected_value) in enumerate(zip(values_fused, values_ref)):
+        assert_close(f"lrid output-tail grad value[{idx}]", actual_value.grad, expected_value.grad, atol, rtol)
+    assert_close("lrid output-tail grad query", query_fused.grad, query_ref.grad, atol, rtol)
+
+
 def common_model_kwargs(use_lrid: bool, attnres_type: str) -> dict:
     return dict(
         n_layer=3,
@@ -175,11 +215,19 @@ def model_parity_check(
     dtype: torch.dtype,
     use_lrid: bool,
     attnres_type: str,
+    lrid_key_from_output_tail: bool,
     atol: float,
     rtol: float,
 ) -> None:
-    torch.manual_seed(30 + int(use_lrid) + (0 if attnres_type == "block" else 10))
+    torch.manual_seed(
+        30
+        + int(use_lrid)
+        + (0 if attnres_type == "block" else 10)
+        + (100 if lrid_key_from_output_tail else 0)
+    )
     kwargs = common_model_kwargs(use_lrid, attnres_type)
+    if use_lrid:
+        kwargs["lrid_key_from_output_tail"] = lrid_key_from_output_tail
     ref = OBPM(ModelConfig(**kwargs, use_fused_attnres=False)).to(device=device, dtype=dtype).train()
     fused = OBPM(ModelConfig(**kwargs, use_fused_attnres=True)).to(device=device, dtype=dtype).train()
     fused.load_state_dict(ref.state_dict(), strict=True)
@@ -194,7 +242,7 @@ def model_parity_check(
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-    prefix = f"model use_lrid={use_lrid} type={attnres_type}"
+    prefix = f"model use_lrid={use_lrid} tail_key={lrid_key_from_output_tail} type={attnres_type}"
     assert_close(f"{prefix} forward", actual, expected, atol, rtol)
     assert_close(f"{prefix} embedding grad", fused.transformer.wte.weight.grad, ref.transformer.wte.weight.grad, atol, rtol)
 
@@ -221,6 +269,7 @@ def compatibility_check(device: torch.device) -> None:
     for name, old_args in [("base", old_base_args), ("lrid", old_lrid_args)]:
         cfg = ModelConfig(**old_args)
         assert cfg.use_fused_attnres is False
+        assert cfg.lrid_key_from_output_tail is False
         if cfg.use_lrid:
             assert cfg.lrid_projection_rank == cfg.lrid_rank
 
@@ -237,12 +286,26 @@ def compatibility_check(device: torch.device) -> None:
         old_checkpoint_model_args = dict(old_args)
         cfg_from_old_checkpoint = ModelConfig(**old_checkpoint_model_args)
         assert "use_fused_attnres" not in old_checkpoint_model_args
+        assert "lrid_key_from_output_tail" not in old_checkpoint_model_args
         assert cfg_from_old_checkpoint.use_fused_attnres is False
+        assert cfg_from_old_checkpoint.lrid_key_from_output_tail is False
 
         roundtrip_args = asdict(cfg_from_old_checkpoint)
         cfg_from_new_checkpoint = ModelConfig(**roundtrip_args)
         assert cfg_from_new_checkpoint.use_fused_attnres is False
+        assert cfg_from_new_checkpoint.lrid_key_from_output_tail is False
         print(f"PASS compat old {name} model_args defaults")
+
+    tail_cfg = ModelConfig(**old_lrid_args, lrid_key_from_output_tail=True)
+    tail_model = OBPM(tail_cfg).to(device)
+    attn_proj = tail_model.transformer.layers[0].attn.c_proj
+    mlp_proj = tail_model.transformer.layers[0].mlp.fc2
+    assert attn_proj.proj.out_features == tail_cfg.n_embd
+    assert mlp_proj.proj.out_features == tail_cfg.n_embd
+    idx = torch.randint(0, tail_cfg.vocab_size, (1, tail_cfg.block_size), device=device)
+    with torch.no_grad():
+        tail_model(idx, return_hidden=True)
+    print("PASS compat lrid_key_from_output_tail has no learned key-projection rows")
 
 
 def main() -> None:
@@ -265,11 +328,22 @@ def main() -> None:
     if args.mode in {"all", "direct"}:
         direct_base_check(device, dtype, force_triton, atol, rtol)
         direct_lrid_check(device, dtype, force_triton, atol, rtol)
+        direct_lrid_output_tail_check(device, dtype, force_triton, atol, rtol)
 
     if args.mode in {"all", "model"}:
         for use_lrid in [False, True]:
             for attnres_type in ["block", "full"]:
-                model_parity_check(device, dtype, use_lrid, attnres_type, atol, rtol)
+                tail_key_options = [False, True] if use_lrid else [False]
+                for lrid_key_from_output_tail in tail_key_options:
+                    model_parity_check(
+                        device,
+                        dtype,
+                        use_lrid,
+                        attnres_type,
+                        lrid_key_from_output_tail,
+                        atol,
+                        rtol,
+                    )
 
     if args.mode in {"all", "compat"}:
         compatibility_check(device)

@@ -79,12 +79,19 @@ LRID-specific:
 --use_lrid true
 --lrid_rank 32
 --lrid_projection_rank 64   # optional physical padding; logical rank stays 32
+--lrid_key_from_output_tail true  # optional: use value[..., -r:] as the LRID key
 --lrid_num_heads 1
 ```
 
 `lrid_projection_rank=64` can improve GEMM shape efficiency for logical
 `lrid_rank=32`, but it does not change the logical key rank used by the residual
 read.
+
+`lrid_key_from_output_tail=True` is an alternative LRID key-source mode. Instead
+of learning extra rank-`r` key rows in the attention/MLP output projections, the
+model uses the last `r` dimensions of each residual value as the key. The
+residual read is still the LRID read, so the fused LRID kernels consume the
+ordinary full-width values and the sliced rank-`r` tail keys.
 
 ## Recommended Commands
 
@@ -128,6 +135,18 @@ Train LRID/LR-AttnRes with the fused path enabled:
 python train.py \
   --use_lrid true \
   --use_fused_attnres true \
+  --attnres_type block \
+  --attnres_num_blocks 8 \
+  --lrid_rank 32
+```
+
+Train LRID/LR-AttnRes with output-tail keys:
+
+```bash
+python train.py \
+  --use_lrid true \
+  --use_fused_attnres true \
+  --lrid_key_from_output_tail true \
   --attnres_type block \
   --attnres_num_blocks 8 \
   --lrid_rank 32
@@ -187,10 +206,14 @@ fields still instantiate because `ModelConfig` supplies defaults for:
 - `attnres_training_torch_phase2=True`
 - `attnres_fuse_read_norm=True`
 - `lrid_projection_rank=lrid_rank`
+- `lrid_key_from_output_tail=False`
 
 Old LRID checkpoints remain shape-compatible because `lrid_projection_rank`
 defaults to the logical `lrid_rank`; extra projection rows only exist when a new
 run explicitly sets `--lrid_projection_rank` greater than `--lrid_rank`.
+Output-tail key mode is opt-in, so existing checkpoints keep using the learned
+LRID key projection unless `--lrid_key_from_output_tail true` is set for a new
+run.
 
 ## Correctness
 

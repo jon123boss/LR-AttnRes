@@ -86,6 +86,7 @@ class ModelConfig:
     lrid_add_static_source_key: bool = False
     lrid_key_from_value: bool = False
     lrid_key_from_value_shared: bool = False
+    lrid_key_from_output_tail: bool = False
     lrid_key_value_norm: bool = True
     lrid_query_from_value: bool = False
     lrid_query_from_value_shared: bool = False
@@ -102,10 +103,19 @@ class ModelConfig:
             raise ValueError("lrid_static_embedding_key and lrid_add_static_embedding_key are mutually exclusive")
         if self.lrid_key_from_value_shared:
             self.lrid_key_from_value = True
+        if self.lrid_key_from_output_tail:
+            if self.lrid_key_from_value:
+                raise ValueError("lrid_key_from_output_tail and lrid_key_from_value are mutually exclusive")
+            if self.lrid_static_embedding_key or self.lrid_add_static_embedding_key or self.lrid_add_static_source_key:
+                raise ValueError(
+                    "lrid_key_from_output_tail cannot be combined with static LRID key additions"
+                )
         if self.lrid_query_from_value_shared:
             self.lrid_query_from_value = True
         if self.lrid_rank < 1:
             raise ValueError("lrid_rank must be >= 1")
+        if self.lrid_key_from_output_tail and self.lrid_rank > self.n_embd:
+            raise ValueError("lrid_rank must be <= n_embd when lrid_key_from_output_tail=True")
         if self.lrid_projection_rank is None:
             self.lrid_projection_rank = self.lrid_rank
         if self.lrid_projection_rank < self.lrid_rank:
@@ -174,10 +184,11 @@ class LRIDFusedProjection(nn.Module):
         self.rank = config.lrid_rank
         self.projection_rank = config.lrid_projection_rank
         self.use_query = config.lrid_input_dependent_query
+        self.use_output_tail_key = config.lrid_key_from_output_tail
         self.use_value_key = config.lrid_key_from_value
         self.use_shared_value_key = config.lrid_key_from_value_shared
         self.use_local_value_key = self.use_value_key and not self.use_shared_value_key
-        self.use_key = not self.use_value_key
+        self.use_key = not (self.use_value_key or self.use_output_tail_key)
         self.use_value_query = self.use_query and config.lrid_query_from_value
         self.use_shared_value_query = self.use_query and config.lrid_query_from_value_shared
         self.use_local_value_query = self.use_value_query and not self.use_shared_value_query
@@ -228,6 +239,8 @@ class LRIDFusedProjection(nn.Module):
             key = projected[..., self.key_offset:self.key_offset + self.rank]
             if self.use_key_norm:
                 key = _norm_lrid_key(key, self.num_heads)
+        elif self.use_output_tail_key:
+            key = output[..., -self.rank:].contiguous()
         elif self.use_local_value_key:
             key = self.project_key_from_value(output)
         if self.use_fused_query:
@@ -245,12 +258,13 @@ class LRIDSourceKeyProjection(nn.Module):
         self.config = config
         self.rank = config.lrid_rank
         self.num_heads = config.lrid_num_heads
+        self.use_output_tail_key = config.lrid_key_from_output_tail
         uses_value_projection = (
             config.lrid_key_from_value
             or (config.lrid_input_dependent_query and config.lrid_query_from_value_shared)
         )
         self.use_value_norm = uses_value_projection and config.lrid_key_value_norm
-        self.proj = nn.Linear(config.n_embd, config.lrid_rank, bias=False)
+        self.proj = None if self.use_output_tail_key else nn.Linear(config.n_embd, config.lrid_rank, bias=False)
         if config.lrid_input_dependent_query and config.lrid_query_from_value_shared:
             self.query_proj = nn.Linear(config.n_embd, config.lrid_rank, bias=False)
         else:
@@ -263,6 +277,8 @@ class LRIDSourceKeyProjection(nn.Module):
         return x
 
     def forward(self, x):
+        if self.use_output_tail_key:
+            return x[..., -self.rank:].contiguous()
         if self.config.lrid_key_from_value:
             x = self._prepare_value_projection_input(x)
         key = self.proj(x)
@@ -591,7 +607,7 @@ class OBPM(nn.Module):
                 raise ValueError("attnres_num_blocks must be >= 1 when using block AttnRes")
             if self.use_lrid:
                 needs_lrid_source_projection = (
-                    not config.lrid_static_embedding_key
+                    (not config.lrid_static_embedding_key and not config.lrid_key_from_output_tail)
                     or config.lrid_key_from_value_shared
                     or (config.lrid_input_dependent_query and config.lrid_query_from_value_shared)
                 )
@@ -665,7 +681,7 @@ class OBPM(nn.Module):
     def _lrid_block_source(self, value, key=None, query=None, count=1):
         if self.config.attnres_block_average:
             value = value / count
-            if not self.config.lrid_key_from_value and not self.config.attnres_key_norm:
+            if key is not None and not self.config.lrid_key_from_value and not self.config.attnres_key_norm:
                 key = key / count
         key_value = value if self.config.lrid_key_from_value_shared else None
         query_value = value if self.config.lrid_query_from_value_shared else None
@@ -1154,6 +1170,8 @@ class OBPM(nn.Module):
         )
 
     def _project_lrid_source_key(self, value):
+        if self.config.lrid_key_from_output_tail:
+            return self._lrid_output_tail_key(value)
         return self.transformer.lrid_embedding_key(value)
 
     def _project_lrid_source_query(self, value):
@@ -1172,9 +1190,14 @@ class OBPM(nn.Module):
             key = key + self.transformer.lrid_static_source_key(key)
         return key
 
+    def _lrid_output_tail_key(self, value):
+        return value[..., -self.config.lrid_rank:].contiguous()
+
     def _lrid_source(self, value, key=None, query=None, key_value=None, query_value=None, add_static_key=False):
         if key is None:
-            if self.config.lrid_key_from_value_shared:
+            if self.config.lrid_key_from_output_tail:
+                key = self._lrid_output_tail_key(value)
+            elif self.config.lrid_key_from_value_shared:
                 key = self._project_lrid_source_key(value if key_value is None else key_value)
             else:
                 raise RuntimeError("LR AttnRes source key is missing")
@@ -1187,7 +1210,9 @@ class OBPM(nn.Module):
         return value, key
 
     def _embedding_lrid_source(self, embedding):
-        if self.config.lrid_static_embedding_key:
+        if self.config.lrid_key_from_output_tail:
+            key = self._lrid_output_tail_key(embedding)
+        elif self.config.lrid_static_embedding_key:
             key = self._static_lrid_embedding_key(embedding)
         else:
             key = self._project_lrid_source_key(embedding)

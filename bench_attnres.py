@@ -36,6 +36,8 @@ def parse_args():
     parser.add_argument("--lrid_ranks", type=str, default="32,64")
     parser.add_argument("--lrid_projection_rank", type=int, default=None)
     parser.add_argument("--lrid_num_heads", type=int, default=1)
+    parser.add_argument("--lrid_key_from_output_tail", type=_str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--no-lrid_key_from_output_tail", dest="lrid_key_from_output_tail", action="store_false")
     parser.add_argument("--attnres_type", choices=("block", "full"), default="block")
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
@@ -103,6 +105,7 @@ def make_config(args, kind, fused=False, lrid_rank=None):
         lrid_rank=lrid_rank or 64,
         lrid_projection_rank=args.lrid_projection_rank if use_lrid else None,
         lrid_num_heads=args.lrid_num_heads,
+        lrid_key_from_output_tail=args.lrid_key_from_output_tail if use_lrid else False,
         lrid_use_logit_scale=True,
     )
 
@@ -229,7 +232,7 @@ def measure_case(args, device, dtype, batch_size, label, kind, fused=False, lrid
         torch.cuda.empty_cache()
     projection_rank = ""
     if kind == "lrid":
-        projection_rank = args.lrid_projection_rank or lrid_rank or 64
+        projection_rank = "tail" if args.lrid_key_from_output_tail else (args.lrid_projection_rank or lrid_rank or 64)
     return {
         "label": label,
         "batch": batch_size,
@@ -259,7 +262,8 @@ def main():
         f"cudagraphs={args.torch_compile_cudagraphs} "
         f"coordesc={args.inductor_coordinate_descent} maxautomm={args.inductor_max_autotune_gemm} "
         f"nonzero_queries={args.nonzero_attnres_queries} "
-        f"lrid_projection_rank={args.lrid_projection_rank}"
+        f"lrid_projection_rank={args.lrid_projection_rank} "
+        f"lrid_key_from_output_tail={args.lrid_key_from_output_tail}"
     )
     print("case,batch,rank,projection_rank,latency_ms,overhead_vs_baseline_pct,speedup_vs_pytorch")
     for batch_size in batch_sizes:

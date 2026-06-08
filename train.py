@@ -198,6 +198,7 @@ lrid_add_static_embedding_key = False
 lrid_add_static_source_key = False
 lrid_key_from_value = False
 lrid_key_from_value_shared = False
+lrid_key_from_output_tail = False
 lrid_key_value_norm = True
 lrid_query_from_value = False
 lrid_query_from_value_shared = False
@@ -510,6 +511,8 @@ def parse_args():
     parser.add_argument("--no-lrid_key_from_value", dest="lrid_key_from_value", action="store_false")
     parser.add_argument("--lrid_key_from_value_shared", type=_str_to_bool, nargs="?", const=True, default=lrid_key_from_value_shared)
     parser.add_argument("--no-lrid_key_from_value_shared", dest="lrid_key_from_value_shared", action="store_false")
+    parser.add_argument("--lrid_key_from_output_tail", type=_str_to_bool, nargs="?", const=True, default=lrid_key_from_output_tail)
+    parser.add_argument("--no-lrid_key_from_output_tail", dest="lrid_key_from_output_tail", action="store_false")
     parser.add_argument("--lrid_key_value_norm", type=_str_to_bool, nargs="?", const=True, default=lrid_key_value_norm)
     parser.add_argument("--no-lrid_key_value_norm", dest="lrid_key_value_norm", action="store_false")
     parser.add_argument("--lrid_query_from_value", type=_str_to_bool, nargs="?", const=True, default=lrid_query_from_value)
@@ -575,6 +578,7 @@ lrid_key_from_value = args.lrid_key_from_value
 lrid_key_from_value_shared = args.lrid_key_from_value_shared
 if lrid_key_from_value_shared:
     lrid_key_from_value = True
+lrid_key_from_output_tail = args.lrid_key_from_output_tail
 lrid_key_value_norm = args.lrid_key_value_norm
 lrid_query_from_value = args.lrid_query_from_value
 lrid_query_from_value_shared = args.lrid_query_from_value_shared

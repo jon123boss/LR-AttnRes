@@ -118,6 +118,7 @@ def get_model(config, device):
             lrid_add_static_source_key = config.get("lrid_add_static_source_key", False),
             lrid_key_from_value = config.get("lrid_key_from_value", False),
             lrid_key_from_value_shared = config.get("lrid_key_from_value_shared", False),
+            lrid_key_from_output_tail = config.get("lrid_key_from_output_tail", False),
             lrid_key_value_norm = config.get("lrid_key_value_norm", True),
             lrid_query_from_value = config.get("lrid_query_from_value", False),
             lrid_query_from_value_shared = config.get("lrid_query_from_value_shared", False),

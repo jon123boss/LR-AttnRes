@@ -63,6 +63,47 @@ def test_fused_lrid_static_query_matches_torch(num_heads, key_norm):
     _assert_close(actual, expected, dtype)
 
 
+def test_fused_lrid_output_tail_keys_match_torch():
+    device = _cuda_device()
+    torch.manual_seed(6)
+    dtype = torch.float32
+    num_heads = 2
+    rank = 32
+    n_embd = 128
+    ref_sources = [
+        torch.randn(2, 7, n_embd, device=device, dtype=dtype, requires_grad=True)
+        for _ in range(6)
+    ]
+    actual_sources = [
+        source.detach().clone().requires_grad_(True)
+        for source in ref_sources
+    ]
+    ref_keys = [source[..., -rank:].contiguous() for source in ref_sources]
+    actual_keys = [source[..., -rank:].contiguous() for source in actual_sources]
+    ref_query = torch.randn(num_heads, rank // num_heads, device=device, dtype=dtype, requires_grad=True)
+    actual_query = ref_query.detach().clone().requires_grad_(True)
+
+    expected = lrid_attention_residual_read_torch(ref_sources, ref_keys, ref_query, num_heads, 0.25, True)
+    actual = lrid_attention_residual_read(
+        actual_sources,
+        actual_keys,
+        actual_query,
+        num_heads,
+        0.25,
+        True,
+        force_triton=True,
+    )
+    upstream = torch.randn_like(expected)
+    expected.backward(upstream)
+    actual.backward(upstream)
+    torch.cuda.synchronize()
+
+    _assert_close(actual, expected, dtype)
+    for actual_source, ref_source in zip(actual_sources, ref_sources):
+        _assert_close(actual_source.grad, ref_source.grad, dtype)
+    _assert_close(actual_query.grad, ref_query.grad, dtype)
+
+
 def test_fused_lrid_dynamic_query_matches_torch():
     device = _cuda_device()
     torch.manual_seed(7)
@@ -240,9 +281,11 @@ def test_phase2_backward_matches_torch(key_norm, normalize_output):
 
 @pytest.mark.parametrize("use_lrid", [False, True])
 @pytest.mark.parametrize("attnres_type", ["block", "full"])
-def test_model_fused_attnres_matches_pytorch_path(use_lrid, attnres_type):
+@pytest.mark.parametrize("lrid_key_from_output_tail", [False, True])
+def test_model_fused_attnres_matches_pytorch_path(use_lrid, attnres_type, lrid_key_from_output_tail):
     device = _cuda_device()
-    torch.manual_seed(10 + int(use_lrid))
+    lrid_key_from_output_tail = bool(use_lrid and lrid_key_from_output_tail)
+    torch.manual_seed(10 + int(use_lrid) + (100 if lrid_key_from_output_tail else 0))
     common = dict(
         n_layer=3,
         n_head=4,
@@ -260,6 +303,7 @@ def test_model_fused_attnres_matches_pytorch_path(use_lrid, attnres_type):
         use_lrid=use_lrid,
         lrid_rank=32,
         lrid_num_heads=2,
+        lrid_key_from_output_tail=lrid_key_from_output_tail,
         lrid_use_logit_scale=True,
     )
     ref = OBPM(ModelConfig(**common, use_fused_attnres=False)).to(device).eval()
@@ -276,9 +320,11 @@ def test_model_fused_attnres_matches_pytorch_path(use_lrid, attnres_type):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(), reason="bf16 CUDA is not available")
 @pytest.mark.parametrize("use_lrid", [False, True])
-def test_cached_block_training_path_matches_pytorch_bfloat16(use_lrid):
+@pytest.mark.parametrize("lrid_key_from_output_tail", [False, True])
+def test_cached_block_training_path_matches_pytorch_bfloat16(use_lrid, lrid_key_from_output_tail):
     device = _cuda_device()
-    torch.manual_seed(14 + int(use_lrid))
+    lrid_key_from_output_tail = bool(use_lrid and lrid_key_from_output_tail)
+    torch.manual_seed(14 + int(use_lrid) + (100 if lrid_key_from_output_tail else 0))
     common = dict(
         n_layer=4,
         n_head=4,
@@ -297,6 +343,7 @@ def test_cached_block_training_path_matches_pytorch_bfloat16(use_lrid):
         use_lrid=use_lrid,
         lrid_rank=32,
         lrid_num_heads=1,
+        lrid_key_from_output_tail=lrid_key_from_output_tail,
         lrid_use_logit_scale=True,
         attnres_training_cache_phase1=True,
         attnres_training_torch_phase2=True,
@@ -386,3 +433,26 @@ def test_lrid_fused_projection_value_is_contiguous():
 
     assert value.is_contiguous()
     assert key is not None
+
+
+def test_lrid_output_tail_key_uses_value_tail():
+    device = _cuda_device()
+    config = ModelConfig(
+        n_layer=1,
+        n_head=4,
+        n_embd=64,
+        mlp_hidden_dim=128,
+        use_lrid=True,
+        lrid_rank=16,
+        lrid_key_from_output_tail=True,
+    )
+    model = OBPM(config).to(device).eval()
+    x = torch.randn(2, 8, config.n_embd, device=device)
+
+    with torch.no_grad():
+        value, key = model.transformer.layers[0].attn.c_proj(x)
+
+    assert model.transformer.layers[0].attn.c_proj.proj.out_features == config.n_embd
+    assert value.is_contiguous()
+    assert key.is_contiguous()
+    _assert_close(key, value[..., -config.lrid_rank:], torch.float32)
