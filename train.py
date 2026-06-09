@@ -182,6 +182,7 @@ use_fused_attnres = False
 attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
 attnres_block_average = False
+attnres_block_average_mode = "count" # count or sqrt
 attnres_key_norm = True
 attn_res_query_norm = False
 attn_res_query_init = "zero" # zero, normal, trunc_normal
@@ -483,6 +484,7 @@ def parse_args():
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=attnres_block_average)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
+    parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default=attnres_block_average_mode)
     parser.add_argument("--attnres_key_norm", type=_str_to_bool, nargs="?", const=True, default=attnres_key_norm)
     parser.add_argument("--no-attnres_key_norm", dest="attnres_key_norm", action="store_false")
     parser.add_argument("--attn_res_query_norm", type=_str_to_bool, nargs="?", const=True, default=attn_res_query_norm)
@@ -560,6 +562,7 @@ use_fused_attnres = args.use_fused_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
+attnres_block_average_mode = args.attnres_block_average_mode
 attnres_key_norm = args.attnres_key_norm
 attn_res_query_norm = args.attn_res_query_norm
 attn_res_query_init = args.attn_res_query_init

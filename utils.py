@@ -102,6 +102,7 @@ def get_model(config, device):
             attnres_type = config["attnres_type"],
             attnres_num_blocks = config["attnres_num_blocks"],
             attnres_block_average = config.get("attnres_block_average", False),
+            attnres_block_average_mode = config.get("attnres_block_average_mode", "count"),
             attnres_key_norm = config["attnres_key_norm"],
             attn_res_query_norm = config["attn_res_query_norm"],
             attn_res_query_init = config["attn_res_query_init"],

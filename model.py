@@ -70,6 +70,7 @@ class ModelConfig:
     use_fused_attnres: bool = False
     attnres_num_blocks: int = 8
     attnres_block_average: bool = False
+    attnres_block_average_mode: str = "count"
     attnres_key_norm: bool = True
     attn_res_query_norm: bool = False
     attn_res_query_init: str = "zero"
@@ -96,6 +97,9 @@ class ModelConfig:
     def __post_init__(self):
         self.attnres_type = (self.attnres_type or "block")
         self.attnres_type = self.attnres_type.lower()
+        self.attnres_block_average_mode = (self.attnres_block_average_mode or "count").lower()
+        if self.attnres_block_average_mode not in {"count", "sqrt"}:
+            raise ValueError("attnres_block_average_mode must be one of: count, sqrt")
         self.attn_res_query_init = (self.attn_res_query_init or "zero").lower()
         if self.attn_res_query_init not in {"zero", "normal", "trunc_normal"}:
             raise ValueError("attn_res_query_init must be one of: zero, normal, trunc_normal")
@@ -675,14 +679,15 @@ class OBPM(nn.Module):
 
     def _attnres_block_summary(self, value, count):
         if self.config.attnres_block_average:
-            return value / count
+            return value / self._attnres_block_average_denominator(count)
         return value
 
     def _lrid_block_source(self, value, key=None, query=None, count=1):
         if self.config.attnres_block_average:
-            value = value / count
+            denominator = self._attnres_block_average_denominator(count)
+            value = value / denominator
             if key is not None and not self.config.lrid_key_from_value and not self.config.attnres_key_norm:
-                key = key / count
+                key = key / denominator
         key_value = value if self.config.lrid_key_from_value_shared else None
         query_value = value if self.config.lrid_query_from_value_shared else None
         return self._lrid_source(
@@ -693,6 +698,11 @@ class OBPM(nn.Module):
             query_value=query_value,
             add_static_key=True,
         )
+
+    def _attnres_block_average_denominator(self, count):
+        if self.config.attnres_block_average_mode == "sqrt":
+            return math.sqrt(count)
+        return count
 
     def _iter_attnres_query_params(self):
         if not self.use_attnres:

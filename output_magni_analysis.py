@@ -1015,7 +1015,8 @@ def main() -> None:
             print(
                 f"{key}: n_layer={loaded.model_config.n_layer}, "
                 f"attnres_type={loaded.model_config.attnres_type}, "
-                f"block_average={loaded.model_config.attnres_block_average}"
+                f"block_average={loaded.model_config.attnres_block_average}, "
+                f"block_average_mode={loaded.model_config.attnres_block_average_mode}"
             )
 
             if val_loader is None:

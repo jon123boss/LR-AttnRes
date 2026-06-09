@@ -156,8 +156,9 @@ unshared, so each LR output module has its own value-query projection. Use
 
 For block LR AttnRes, outside dynamic queries are projected from the live
 partial block or completed block source value, mirroring outside source keys.
-When `--attnres_block_average` is enabled, that source value is the current
-block average.
+When `--attnres_block_average` is enabled, that source value is scaled by the
+selected block-average denominator: the count by default, or the square root of
+the count with `--attnres_block_average_mode sqrt`.
 
 The token embedding is also a depth source, so it gets its own low-rank key projection:
 
@@ -328,10 +329,12 @@ Block LR AttnRes compresses prior sublayer outputs into block summaries. It is t
 
 By default, block summaries are sums of the sublayer outputs in that block. The
 optional `--attnres_block_average` flag divides partial and completed block
-summaries by the number of accumulated sublayers before using them as depth
-sources. In LR AttnRes, emitted block source keys are averaged only when
+summaries by the selected denominator before using them as depth sources. The
+default denominator is the number of accumulated sublayers; set
+`--attnres_block_average_mode sqrt` to divide by the square root of that count.
+In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
-key by the block count would be removed by the later RMSNorm. The fused dynamic
+key by the denominator would be removed by the later RMSNorm. The fused dynamic
 query, when enabled, remains the latest emitted query rather than an average.
 
 When `--lrid_key_from_value` is enabled, block keys are not averaged separately.
@@ -509,6 +512,7 @@ Model config:
 ```text
 use_lrid: bool
 attnres_block_average: bool
+attnres_block_average_mode: "count" | "sqrt"
 attnres_key_norm: bool
 attn_res_query_norm: bool
 attn_res_query_init: "zero" | "normal" | "trunc_normal"
@@ -534,6 +538,7 @@ Training CLI:
 --no-use_lrid
 --attnres_block_average
 --no-attnres_block_average
+--attnres_block_average_mode {count,sqrt}
 --attnres_key_norm
 --no-attnres_key_norm
 --attn_res_query_norm

@@ -187,7 +187,7 @@ def direct_lrid_output_tail_check(
     assert_close("lrid output-tail grad query", query_fused.grad, query_ref.grad, atol, rtol)
 
 
-def common_model_kwargs(use_lrid: bool, attnres_type: str) -> dict:
+def common_model_kwargs(use_lrid: bool, attnres_type: str, attnres_block_average_mode: str = "count") -> dict:
     return dict(
         n_layer=3,
         n_head=4,
@@ -201,6 +201,7 @@ def common_model_kwargs(use_lrid: bool, attnres_type: str) -> dict:
         attnres_type=attnres_type,
         attnres_num_blocks=2,
         attnres_block_average=True,
+        attnres_block_average_mode=attnres_block_average_mode,
         attnres_key_norm=True,
         attn_res_query_init="normal",
         use_lrid=use_lrid,
@@ -216,6 +217,7 @@ def model_parity_check(
     use_lrid: bool,
     attnres_type: str,
     lrid_key_from_output_tail: bool,
+    attnres_block_average_mode: str,
     atol: float,
     rtol: float,
 ) -> None:
@@ -224,8 +226,9 @@ def model_parity_check(
         + int(use_lrid)
         + (0 if attnres_type == "block" else 10)
         + (100 if lrid_key_from_output_tail else 0)
+        + (1000 if attnres_block_average_mode == "sqrt" else 0)
     )
-    kwargs = common_model_kwargs(use_lrid, attnres_type)
+    kwargs = common_model_kwargs(use_lrid, attnres_type, attnres_block_average_mode)
     if use_lrid:
         kwargs["lrid_key_from_output_tail"] = lrid_key_from_output_tail
     ref = OBPM(ModelConfig(**kwargs, use_fused_attnres=False)).to(device=device, dtype=dtype).train()
@@ -242,7 +245,10 @@ def model_parity_check(
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-    prefix = f"model use_lrid={use_lrid} tail_key={lrid_key_from_output_tail} type={attnres_type}"
+    prefix = (
+        f"model use_lrid={use_lrid} tail_key={lrid_key_from_output_tail} "
+        f"type={attnres_type} block_avg_mode={attnres_block_average_mode}"
+    )
     assert_close(f"{prefix} forward", actual, expected, atol, rtol)
     assert_close(f"{prefix} embedding grad", fused.transformer.wte.weight.grad, ref.transformer.wte.weight.grad, atol, rtol)
 
@@ -270,6 +276,7 @@ def compatibility_check(device: torch.device) -> None:
         cfg = ModelConfig(**old_args)
         assert cfg.use_fused_attnres is False
         assert cfg.lrid_key_from_output_tail is False
+        assert cfg.attnres_block_average_mode == "count"
         if cfg.use_lrid:
             assert cfg.lrid_projection_rank == cfg.lrid_rank
 
@@ -287,13 +294,16 @@ def compatibility_check(device: torch.device) -> None:
         cfg_from_old_checkpoint = ModelConfig(**old_checkpoint_model_args)
         assert "use_fused_attnres" not in old_checkpoint_model_args
         assert "lrid_key_from_output_tail" not in old_checkpoint_model_args
+        assert "attnres_block_average_mode" not in old_checkpoint_model_args
         assert cfg_from_old_checkpoint.use_fused_attnres is False
         assert cfg_from_old_checkpoint.lrid_key_from_output_tail is False
+        assert cfg_from_old_checkpoint.attnres_block_average_mode == "count"
 
         roundtrip_args = asdict(cfg_from_old_checkpoint)
         cfg_from_new_checkpoint = ModelConfig(**roundtrip_args)
         assert cfg_from_new_checkpoint.use_fused_attnres is False
         assert cfg_from_new_checkpoint.lrid_key_from_output_tail is False
+        assert cfg_from_new_checkpoint.attnres_block_average_mode == "count"
         print(f"PASS compat old {name} model_args defaults")
 
     tail_cfg = ModelConfig(**old_lrid_args, lrid_key_from_output_tail=True)
@@ -335,15 +345,17 @@ def main() -> None:
             for attnres_type in ["block", "full"]:
                 tail_key_options = [False, True] if use_lrid else [False]
                 for lrid_key_from_output_tail in tail_key_options:
-                    model_parity_check(
-                        device,
-                        dtype,
-                        use_lrid,
-                        attnres_type,
-                        lrid_key_from_output_tail,
-                        atol,
-                        rtol,
-                    )
+                    for attnres_block_average_mode in ["count", "sqrt"]:
+                        model_parity_check(
+                            device,
+                            dtype,
+                            use_lrid,
+                            attnres_type,
+                            lrid_key_from_output_tail,
+                            attnres_block_average_mode,
+                            atol,
+                            rtol,
+                        )
 
     if args.mode in {"all", "compat"}:
         compatibility_check(device)

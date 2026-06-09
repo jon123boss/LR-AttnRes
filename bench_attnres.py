@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--attnres_type", choices=("block", "full"), default="block")
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
+    parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default="count")
     parser.add_argument("--attnres_key_norm", type=_str_to_bool, nargs="?", const=True, default=True)
     parser.add_argument("--no-attnres_key_norm", dest="attnres_key_norm", action="store_false")
     parser.add_argument("--attnres_training_cache_phase1", type=_str_to_bool, nargs="?", const=True, default=True)
@@ -97,6 +98,7 @@ def make_config(args, kind, fused=False, lrid_rank=None):
         attnres_type=args.attnres_type,
         attnres_num_blocks=args.attnres_num_blocks,
         attnres_block_average=args.attnres_block_average,
+        attnres_block_average_mode=args.attnres_block_average_mode,
         attnres_key_norm=args.attnres_key_norm,
         attnres_training_cache_phase1=args.attnres_training_cache_phase1,
         attnres_training_torch_phase2=args.attnres_training_torch_phase2,

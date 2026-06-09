@@ -13,6 +13,34 @@ from attnres_ops import (
 from model import ModelConfig, OBPM
 
 
+@pytest.mark.parametrize("mode,denominator", [("count", 4.0), ("sqrt", 2.0)])
+def test_attnres_block_average_mode_scales_block_source(mode, denominator):
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_block_average=True,
+        attnres_block_average_mode=mode,
+        attnres_key_norm=False,
+        use_lrid=True,
+        lrid_rank=4,
+        lrid_num_heads=1,
+    )
+    model = OBPM(cfg)
+    value = torch.full((1, 2, cfg.n_embd), 8.0)
+    key = torch.full((1, 2, cfg.lrid_rank), 4.0)
+
+    assert torch.allclose(model._attnres_block_summary(value, 4), value / denominator)
+    lrid_value, lrid_key = model._lrid_block_source(value, key, count=4)
+    assert torch.allclose(lrid_value, value / denominator)
+    assert torch.allclose(lrid_key, key / denominator)
+
+
 def _cuda_device():
     if not torch.cuda.is_available() or not is_fused_attnres_available():
         pytest.skip("CUDA/Triton fused AttnRes path is not available")
