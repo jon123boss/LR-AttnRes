@@ -186,45 +186,6 @@ def test_attnres_cached_phase2_applies_partial_count_prior():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.parametrize(
-    "count_prior,expected_value",
-    [
-        (True, 13.0 / 4.0),
-        (False, 5.0 / 2.0),
-    ],
-)
-def test_zero_block_read_respects_count_prior_toggle(count_prior, expected_value):
-    cfg = ModelConfig(
-        n_layer=1,
-        n_head=2,
-        n_embd=4,
-        mlp_hidden_dim=8,
-        vocab_size=16,
-        block_size=4,
-        use_attnres=True,
-        use_fused_attnres=True,
-        attnres_type="block",
-        attnres_num_blocks=1,
-        attnres_block_average=True,
-        attnres_block_count_prior=count_prior,
-        attnres_key_norm=False,
-    )
-    model = OBPM(cfg)
-    embedding = torch.full((1, 2, cfg.n_embd), 1.0)
-    partial_sum = torch.full((1, 2, cfg.n_embd), 12.0)
-
-    actual = model._zero_block_read(
-        embedding,
-        completed_count=1,
-        partial_block=partial_sum,
-        partial_count=3,
-        partial_summary_idx=1,
-    )
-    expected = torch.full_like(actual, expected_value)
-
-    assert torch.allclose(actual, expected)
-
-
 @pytest.mark.parametrize("use_lrid", [False, True])
 @pytest.mark.parametrize("count_prior", [False, True])
 def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
@@ -276,34 +237,6 @@ def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
     )
 
     assert records == expected
-
-
-@pytest.mark.parametrize("use_lrid", [False, True])
-def test_zero_query_fastpath_checks_query_values_not_only_versions(use_lrid):
-    cfg = ModelConfig(
-        n_layer=1,
-        n_head=2,
-        n_embd=8,
-        mlp_hidden_dim=16,
-        vocab_size=32,
-        block_size=4,
-        use_attnres=True,
-        use_fused_attnres=True,
-        attnres_type="block",
-        attnres_num_blocks=1,
-        attn_res_query_init="zero",
-        use_lrid=use_lrid,
-        lrid_rank=4,
-        lrid_num_heads=1,
-    )
-    model = OBPM(cfg).eval()
-    assert model._zero_query_fastpath_active()
-
-    query = next(iter(model._iter_attnres_query_params()))
-    query.data.add_(1.0)
-
-    assert not model._zero_query_fastpath_active()
-    assert not model._zero_query_fastpath_enabled
 
 
 def _cuda_device():

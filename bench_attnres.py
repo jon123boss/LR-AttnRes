@@ -180,7 +180,6 @@ def measure_case(args, device, dtype, batch_size, label, kind, fused=False, lrid
             else:
                 for residual in model.transformer.attn_residuals:
                     residual.query.normal_(0.0, config.init_std)
-        model._refresh_zero_query_fastpath_state()
     if dtype != torch.float32:
         model.to(dtype=dtype)
     if args.torch_compile:
