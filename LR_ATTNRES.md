@@ -156,9 +156,9 @@ unshared, so each LR output module has its own value-query projection. Use
 
 For block LR AttnRes, outside dynamic queries are projected from the live
 partial block or completed block source value, mirroring outside source keys.
-When `--attnres_block_average` is enabled, that source value is scaled by the
-selected block-average denominator: the count by default, or the square root of
-the count with `--attnres_block_average_mode sqrt`.
+By default, `--attnres_block_average` is enabled and that source value is scaled
+by the selected block-average denominator: the count by default, or the square
+root of the count with `--attnres_block_average_mode sqrt`.
 When `--attnres_block_learned_scale` is enabled, this fixed denominator is
 replaced by one learned scalar per partial/completed block source. The scalar is
 indexed by the residual source position: a live partial source after sublayer
@@ -336,11 +336,13 @@ Full LR AttnRes attends over all previous sublayer sources. It is the most expre
 
 Block LR AttnRes compresses prior sublayer outputs into block summaries. It is the recommended default.
 
-By default, block summaries are sums of the sublayer outputs in that block. The
-optional `--attnres_block_average` flag divides partial and completed block
-summaries by the selected denominator before using them as depth sources. The
-default denominator is the number of accumulated sublayers; set
-`--attnres_block_average_mode sqrt` to divide by the square root of that count.
+By default, block summaries are means of the sublayer outputs in that block:
+`--attnres_block_average` divides partial and completed block summaries by the
+selected denominator before using them as depth sources. The default denominator
+is the number of accumulated sublayers; set `--attnres_block_average_mode sqrt`
+to divide by the square root of that count. Each compressed block source also
+adds `log(count)` to its depth-routing logit so it receives the softmax prior
+mass of the sublayers it represents.
 In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
 key by the denominator would be removed by the later RMSNorm. The fused dynamic

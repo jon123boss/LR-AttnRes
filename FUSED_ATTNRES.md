@@ -30,6 +30,7 @@ out = attention_residual_read(
     query,                  # Tensor [D]
     key_norm=True,
     normalize_output=False,
+    source_counts=None,     # optional count prior: logits += log(count)
 )
 # out: [B, T, D]
 ```
@@ -47,6 +48,7 @@ out = lrid_attention_residual_read(
     logit_scale=1.0 / (32 ** 0.5),
     key_norm=True,
     normalize_output=False,
+    source_counts=None,     # optional count prior: logits += log(count)
 )
 # out: [B, T, D]
 ```

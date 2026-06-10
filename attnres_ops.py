@@ -62,6 +62,25 @@ def _as_stacked(values):
     return torch.stack(values, dim=0)
 
 
+def _source_log_count_bias(source_counts, n_sources: int, device) -> Tensor:
+    if source_counts is None:
+        return None
+    if isinstance(source_counts, Tensor):
+        counts = source_counts.reshape(-1).to(device=device, dtype=torch.float32)
+    elif isinstance(source_counts, (int, float)):
+        counts = torch.full((n_sources,), float(source_counts), device=device, dtype=torch.float32)
+    else:
+        if len(source_counts) != n_sources:
+            raise RuntimeError("source_counts length must match the number of sources")
+        count_values = [float(count) for count in source_counts]
+        if any(count <= 0.0 for count in count_values):
+            raise RuntimeError("source_counts must be positive")
+        counts = torch.tensor(count_values, device=device, dtype=torch.float32)
+    if counts.numel() != n_sources:
+        raise RuntimeError("source_counts length must match the number of sources")
+    return counts.log()
+
+
 def is_fused_attnres_available() -> bool:
     return _TRITON_AVAILABLE
 
@@ -2115,20 +2134,27 @@ def _can_use_triton_attnres_list(values, query: Tensor) -> bool:
     return _can_use_triton(*values, query)
 
 
-def _attnres_read_torch_stacked(values: Tensor, query: Tensor, key_norm: bool) -> Tensor:
+def _attnres_read_torch_stacked(values: Tensor, query: Tensor, key_norm: bool, source_counts=None) -> Tensor:
     keys = _norm(values) if key_norm else values
     query = query.to(keys.dtype)
     logits = torch.einsum("d,sbtd->sbt", query, keys)
+    log_count_bias = _source_log_count_bias(source_counts, values.size(0), logits.device)
+    if log_count_bias is not None:
+        logits = logits + log_count_bias.view(-1, 1, 1)
     weights = F.softmax(logits.float(), dim=0).to(values.dtype)
     return torch.einsum("sbt,sbtd->btd", weights, values)
 
 
-def _attnres_read_torch_list(values, query: Tensor, key_norm: bool) -> Tensor:
+def _attnres_read_torch_list(values, query: Tensor, key_norm: bool, source_counts=None) -> Tensor:
     query = query.to(values[0].dtype)
+    log_count_bias = _source_log_count_bias(source_counts, len(values), values[0].device)
     logits = []
-    for value in values:
+    for idx, value in enumerate(values):
         key = _norm(value) if key_norm else value
-        logits.append(torch.sum(key * query, dim=-1))
+        logit = torch.sum(key * query, dim=-1)
+        if log_count_bias is not None:
+            logit = logit + log_count_bias[idx]
+        logits.append(logit)
     weights = F.softmax(torch.stack(logits, dim=0).float(), dim=0).to(values[0].dtype)
 
     output = torch.zeros_like(values[0])
@@ -2137,9 +2163,9 @@ def _attnres_read_torch_list(values, query: Tensor, key_norm: bool) -> Tensor:
     return output
 
 
-def attention_residual_read_torch(values, query: Tensor, key_norm: bool) -> Tensor:
+def attention_residual_read_torch(values, query: Tensor, key_norm: bool, source_counts=None) -> Tensor:
     values = _as_stacked(values)
-    return _attnres_read_torch_stacked(values, query, key_norm)
+    return _attnres_read_torch_stacked(values, query, key_norm, source_counts)
 
 
 def _attnres_read_triton(values: Tensor, query: Tensor, key_norm: bool, normalize_output: bool = False) -> Tensor:
@@ -2380,6 +2406,7 @@ def attention_residual_read(
     key_norm: bool,
     force_triton: bool = False,
     normalize_output: bool = False,
+    source_counts=None,
 ) -> Tensor:
     if not isinstance(values, Tensor):
         if len(values) == 1:
@@ -2387,7 +2414,7 @@ def attention_residual_read(
             return _norm(output) if normalize_output else output
         query = query.to(values[0].dtype)
         if torch.is_grad_enabled():
-            if _use_triton_training_kernel() and _can_use_triton_attnres_list(values, query):
+            if source_counts is None and _use_triton_training_kernel() and _can_use_triton_attnres_list(values, query):
                 return _TritonAttentionResidualListRead.apply(
                     query,
                     bool(key_norm),
@@ -2395,13 +2422,15 @@ def attention_residual_read(
                     *values,
                 )
             else:
-                output = _attnres_read_torch_list(values, query, key_norm)
+                if source_counts is not None and force_triton:
+                    raise RuntimeError("Triton fused AttnRes path does not support source_counts")
+                output = _attnres_read_torch_list(values, query, key_norm, source_counts)
             return _norm(output) if normalize_output else output
-        if _can_use_triton_attnres_list(values, query):
+        if source_counts is None and _can_use_triton_attnres_list(values, query):
             return _attnres_read_list_triton(values, query, bool(key_norm), bool(normalize_output))
         if force_triton:
             raise RuntimeError("Triton fused AttnRes path is not available for these tensors")
-        output = _attnres_read_torch_list(values, query, key_norm)
+        output = _attnres_read_torch_list(values, query, key_norm, source_counts)
         return _norm(output) if normalize_output else output
 
     values = _as_stacked(values)
@@ -2409,11 +2438,11 @@ def attention_residual_read(
         output = values[0]
         return _norm(output) if normalize_output else output
     query = query.to(values.dtype)
-    if _can_use_triton(values, query):
+    if source_counts is None and _can_use_triton(values, query):
         return _TritonAttentionResidualRead.apply(values, query, bool(key_norm), bool(normalize_output))
     if force_triton:
         raise RuntimeError("Triton fused AttnRes path is not available for these tensors")
-    output = _attnres_read_torch_stacked(values, query, key_norm)
+    output = _attnres_read_torch_stacked(values, query, key_norm, source_counts)
     return _norm(output) if normalize_output else output
 
 
@@ -2485,9 +2514,12 @@ def _attnres_phase2_merge_torch(
     interblock_output: Tensor,
     interblock_lse: Tensor,
     key_norm: bool,
+    logit_bias: float = 0.0,
 ) -> Tensor:
     key = _norm(partial_value) if key_norm else partial_value
     logit = torch.sum(key * query.to(key.dtype), dim=-1).float()
+    if logit_bias:
+        logit = logit + float(logit_bias)
     prob = torch.sigmoid(logit - interblock_lse.float()).to(partial_value.dtype)
     return torch.addcmul(interblock_output, partial_value - interblock_output, prob.unsqueeze(-1))
 
@@ -3819,8 +3851,21 @@ def attention_residual_phase2(
     key_norm: bool,
     force_triton: bool = False,
     normalize_output: bool = False,
+    logit_bias: float = 0.0,
 ):
     query = query.to(partial_value.dtype)
+    logit_bias = float(logit_bias)
+    if logit_bias:
+        key = _norm(partial_value) if key_norm else partial_value
+        partial_logit = torch.sum(key * query.to(key.dtype), dim=-1).float() + logit_bias
+        return attention_residual_phase2_from_logit(
+            partial_value,
+            partial_logit,
+            interblock_output,
+            interblock_lse,
+            force_triton=force_triton,
+            normalize_output=normalize_output,
+        )
     if (
         _TRITON_AVAILABLE
         and partial_value.is_cuda
@@ -3851,6 +3896,7 @@ def attention_residual_phase2(
         interblock_output,
         interblock_lse,
         key_norm,
+        logit_bias,
     )
     return _norm(output) if normalize_output else output
 
@@ -3862,6 +3908,7 @@ def attention_residual_phase2_torch(
     interblock_lse: Tensor,
     key_norm: bool,
     normalize_output: bool = False,
+    logit_bias: float = 0.0,
 ):
     query = query.to(partial_value.dtype)
     output = _attnres_phase2_merge_torch(
@@ -3870,6 +3917,7 @@ def attention_residual_phase2_torch(
         interblock_output,
         interblock_lse,
         key_norm,
+        logit_bias,
     )
     return _norm(output) if normalize_output else output
 
@@ -3916,9 +3964,23 @@ def lrid_attention_residual_phase2(
     key_norm: bool,
     force_triton: bool = False,
     normalize_output: bool = False,
+    logit_bias: float = 0.0,
 ):
     query = query.reshape(-1).to(partial_key.dtype)
     partial_key = partial_key.reshape(partial_key.size(0), partial_key.size(1), -1)
+    logit_bias = float(logit_bias)
+    if logit_bias:
+        key = _norm(partial_key.float()).to(partial_value.dtype) if key_norm else partial_key
+        logit = torch.sum(key * query.to(key.dtype).view(1, 1, -1), dim=-1) * float(logit_scale)
+        logit = logit.float() + logit_bias
+        return attention_residual_phase2_from_logit(
+            partial_value,
+            logit,
+            interblock_output,
+            interblock_lse,
+            force_triton=force_triton,
+            normalize_output=normalize_output,
+        )
     if (
         _TRITON_AVAILABLE
         and partial_value.is_cuda
@@ -3969,11 +4031,14 @@ def lrid_attention_residual_phase2_torch(
     logit_scale: float,
     key_norm: bool,
     normalize_output: bool = False,
+    logit_bias: float = 0.0,
 ):
     query = query.reshape(-1).to(partial_key.dtype)
     partial_key = partial_key.reshape(partial_key.size(0), partial_key.size(1), -1)
     key = _norm(partial_key.float()).to(partial_value.dtype) if key_norm else partial_key
     logit = torch.sum(key * query.to(key.dtype).view(1, 1, -1), dim=-1) * float(logit_scale)
+    if logit_bias:
+        logit = logit.float() + float(logit_bias)
     prob = torch.sigmoid(logit.float() - interblock_lse.float()).to(partial_value.dtype)
     output = torch.lerp(interblock_output, partial_value, prob.unsqueeze(-1))
     return _norm(output) if normalize_output else output
@@ -3986,6 +4051,7 @@ def _lrid_read_torch_stacked(
     num_heads: int,
     logit_scale: float,
     key_norm: bool,
+    source_counts=None,
 ) -> Tensor:
     num_heads = int(num_heads)
     key_head_dim = keys.size(-1) // num_heads
@@ -4001,6 +4067,9 @@ def _lrid_read_torch_stacked(
         logits = torch.einsum("sbthr,bthr->sbth", keys, query) * logit_scale
     else:
         logits = torch.einsum("sbthr,hr->sbth", keys, query) * logit_scale
+    log_count_bias = _source_log_count_bias(source_counts, values.size(0), logits.device)
+    if log_count_bias is not None:
+        logits = logits + log_count_bias.view(-1, 1, 1, 1)
     weights = F.softmax(logits.float(), dim=0).to(values.dtype)
     output = torch.einsum("sbth,sbthd->bthd", weights, values)
     return output.reshape(output.size(0), output.size(1), num_heads * value_head_dim)
@@ -4013,6 +4082,7 @@ def _lrid_read_torch_list(
     num_heads: int,
     logit_scale: float,
     key_norm: bool,
+    source_counts=None,
 ) -> Tensor:
     num_heads = int(num_heads)
     B, T, D = values[0].shape
@@ -4020,18 +4090,22 @@ def _lrid_read_torch_list(
     value_head_dim = D // num_heads
 
     query = query.to(keys[0].dtype)
+    log_count_bias = _source_log_count_bias(source_counts, len(values), values[0].device)
     value_views = []
     logits = []
-    for value, key in zip(values, keys):
+    for idx, (value, key) in enumerate(zip(values, keys)):
         key = key.reshape(B, T, num_heads, key_head_dim)
         if key_norm:
             key = _norm(key.float()).to(values[0].dtype)
         value = value.reshape(B, T, num_heads, value_head_dim)
         value_views.append(value)
         if query.dim() == 4:
-            logits.append(torch.sum(key * query, dim=-1) * logit_scale)
+            logit = torch.sum(key * query, dim=-1) * logit_scale
         else:
-            logits.append(torch.sum(key * query.view(1, 1, num_heads, key_head_dim), dim=-1) * logit_scale)
+            logit = torch.sum(key * query.view(1, 1, num_heads, key_head_dim), dim=-1) * logit_scale
+        if log_count_bias is not None:
+            logit = logit + log_count_bias[idx]
+        logits.append(logit)
 
     weights = F.softmax(torch.stack(logits, dim=0).float(), dim=0).to(values[0].dtype)
     output = torch.zeros_like(value_views[0])
@@ -4047,10 +4121,11 @@ def lrid_attention_residual_read_torch(
     num_heads: int,
     logit_scale: float,
     key_norm: bool,
+    source_counts=None,
 ) -> Tensor:
     values = _as_stacked(values)
     keys = _as_stacked(keys)
-    return _lrid_read_torch_stacked(values, keys, query, num_heads, logit_scale, key_norm)
+    return _lrid_read_torch_stacked(values, keys, query, num_heads, logit_scale, key_norm, source_counts)
 
 
 
@@ -4570,6 +4645,7 @@ def lrid_attention_residual_read(
     key_norm: bool,
     force_triton: bool = False,
     normalize_output: bool = False,
+    source_counts=None,
 ) -> Tensor:
     if isinstance(values, Tensor):
         first_value = values[0]
@@ -4580,7 +4656,7 @@ def lrid_attention_residual_read(
     query = query.to(key_dtype)
 
     use_fused_output_norm = normalize_output and int(num_heads) == 1
-    if _can_use_triton_lrid_list(values, keys, query):
+    if source_counts is None and _can_use_triton_lrid_list(values, keys, query):
         if torch.is_grad_enabled():
             training_kernel_mode = _training_kernel_mode()
             if training_kernel_mode in {"auto", "triton_op"} and _lrid_read_list_library_op is not None and query.dim() != 4:
@@ -4640,6 +4716,7 @@ def lrid_attention_residual_read(
             num_heads,
             logit_scale,
             key_norm,
+            source_counts,
         )
         return _norm(output) if normalize_output else output
 
@@ -4649,5 +4726,5 @@ def lrid_attention_residual_read(
         return _norm(first_value) if normalize_output else first_value
     if force_triton:
         raise RuntimeError("Triton fused LRID AttnRes path is not available for these tensors")
-    output = _lrid_read_torch_stacked(values, keys, query, num_heads, logit_scale, key_norm)
+    output = _lrid_read_torch_stacked(values, keys, query, num_heads, logit_scale, key_norm, source_counts)
     return _norm(output) if normalize_output else output

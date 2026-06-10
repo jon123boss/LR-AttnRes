@@ -69,7 +69,7 @@ class ModelConfig:
     use_attnres: bool = False
     use_fused_attnres: bool = False
     attnres_num_blocks: int = 8
-    attnres_block_average: bool = False
+    attnres_block_average: bool = True
     attnres_block_average_mode: str = "count"
     attnres_block_learned_scale: bool = False
     attnres_block_learned_scale_init: str = "count"
@@ -495,9 +495,12 @@ class AttentionResidual(nn.Module):
             query = norm(query.float())
         return query.to(dtype)
 
-    def forward(self, values):
+    def forward(self, values, source_counts=None):
         keys = norm(values) if self.use_key_norm else values
         logits = torch.einsum("d,sbtd->sbt", self._query(keys.dtype), keys)
+        if source_counts is not None:
+            log_counts = torch.as_tensor(source_counts, device=logits.device, dtype=torch.float32).log()
+            logits = logits + log_counts.view(-1, 1, 1)
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
 
@@ -844,9 +847,13 @@ class OBPM(nn.Module):
         if partial_block is None:
             return self._zero_average_read(completed_sum, completed_count, normalize_output)
         partial_source = self._attnres_block_summary(partial_block, partial_count, partial_summary_idx)
-        return self._zero_average_read(completed_sum + partial_source, completed_count + 1, normalize_output)
+        return self._zero_average_read(
+            completed_sum + partial_source * partial_count,
+            completed_count + partial_count,
+            normalize_output,
+        )
 
-    def _apply_attnres(self, residual_idx, sources, normalize_output=False, average_read=False):
+    def _apply_attnres(self, residual_idx, sources, normalize_output=False, average_read=False, source_counts=None):
         if len(sources) == 1:
             return norm(sources[0]) if normalize_output else sources[0]
         if average_read:
@@ -859,9 +866,10 @@ class OBPM(nn.Module):
                 query,
                 residual.use_key_norm,
                 normalize_output=normalize_output,
+                source_counts=source_counts,
             )
         values = torch.stack(sources, dim=0)
-        output = residual(values)
+        output = residual(values, source_counts=source_counts)
         return norm(output) if normalize_output else output
 
     def _attnres_query(self, residual_idx, dtype):
@@ -875,6 +883,7 @@ class OBPM(nn.Module):
         interblock_output,
         interblock_lse,
         normalize_output=False,
+        partial_count=1,
     ):
         phase2 = attention_residual_phase2_torch if self.config.attnres_training_torch_phase2 else attention_residual_phase2
         return phase2(
@@ -884,6 +893,7 @@ class OBPM(nn.Module):
             interblock_lse,
             self.config.attnres_key_norm,
             normalize_output=normalize_output,
+            logit_bias=math.log(float(partial_count)),
         )
 
     def _apply_lrid_training_phase2(
@@ -894,6 +904,7 @@ class OBPM(nn.Module):
         interblock_output,
         interblock_lse,
         normalize_output=False,
+        partial_count=1,
     ):
         phase2 = lrid_attention_residual_phase2_torch if self.config.attnres_training_torch_phase2 else lrid_attention_residual_phase2
         return phase2(
@@ -905,6 +916,7 @@ class OBPM(nn.Module):
             self.config.lrid_logit_scale,
             self.config.attnres_key_norm,
             normalize_output=normalize_output,
+            logit_bias=math.log(float(partial_count)),
         )
 
     def _forward_block_attnres_fused_training(
@@ -931,13 +943,16 @@ class OBPM(nn.Module):
             dim=0,
         ).contiguous()
 
-        def make_source_logits(source, first_read):
+        def make_source_logits(source, first_read, source_count=1):
             key = norm(source) if self.config.attnres_key_norm else source
             queries = query_bank[first_read - 1:].to(key.dtype)
-            return F.linear(key, queries).permute(2, 0, 1).contiguous()
+            logits = F.linear(key, queries).permute(2, 0, 1).contiguous()
+            if source_count != 1:
+                logits = logits + math.log(float(source_count))
+            return logits
 
         completed_blocks = [x]
-        completed_logits = [make_source_logits(x, 1)]
+        completed_logits = [make_source_logits(x, 1, 1)]
         completed_logit_first_reads = [1]
         partial_block = None
         partial_count = 0
@@ -1005,6 +1020,7 @@ class OBPM(nn.Module):
                         interblock_output,
                         phase_lses[phase_idx],
                         normalize_output=fused_read_norm,
+                        partial_count=partial_count,
                     )
             return norm(output) if fused_read_norm and (residual_idx == 0 or partial_block is None) else output
 
@@ -1014,7 +1030,7 @@ class OBPM(nn.Module):
                 return
             completed_source = self._attnres_block_summary(partial_block, partial_count, residual_idx)
             completed_blocks.append(completed_source)
-            completed_logits.append(make_source_logits(completed_source, residual_idx))
+            completed_logits.append(make_source_logits(completed_source, residual_idx, partial_count))
             completed_logit_first_reads.append(residual_idx)
             partial_block = None
             partial_count = 0
@@ -1094,19 +1110,22 @@ class OBPM(nn.Module):
                 key = norm(key.float()).to(source[0].dtype)
             return key
 
-        def make_source_logits(source, first_read):
+        def make_source_logits(source, first_read, source_count=1):
             key = source_key(source)
             queries = query_bank[first_read - 1:].to(key.dtype)
-            return (
+            logits = (
                 F.linear(key, queries)
                 .permute(2, 0, 1)
                 .contiguous()
                 * self.config.lrid_logit_scale
             )
+            if source_count != 1:
+                logits = logits + math.log(float(source_count))
+            return logits
 
         embedding_source = self._embedding_lrid_source(x)
         completed_values = [embedding_source[0]]
-        completed_logits = [make_source_logits(embedding_source, 1)]
+        completed_logits = [make_source_logits(embedding_source, 1, 1)]
         completed_logit_first_reads = [1]
         partial_block = None
         partial_key = None
@@ -1179,6 +1198,7 @@ class OBPM(nn.Module):
                         interblock_output,
                         phase_lses[phase_idx],
                         normalize_output=fused_read_norm,
+                        partial_count=partial_count,
                     )
             return norm(output) if fused_read_norm and (residual_idx == 0 or partial_block is None) else output
 
@@ -1188,7 +1208,7 @@ class OBPM(nn.Module):
                 return
             completed_source = current_partial_source(residual_idx)
             completed_values.append(completed_source[0])
-            completed_logits.append(make_source_logits(completed_source, residual_idx))
+            completed_logits.append(make_source_logits(completed_source, residual_idx, partial_count))
             completed_logit_first_reads.append(residual_idx)
             partial_block = None
             partial_key = None
@@ -1320,7 +1340,15 @@ class OBPM(nn.Module):
             key = self._add_static_lrid_embedding_key(key)
         return self._lrid_source(embedding, key)
 
-    def _apply_lrid_attnres(self, residual_idx, sources, query_override=None, normalize_output=False, average_read=False):
+    def _apply_lrid_attnres(
+        self,
+        residual_idx,
+        sources,
+        query_override=None,
+        normalize_output=False,
+        average_read=False,
+        source_counts=None,
+    ):
         if len(sources) == 1:
             output = sources[0][0]
             return norm(output) if normalize_output else output
@@ -1357,6 +1385,7 @@ class OBPM(nn.Module):
                 self.config.lrid_logit_scale,
                 self.config.attnres_key_norm,
                 normalize_output=normalize_output,
+                source_counts=source_counts,
             )
 
         values = torch.stack(value_sources, dim=0)
@@ -1371,6 +1400,9 @@ class OBPM(nn.Module):
             logits = torch.einsum("sbthr,bthr->sbth", keys, query) * self.config.lrid_logit_scale
         else:
             logits = torch.einsum("sbthr,hr->sbth", keys, query) * self.config.lrid_logit_scale
+        if source_counts is not None:
+            log_counts = torch.as_tensor(source_counts, device=logits.device, dtype=torch.float32).log()
+            logits = logits + log_counts.view(-1, 1, 1, 1)
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         output = torch.einsum("sbth,sbthd->bthd", weights, values)
         output = output.reshape(output.size(0), output.size(1), self.config.n_embd)
@@ -1495,6 +1527,7 @@ class OBPM(nn.Module):
             else:
                 block_ends = self.attnres_block_ends
                 completed_blocks = [embedding_source] if self.use_lrid else [embedding]
+                completed_block_counts = [1]
                 if zero_query_fastpath:
                     completed_sum = embedding
                     completed_count = 1
@@ -1537,11 +1570,13 @@ class OBPM(nn.Module):
                             sources = completed_blocks if partial_block is None else completed_blocks + [
                                 self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, attn_res_idx)
                             ]
+                            source_counts = completed_block_counts if partial_block is None else completed_block_counts + [partial_count]
                             x = self._apply_lrid_attnres(
                                 attn_res_idx,
                                 sources,
                                 normalize_output=fused_read_norm,
                                 average_read=False,
+                                source_counts=source_counts,
                             )
 
                     attn_out = block.forward_attention(
@@ -1606,12 +1641,15 @@ class OBPM(nn.Module):
                         is_block_end = after_attn_idx in block_ends
                         if is_block_end:
                             if zero_query_fastpath:
-                                completed_sum = completed_sum + self._attnres_block_summary(partial_block, partial_count, after_attn_idx)
-                                completed_count += 1
+                                completed_sum = completed_sum + (
+                                    self._attnres_block_summary(partial_block, partial_count, after_attn_idx) * partial_count
+                                )
+                                completed_count += partial_count
                             else:
                                 completed_blocks.append(
                                     self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, after_attn_idx)
                                 )
+                                completed_block_counts.append(partial_count)
                             partial_block = None
                             partial_key = None
                             partial_count = 0
@@ -1630,12 +1668,14 @@ class OBPM(nn.Module):
                             sources = completed_blocks if partial_block is None else completed_blocks + [
                                 self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, after_attn_idx)
                             ]
+                            source_counts = completed_block_counts if partial_block is None else completed_block_counts + [partial_count]
                             x = self._apply_lrid_attnres(
                                 after_attn_idx,
                                 sources,
                                 query_override=partial_query if self.config.lrid_input_dependent_query else None,
                                 normalize_output=fused_read_norm,
                                 average_read=False,
+                                source_counts=source_counts,
                             )
 
                     mlp_out = block.forward_mlp(
@@ -1690,12 +1730,15 @@ class OBPM(nn.Module):
                         is_block_end = after_mlp_idx in block_ends
                         if is_block_end:
                             if zero_query_fastpath:
-                                completed_sum = completed_sum + self._attnres_block_summary(partial_block, partial_count, after_mlp_idx)
-                                completed_count += 1
+                                completed_sum = completed_sum + (
+                                    self._attnres_block_summary(partial_block, partial_count, after_mlp_idx) * partial_count
+                                )
+                                completed_count += partial_count
                             else:
                                 completed_blocks.append(
                                     self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, after_mlp_idx)
                                 )
+                                completed_block_counts.append(partial_count)
                             partial_block = None
                             partial_key = None
                             partial_count = 0
@@ -1725,11 +1768,13 @@ class OBPM(nn.Module):
                         )
                     else:
                         sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, attn_res_idx)]
+                        source_counts = completed_block_counts if partial_block is None else completed_block_counts + [partial_count]
                         x = self._apply_attnres(
                             2 * layer_idx,
                             sources,
                             normalize_output=fused_read_norm,
                             average_read=False,
+                            source_counts=source_counts,
                         )
 
                 attn_out = block.forward_attention(
@@ -1766,10 +1811,13 @@ class OBPM(nn.Module):
                     is_block_end = after_attn_idx in block_ends
                     if is_block_end:
                         if zero_query_fastpath:
-                            completed_sum = completed_sum + self._attnres_block_summary(partial_block, partial_count, after_attn_idx)
-                            completed_count += 1
+                            completed_sum = completed_sum + (
+                                self._attnres_block_summary(partial_block, partial_count, after_attn_idx) * partial_count
+                            )
+                            completed_count += partial_count
                         else:
                             completed_blocks.append(self._attnres_block_summary(partial_block, partial_count, after_attn_idx))
+                            completed_block_counts.append(partial_count)
                         partial_block = None
                         partial_count = 0
                     if zero_query_fastpath:
@@ -1783,11 +1831,13 @@ class OBPM(nn.Module):
                         )
                     else:
                         sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, after_attn_idx)]
+                        source_counts = completed_block_counts if partial_block is None else completed_block_counts + [partial_count]
                         x = self._apply_attnres(
                             after_attn_idx,
                             sources,
                             normalize_output=fused_read_norm,
                             average_read=False,
+                            source_counts=source_counts,
                         )
 
                 mlp_out = block.forward_mlp(x, x_is_normalized=fused_read_norm)
@@ -1811,10 +1861,13 @@ class OBPM(nn.Module):
                     is_block_end = after_mlp_idx in block_ends
                     if is_block_end:
                         if zero_query_fastpath:
-                            completed_sum = completed_sum + self._attnres_block_summary(partial_block, partial_count, after_mlp_idx)
-                            completed_count += 1
+                            completed_sum = completed_sum + (
+                                self._attnres_block_summary(partial_block, partial_count, after_mlp_idx) * partial_count
+                            )
+                            completed_count += partial_count
                         else:
                             completed_blocks.append(self._attnres_block_summary(partial_block, partial_count, after_mlp_idx))
+                            completed_block_counts.append(partial_count)
                         partial_block = None
                         partial_count = 0
             else:
@@ -1858,11 +1911,13 @@ class OBPM(nn.Module):
                         sources = completed_blocks if partial_block is None else completed_blocks + [
                             self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, 2 * self.config.n_layer)
                         ]
+                        source_counts = completed_block_counts if partial_block is None else completed_block_counts + [partial_count]
                         x = self._apply_lrid_attnres(
                             2 * self.config.n_layer,
                             sources,
                             normalize_output=fused_read_norm,
                             average_read=False,
+                            source_counts=source_counts,
                         )
             elif self.attnres_type == "full":
                 if zero_query_fastpath:
@@ -1886,11 +1941,13 @@ class OBPM(nn.Module):
                     )
                 else:
                     sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, 2 * self.config.n_layer)]
+                    source_counts = completed_block_counts if partial_block is None else completed_block_counts + [partial_count]
                     x = self._apply_attnres(
                         2 * self.config.n_layer,
                         sources,
                         normalize_output=fused_read_norm,
                         average_read=False,
+                        source_counts=source_counts,
                     )
         
         if not fused_read_norm:

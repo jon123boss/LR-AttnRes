@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument("--lrid_key_from_output_tail", type=_str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--no-lrid_key_from_output_tail", dest="lrid_key_from_output_tail", action="store_false")
     parser.add_argument("--attnres_type", choices=("block", "full"), default="block")
-    parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=True)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
     parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default="count")
     parser.add_argument("--attnres_block_learned_scale", type=_str_to_bool, nargs="?", const=True, default=False)

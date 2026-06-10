@@ -4,6 +4,7 @@ import torch
 from attnres_ops import (
     attention_residual_phase1_from_logits,
     attention_residual_phase2,
+    attention_residual_phase2_torch,
     attention_residual_read,
     attention_residual_read_torch,
     is_fused_attnres_available,
@@ -116,6 +117,104 @@ def test_attnres_block_value_norm_overrides_scaling():
     lrid_rms = lrid_value.pow(2).mean(dim=-1).sqrt()
     assert torch.allclose(lrid_rms, torch.ones_like(lrid_rms), atol=1e-6, rtol=1e-6)
     assert torch.equal(lrid_key, key)
+
+
+def test_attnres_source_count_prior_matches_zero_query_uniform_average():
+    embedding = torch.full((1, 2, 4), 1.0)
+    block_mean = torch.full((1, 2, 4), 7.0)
+    query = torch.zeros(4)
+
+    actual = attention_residual_read(
+        [embedding, block_mean],
+        query,
+        key_norm=False,
+        source_counts=[1, 3],
+    )
+    expected = (embedding + 3 * block_mean) / 4
+
+    assert torch.allclose(actual, expected)
+
+
+def test_lrid_source_count_prior_matches_zero_query_uniform_average():
+    embedding = torch.full((1, 2, 8), 2.0)
+    block_mean = torch.full((1, 2, 8), 10.0)
+    keys = [torch.zeros(1, 2, 4), torch.zeros(1, 2, 4)]
+    query = torch.zeros(1, 4)
+
+    actual = lrid_attention_residual_read(
+        [embedding, block_mean],
+        keys,
+        query,
+        num_heads=1,
+        logit_scale=1.0,
+        key_norm=False,
+        source_counts=[1, 3],
+    )
+    expected = (embedding + 3 * block_mean) / 4
+
+    assert torch.allclose(actual, expected)
+
+
+def test_attnres_cached_phase2_applies_partial_count_prior():
+    torch.manual_seed(11)
+    values = [torch.randn(2, 3, 6) for _ in range(2)]
+    partial = torch.randn(2, 3, 6)
+    query = torch.randn(6)
+    counts = [1, 4]
+    partial_count = 2
+
+    logits = []
+    for value, count in zip(values, counts):
+        logits.append(torch.sum(value * query, dim=-1) + torch.log(torch.tensor(float(count))))
+    logits = torch.stack(logits, dim=0).unsqueeze(0)
+    phase_output, phase_lse = attention_residual_phase1_from_logits(values, logits)
+    actual = attention_residual_phase2_torch(
+        partial,
+        query,
+        phase_output[0],
+        phase_lse[0],
+        key_norm=False,
+        logit_bias=torch.log(torch.tensor(float(partial_count))).item(),
+    )
+    expected = attention_residual_read_torch(
+        values + [partial],
+        query,
+        key_norm=False,
+        source_counts=counts + [partial_count],
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_zero_block_read_is_count_weighted_with_block_average():
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=4,
+        mlp_hidden_dim=8,
+        vocab_size=16,
+        block_size=4,
+        use_attnres=True,
+        use_fused_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=1,
+        attnres_block_average=True,
+        attnres_key_norm=False,
+    )
+    model = OBPM(cfg)
+    embedding = torch.full((1, 2, cfg.n_embd), 1.0)
+    partial_sum = torch.full((1, 2, cfg.n_embd), 12.0)
+
+    actual = model._zero_block_read(
+        embedding,
+        completed_count=1,
+        partial_block=partial_sum,
+        partial_count=3,
+        partial_summary_idx=1,
+    )
+    expected = (embedding + partial_sum) / 4
+
+    assert torch.allclose(actual, expected)
 
 
 def _cuda_device():
