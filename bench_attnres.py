@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=True)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
     parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default="count")
+    parser.add_argument("--attnres_block_count_prior", type=_str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--no-attnres_block_count_prior", dest="attnres_block_count_prior", action="store_false")
     parser.add_argument("--attnres_block_learned_scale", type=_str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--no-attnres_block_learned_scale", dest="attnres_block_learned_scale", action="store_false")
     parser.add_argument(
@@ -108,6 +110,7 @@ def make_config(args, kind, fused=False, lrid_rank=None):
         attnres_num_blocks=args.attnres_num_blocks,
         attnres_block_average=args.attnres_block_average,
         attnres_block_average_mode=args.attnres_block_average_mode,
+        attnres_block_count_prior=args.attnres_block_count_prior,
         attnres_block_learned_scale=args.attnres_block_learned_scale,
         attnres_block_learned_scale_init=args.attnres_block_learned_scale_init,
         attnres_block_value_norm=args.attnres_block_value_norm,

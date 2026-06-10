@@ -186,7 +186,14 @@ def test_attnres_cached_phase2_applies_partial_count_prior():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_zero_block_read_is_count_weighted_with_block_average():
+@pytest.mark.parametrize(
+    "count_prior,expected_value",
+    [
+        (True, 13.0 / 4.0),
+        (False, 5.0 / 2.0),
+    ],
+)
+def test_zero_block_read_respects_count_prior_toggle(count_prior, expected_value):
     cfg = ModelConfig(
         n_layer=1,
         n_head=2,
@@ -199,6 +206,7 @@ def test_zero_block_read_is_count_weighted_with_block_average():
         attnres_type="block",
         attnres_num_blocks=1,
         attnres_block_average=True,
+        attnres_block_count_prior=count_prior,
         attnres_key_norm=False,
     )
     model = OBPM(cfg)
@@ -212,9 +220,62 @@ def test_zero_block_read_is_count_weighted_with_block_average():
         partial_count=3,
         partial_summary_idx=1,
     )
-    expected = (embedding + partial_sum) / 4
+    expected = torch.full_like(actual, expected_value)
 
     assert torch.allclose(actual, expected)
+
+
+@pytest.mark.parametrize("use_lrid", [False, True])
+@pytest.mark.parametrize("count_prior", [False, True])
+def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
+    cfg = ModelConfig(
+        n_layer=3,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=5,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_average=True,
+        attnres_block_count_prior=count_prior,
+        attnres_key_norm=False,
+        use_lrid=use_lrid,
+        lrid_rank=4,
+        lrid_num_heads=1,
+    )
+    model = OBPM(cfg).eval()
+    records = []
+    method_name = "_apply_lrid_attnres" if use_lrid else "_apply_attnres"
+    original = getattr(model, method_name)
+
+    def wrapped(residual_idx, sources, *args, **kwargs):
+        source_counts = kwargs.get("source_counts")
+        records.append((residual_idx, None if source_counts is None else list(source_counts)))
+        return original(residual_idx, sources, *args, **kwargs)
+
+    setattr(model, method_name, wrapped)
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    with torch.no_grad():
+        model(idx, return_hidden=True)
+
+    expected_with_prior = [
+        (0, [1]),
+        (1, [1, 1]),
+        (2, [1, 2]),
+        (3, [1, 3]),
+        (4, [1, 3, 1]),
+        (5, [1, 3, 2]),
+        (6, [1, 3, 3]),
+    ]
+    expected = (
+        expected_with_prior
+        if count_prior
+        else [(residual_idx, None) for residual_idx, _ in expected_with_prior]
+    )
+
+    assert records == expected
 
 
 def _cuda_device():

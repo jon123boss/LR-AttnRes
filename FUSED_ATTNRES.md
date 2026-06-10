@@ -53,6 +53,10 @@ out = lrid_attention_residual_read(
 # out: [B, T, D]
 ```
 
+Model block mode passes `source_counts` only when
+`attnres_block_count_prior=True`; `--no-attnres_block_count_prior` leaves block
+values averaged but removes the `log(count)` routing prior.
+
 Block training uses a cached-logit two-part read internally:
 
 - `attention_residual_phase1_from_logits(values, logits)` computes the

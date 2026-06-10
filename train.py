@@ -183,6 +183,7 @@ attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
 attnres_block_average = True
 attnres_block_average_mode = "count" # count or sqrt
+attnres_block_count_prior = True
 attnres_block_learned_scale = False
 attnres_block_learned_scale_init = "count" # count, sqrt, or one
 attnres_block_value_norm = False
@@ -488,6 +489,8 @@ def parse_args():
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=attnres_block_average)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
     parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default=attnres_block_average_mode)
+    parser.add_argument("--attnres_block_count_prior", type=_str_to_bool, nargs="?", const=True, default=attnres_block_count_prior)
+    parser.add_argument("--no-attnres_block_count_prior", dest="attnres_block_count_prior", action="store_false")
     parser.add_argument("--attnres_block_learned_scale", type=_str_to_bool, nargs="?", const=True, default=attnres_block_learned_scale)
     parser.add_argument("--no-attnres_block_learned_scale", dest="attnres_block_learned_scale", action="store_false")
     parser.add_argument(
@@ -575,6 +578,7 @@ attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
 attnres_block_average_mode = args.attnres_block_average_mode
+attnres_block_count_prior = args.attnres_block_count_prior
 attnres_block_learned_scale = args.attnres_block_learned_scale
 attnres_block_learned_scale_init = args.attnres_block_learned_scale_init
 attnres_block_value_norm = args.attnres_block_value_norm

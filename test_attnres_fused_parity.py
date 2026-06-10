@@ -303,6 +303,7 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg.use_fused_attnres is False
         assert cfg.lrid_key_from_output_tail is False
         assert cfg.attnres_block_average_mode == "count"
+        assert cfg.attnres_block_count_prior is True
         assert cfg.attnres_block_learned_scale is False
         assert cfg.attnres_block_learned_scale_init == "count"
         assert cfg.attnres_block_value_norm is False
@@ -324,12 +325,14 @@ def compatibility_check(device: torch.device) -> None:
         assert "use_fused_attnres" not in old_checkpoint_model_args
         assert "lrid_key_from_output_tail" not in old_checkpoint_model_args
         assert "attnres_block_average_mode" not in old_checkpoint_model_args
+        assert "attnres_block_count_prior" not in old_checkpoint_model_args
         assert "attnres_block_learned_scale" not in old_checkpoint_model_args
         assert "attnres_block_learned_scale_init" not in old_checkpoint_model_args
         assert "attnres_block_value_norm" not in old_checkpoint_model_args
         assert cfg_from_old_checkpoint.use_fused_attnres is False
         assert cfg_from_old_checkpoint.lrid_key_from_output_tail is False
         assert cfg_from_old_checkpoint.attnres_block_average_mode == "count"
+        assert cfg_from_old_checkpoint.attnres_block_count_prior is True
         assert cfg_from_old_checkpoint.attnres_block_learned_scale is False
         assert cfg_from_old_checkpoint.attnres_block_learned_scale_init == "count"
         assert cfg_from_old_checkpoint.attnres_block_value_norm is False
@@ -339,6 +342,7 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg_from_new_checkpoint.use_fused_attnres is False
         assert cfg_from_new_checkpoint.lrid_key_from_output_tail is False
         assert cfg_from_new_checkpoint.attnres_block_average_mode == "count"
+        assert cfg_from_new_checkpoint.attnres_block_count_prior is True
         assert cfg_from_new_checkpoint.attnres_block_learned_scale is False
         assert cfg_from_new_checkpoint.attnres_block_learned_scale_init == "count"
         assert cfg_from_new_checkpoint.attnres_block_value_norm is False

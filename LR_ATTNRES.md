@@ -341,8 +341,9 @@ By default, block summaries are means of the sublayer outputs in that block:
 selected denominator before using them as depth sources. The default denominator
 is the number of accumulated sublayers; set `--attnres_block_average_mode sqrt`
 to divide by the square root of that count. Each compressed block source also
-adds `log(count)` to its depth-routing logit so it receives the softmax prior
-mass of the sublayers it represents.
+adds `log(count)` to its depth-routing logit by default so it receives the
+softmax prior mass of the sublayers it represents. Use
+`--no-attnres_block_count_prior` to disable that logit prior for ablations.
 In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
 key by the denominator would be removed by the later RMSNorm. The fused dynamic
@@ -529,6 +530,7 @@ Model config:
 use_lrid: bool
 attnres_block_average: bool
 attnres_block_average_mode: "count" | "sqrt"
+attnres_block_count_prior: bool
 attnres_block_learned_scale: bool
 attnres_block_learned_scale_init: "count" | "sqrt" | "one"
 attnres_block_value_norm: bool
@@ -558,6 +560,8 @@ Training CLI:
 --attnres_block_average
 --no-attnres_block_average
 --attnres_block_average_mode {count,sqrt}
+--attnres_block_count_prior
+--no-attnres_block_count_prior
 --attnres_block_learned_scale
 --no-attnres_block_learned_scale
 --attnres_block_learned_scale_init {count,sqrt,one}
