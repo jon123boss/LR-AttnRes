@@ -342,8 +342,10 @@ selected denominator before using them as depth sources. The default denominator
 is the number of accumulated sublayers; set `--attnres_block_average_mode sqrt`
 to divide by the square root of that count. Each compressed block source also
 adds `log(count)` to its depth-routing logit by default so it receives the
-softmax prior mass of the sublayers it represents. Use
-`--no-attnres_block_count_prior` to disable that logit prior for ablations.
+softmax prior mass of the sublayers it represents. Disable this prior for
+ablations with `--no-attnres_block_count_prior`. It requires count-mean block
+summaries and is rejected for `sqrt`, learned-scale, raw-sum, or value-norm
+block summaries.
 In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
 key by the denominator would be removed by the later RMSNorm. The fused dynamic

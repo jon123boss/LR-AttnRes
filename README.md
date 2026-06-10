@@ -178,8 +178,10 @@ are configurable via `--attnres_key_norm`, `--attn_res_query_norm`, and
 `--attnres_block_average_mode sqrt` divides by the square root of the count.
 Block AttnRes also adds a `log(count)` depth-logit prior by default for each
 compressed block source so a block receives the softmax mass of the sublayers it
-represents. Disable this prior for ablations with
-`--no-attnres_block_count_prior`.
+represents. Disable it for ablations with `--no-attnres_block_count_prior`.
+This prior requires count-mean block summaries
+(`--attnres_block_average --attnres_block_average_mode count`) and is rejected
+for `sqrt`, learned-scale, raw-sum, or value-norm block summaries.
 For a learnable alternative, `--attnres_block_learned_scale` gives each live
 partial/completed block source its own scalar, initialized with
 `--attnres_block_learned_scale_init {count,sqrt,one}`. To remove block value

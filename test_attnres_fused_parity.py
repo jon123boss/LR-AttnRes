@@ -195,6 +195,12 @@ def common_model_kwargs(
     attnres_block_learned_scale_init: str = "count",
     attnres_block_value_norm: bool = False,
 ) -> dict:
+    attnres_block_count_prior = (
+        attnres_type == "block"
+        and attnres_block_average_mode == "count"
+        and not attnres_block_learned_scale
+        and not attnres_block_value_norm
+    )
     return dict(
         n_layer=3,
         n_head=4,
@@ -209,6 +215,7 @@ def common_model_kwargs(
         attnres_num_blocks=2,
         attnres_block_average=True,
         attnres_block_average_mode=attnres_block_average_mode,
+        attnres_block_count_prior=attnres_block_count_prior,
         attnres_block_learned_scale=attnres_block_learned_scale,
         attnres_block_learned_scale_init=attnres_block_learned_scale_init,
         attnres_block_value_norm=attnres_block_value_norm,

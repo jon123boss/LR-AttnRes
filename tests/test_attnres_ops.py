@@ -27,6 +27,7 @@ def test_attnres_block_average_mode_scales_block_source(mode, denominator):
         attnres_type="block",
         attnres_block_average=True,
         attnres_block_average_mode=mode,
+        attnres_block_count_prior=(mode == "count"),
         attnres_key_norm=False,
         use_lrid=True,
         lrid_rank=4,
@@ -66,6 +67,7 @@ def test_attnres_learned_block_scale_init_and_usage(init, expected):
         attnres_num_blocks=2,
         attnres_block_average=True,
         attnres_block_average_mode="count",
+        attnres_block_count_prior=False,
         attnres_block_learned_scale=True,
         attnres_block_learned_scale_init=init,
         attnres_key_norm=False,
@@ -98,6 +100,7 @@ def test_attnres_block_value_norm_overrides_scaling():
         attnres_type="block",
         attnres_block_average=True,
         attnres_block_average_mode="count",
+        attnres_block_count_prior=False,
         attnres_block_value_norm=True,
         attnres_key_norm=False,
         use_lrid=True,
@@ -155,6 +158,65 @@ def test_lrid_source_count_prior_matches_zero_query_uniform_average():
     assert torch.allclose(actual, expected)
 
 
+def test_attnres_source_count_prior_read_matches_torch_gradients():
+    torch.manual_seed(17)
+    counts = [1, 3, 2]
+    values_ref = [torch.randn(2, 3, 5, requires_grad=True) for _ in counts]
+    query_ref = torch.randn(5, requires_grad=True)
+    values_actual = [value.detach().clone().requires_grad_(True) for value in values_ref]
+    query_actual = query_ref.detach().clone().requires_grad_(True)
+
+    expected = attention_residual_read_torch(values_ref, query_ref, key_norm=True, source_counts=counts)
+    actual = attention_residual_read(values_actual, query_actual, key_norm=True, source_counts=counts)
+    expected.float().square().mean().backward()
+    actual.float().square().mean().backward()
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    for actual_value, expected_value in zip(values_actual, values_ref):
+        assert torch.allclose(actual_value.grad, expected_value.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(query_actual.grad, query_ref.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_lrid_source_count_prior_read_matches_torch_gradients():
+    torch.manual_seed(19)
+    counts = [1, 3, 2]
+    num_heads = 2
+    values_ref = [torch.randn(2, 3, 8, requires_grad=True) for _ in counts]
+    keys_ref = [torch.randn(2, 3, 6, requires_grad=True) for _ in counts]
+    query_ref = torch.randn(num_heads, 3, requires_grad=True)
+    values_actual = [value.detach().clone().requires_grad_(True) for value in values_ref]
+    keys_actual = [key.detach().clone().requires_grad_(True) for key in keys_ref]
+    query_actual = query_ref.detach().clone().requires_grad_(True)
+
+    expected = lrid_attention_residual_read_torch(
+        values_ref,
+        keys_ref,
+        query_ref,
+        num_heads=num_heads,
+        logit_scale=0.5,
+        key_norm=True,
+        source_counts=counts,
+    )
+    actual = lrid_attention_residual_read(
+        values_actual,
+        keys_actual,
+        query_actual,
+        num_heads=num_heads,
+        logit_scale=0.5,
+        key_norm=True,
+        source_counts=counts,
+    )
+    expected.float().square().mean().backward()
+    actual.float().square().mean().backward()
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    for actual_value, expected_value in zip(values_actual, values_ref):
+        assert torch.allclose(actual_value.grad, expected_value.grad, atol=1e-6, rtol=1e-6)
+    for actual_key, expected_key in zip(keys_actual, keys_ref):
+        assert torch.allclose(actual_key.grad, expected_key.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(query_actual.grad, query_ref.grad, atol=1e-6, rtol=1e-6)
+
+
 def test_attnres_cached_phase2_applies_partial_count_prior():
     torch.manual_seed(11)
     values = [torch.randn(2, 3, 6) for _ in range(2)]
@@ -184,6 +246,115 @@ def test_attnres_cached_phase2_applies_partial_count_prior():
     )
 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attnres_block_average": False},
+        {"attnres_block_average_mode": "sqrt"},
+        {"attnres_block_learned_scale": True},
+        {"attnres_block_value_norm": True},
+    ],
+)
+def test_count_prior_requires_count_mean_block_sources(overrides):
+    kwargs = dict(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_block_count_prior=True,
+    )
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match="attnres_block_count_prior requires count-mean block summaries"):
+        ModelConfig(**kwargs)
+
+
+@pytest.mark.parametrize("use_lrid", [False, True])
+def test_count_prior_uses_cached_fused_block_path(use_lrid):
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        use_fused_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=1,
+        attnres_block_average=True,
+        attnres_block_average_mode="count",
+        attnres_block_count_prior=True,
+        attnres_training_cache_phase1=True,
+        use_lrid=use_lrid,
+        lrid_rank=4,
+        lrid_num_heads=1,
+    )
+    model = OBPM(cfg).train()
+
+    if use_lrid:
+        assert not model._use_block_attnres_fused_training_path(None, False)
+        assert model._use_block_lrid_attnres_fused_training_path(None, False)
+    else:
+        assert model._use_block_attnres_fused_training_path(None, False)
+        assert not model._use_block_lrid_attnres_fused_training_path(None, False)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("use_lrid", [False, True])
+def test_fused_count_prior_matches_unfused_training_gradients(use_lrid, device_name):
+    device = torch.device("cpu") if device_name == "cpu" else _cuda_device()
+    atol = 2e-6 if device.type == "cpu" else 3e-4
+    rtol = 2e-6 if device.type == "cpu" else 3e-4
+    cfg_kwargs = dict(
+        n_layer=2,
+        n_head=2,
+        n_embd=16,
+        mlp_hidden_dim=32,
+        vocab_size=64,
+        block_size=6,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_average=True,
+        attnres_block_average_mode="count",
+        attnres_block_count_prior=True,
+        attn_res_query_init="normal",
+        use_lrid=use_lrid,
+        lrid_rank=8,
+        lrid_num_heads=1,
+    )
+    torch.manual_seed(21)
+    ref = OBPM(ModelConfig(**cfg_kwargs, use_fused_attnres=False)).to(device).train()
+    fused = OBPM(ModelConfig(**cfg_kwargs, use_fused_attnres=True)).to(device).train()
+    fused.load_state_dict(ref.state_dict(), strict=True)
+    if use_lrid:
+        assert fused._use_block_lrid_attnres_fused_training_path(None, False)
+    else:
+        assert fused._use_block_attnres_fused_training_path(None, False)
+
+    idx = torch.randint(0, cfg_kwargs["vocab_size"], (2, cfg_kwargs["block_size"]), device=device)
+    ref_output = ref(idx, return_hidden=True)
+    fused_output = fused(idx, return_hidden=True)
+    ref_loss = ref_output.float().square().mean()
+    fused_loss = fused_output.float().square().mean()
+    ref_loss.backward()
+    fused_loss.backward()
+
+    assert torch.allclose(fused_output, ref_output, atol=atol, rtol=rtol)
+    for (ref_name, ref_param), (fused_name, fused_param) in zip(ref.named_parameters(), fused.named_parameters()):
+        assert ref_name == fused_name
+        if ref_param.grad is None and fused_param.grad is None:
+            continue
+        assert ref_param.grad is not None
+        assert fused_param.grad is not None
+        assert torch.allclose(fused_param.grad, ref_param.grad, atol=atol, rtol=rtol), ref_name
 
 
 @pytest.mark.parametrize("use_lrid", [False, True])

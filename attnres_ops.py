@@ -2168,6 +2168,48 @@ def attention_residual_read_torch(values, query: Tensor, key_norm: bool, source_
     return _attnres_read_torch_stacked(values, query, key_norm, source_counts)
 
 
+def _attnres_read_from_count_logits(
+    values,
+    query: Tensor,
+    key_norm: bool,
+    source_counts,
+    force_triton: bool = False,
+    normalize_output: bool = False,
+) -> Tensor:
+    if isinstance(values, Tensor):
+        values = _as_stacked(values)
+        query = query.to(values.dtype)
+        keys = _norm(values) if key_norm else values
+        logits = torch.einsum("d,sbtd->sbt", query, keys)
+        log_count_bias = _source_log_count_bias(source_counts, values.size(0), logits.device)
+        if log_count_bias is not None:
+            logits = logits + log_count_bias.view(-1, 1, 1)
+        output, _ = attention_residual_phase1_from_logits(
+            values,
+            logits.unsqueeze(0),
+            force_triton=force_triton,
+            normalize_output=normalize_output,
+        )
+        return output[0]
+
+    query = query.to(values[0].dtype)
+    log_count_bias = _source_log_count_bias(source_counts, len(values), values[0].device)
+    logits = []
+    for idx, value in enumerate(values):
+        key = _norm(value) if key_norm else value
+        logit = torch.sum(key * query, dim=-1)
+        if log_count_bias is not None:
+            logit = logit + log_count_bias[idx]
+        logits.append(logit)
+    output, _ = attention_residual_phase1_from_logits(
+        values,
+        torch.stack(logits, dim=0).unsqueeze(0),
+        force_triton=force_triton,
+        normalize_output=normalize_output,
+    )
+    return output[0]
+
+
 def _attnres_read_triton(values: Tensor, query: Tensor, key_norm: bool, normalize_output: bool = False) -> Tensor:
     S, B, T, D = values.shape
     n_tokens = B * T
@@ -2413,6 +2455,15 @@ def attention_residual_read(
             output = values[0]
             return _norm(output) if normalize_output else output
         query = query.to(values[0].dtype)
+        if source_counts is not None:
+            return _attnres_read_from_count_logits(
+                values,
+                query,
+                key_norm,
+                source_counts,
+                force_triton=force_triton,
+                normalize_output=normalize_output,
+            )
         if torch.is_grad_enabled():
             if source_counts is None and _use_triton_training_kernel() and _can_use_triton_attnres_list(values, query):
                 return _TritonAttentionResidualListRead.apply(
@@ -2422,8 +2473,6 @@ def attention_residual_read(
                     *values,
                 )
             else:
-                if source_counts is not None and force_triton:
-                    raise RuntimeError("Triton fused AttnRes path does not support source_counts")
                 output = _attnres_read_torch_list(values, query, key_norm, source_counts)
             return _norm(output) if normalize_output else output
         if source_counts is None and _can_use_triton_attnres_list(values, query):
@@ -2438,6 +2487,15 @@ def attention_residual_read(
         output = values[0]
         return _norm(output) if normalize_output else output
     query = query.to(values.dtype)
+    if source_counts is not None:
+        return _attnres_read_from_count_logits(
+            values,
+            query,
+            key_norm,
+            source_counts,
+            force_triton=force_triton,
+            normalize_output=normalize_output,
+        )
     if source_counts is None and _can_use_triton(values, query):
         return _TritonAttentionResidualRead.apply(values, query, bool(key_norm), bool(normalize_output))
     if force_triton:
@@ -4128,6 +4186,64 @@ def lrid_attention_residual_read_torch(
     return _lrid_read_torch_stacked(values, keys, query, num_heads, logit_scale, key_norm, source_counts)
 
 
+def _lrid_read_from_count_logits(
+    values,
+    keys,
+    query: Tensor,
+    num_heads: int,
+    logit_scale: float,
+    key_norm: bool,
+    source_counts,
+    force_triton: bool = False,
+    normalize_output: bool = False,
+) -> Tensor:
+    values = _as_stacked(values)
+    keys = _as_stacked(keys)
+    num_heads = int(num_heads)
+    S, B, T, D = values.shape
+    key_head_dim = keys.size(-1) // num_heads
+    value_head_dim = D // num_heads
+
+    key_views = keys.reshape(S, B, T, num_heads, key_head_dim)
+    value_views = values.reshape(S, B, T, num_heads, value_head_dim)
+    if key_norm:
+        key_views = _norm(key_views.float()).to(values.dtype)
+
+    query = query.to(key_views.dtype)
+    if query.dim() == 4:
+        logits = torch.einsum("sbthr,bthr->sbth", key_views, query) * float(logit_scale)
+    else:
+        logits = torch.einsum("sbthr,hr->sbth", key_views, query) * float(logit_scale)
+    log_count_bias = _source_log_count_bias(source_counts, S, logits.device)
+    if log_count_bias is not None:
+        logits = logits + log_count_bias.view(S, 1, 1, 1)
+
+    phase_values = (
+        value_views
+        .permute(0, 1, 3, 2, 4)
+        .reshape(S, B * num_heads, T, value_head_dim)
+    )
+    phase_logits = (
+        logits
+        .permute(0, 1, 3, 2)
+        .reshape(S, B * num_heads, T)
+        .unsqueeze(0)
+    )
+    output, _ = attention_residual_phase1_from_logits(
+        phase_values,
+        phase_logits,
+        force_triton=force_triton,
+        normalize_output=False,
+    )
+    output = (
+        output[0]
+        .reshape(B, num_heads, T, value_head_dim)
+        .permute(0, 2, 1, 3)
+        .reshape(B, T, D)
+    )
+    return _norm(output) if normalize_output else output
+
+
 
 def _can_use_triton_lrid_list(values, keys, query: Tensor) -> bool:
     if not _TRITON_AVAILABLE or isinstance(values, Tensor) or isinstance(keys, Tensor):
@@ -4656,6 +4772,18 @@ def lrid_attention_residual_read(
     query = query.to(key_dtype)
 
     use_fused_output_norm = normalize_output and int(num_heads) == 1
+    if source_counts is not None:
+        return _lrid_read_from_count_logits(
+            values,
+            keys,
+            query,
+            num_heads,
+            logit_scale,
+            key_norm,
+            source_counts,
+            force_triton=force_triton,
+            normalize_output=normalize_output,
+        )
     if source_counts is None and _can_use_triton_lrid_list(values, keys, query):
         if torch.is_grad_enabled():
             training_kernel_mode = _training_kernel_mode()
