@@ -57,6 +57,7 @@ class WandbLogger:
         self.wandb.define_metric("tokens_per_s", step_metric="tokens_processed")
         self.wandb.define_metric("gpu/*", step_metric="tokens_processed")
         self.wandb.define_metric("lambdas/*", step_metric="tokens_processed")
+        self.wandb.define_metric("attnres_block_scales/*", step_metric="tokens_processed")
         self.wandb.define_metric("model/num_params", step_metric="tokens_processed")
 
         self.active = True
@@ -131,6 +132,26 @@ class WandbLogger:
         for key, value in lambda_dict.items():
             log_dict[f"lambdas/{key}"] = float(value)
         
+        self.run.log(log_dict)
+
+    def log_attnres_block_scales(self, scales, block_ends, tokens_processed):
+        if not self.active or scales is None:
+            return
+        if hasattr(scales, "detach"):
+            scales = scales.detach().float().cpu().tolist()
+        else:
+            scales = [float(scale) for scale in scales]
+        block_ends = set(int(idx) for idx in (block_ends or ()))
+        log_dict = {
+            "tokens_processed": int(tokens_processed),
+        }
+        for source_idx, scale in enumerate(scales, start=1):
+            source_kind = "completed" if source_idx in block_ends else "partial"
+            log_dict[f"attnres_block_scales/source_{source_idx:03d}_{source_kind}"] = float(scale)
+        if scales:
+            log_dict["attnres_block_scales/min"] = float(min(scales))
+            log_dict["attnres_block_scales/max"] = float(max(scales))
+            log_dict["attnres_block_scales/mean"] = float(sum(scales) / len(scales))
         self.run.log(log_dict)
 
     def log_checkpoint(self, step, ckpt_path, config=None, artifact_name_prefix="obpm-ckpt-step"):

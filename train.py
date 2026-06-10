@@ -997,6 +997,16 @@ while tokens_processed < max_tokens and step < max_steps:
             peak_gpu_memory_gb=peak_gpu_memory_gb,
             peak_gpu_memory_reserved_gb=peak_gpu_memory_reserved_gb,
         )
+        raw_model = unwrap_model(model)
+        if (
+            getattr(raw_model.config, "attnres_block_learned_scale", False)
+            and hasattr(raw_model.transformer, "attnres_block_scales")
+        ):
+            logger.log_attnres_block_scales(
+                raw_model.transformer.attnres_block_scales,
+                raw_model.attnres_block_ends,
+                tokens_processed,
+            )
 
     if step % log_interval == 0:
         norm_str = f"{norm:.2f}" if norm is not None else "N/A"
