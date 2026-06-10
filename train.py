@@ -149,7 +149,7 @@ ddp_preserve_global_batch = True
 ddp_find_unused_parameters = False
 # torch.compile
 torch_compile = True
-torch_compile_max_autotune = False
+torch_compile_max_autotune = True
 torch_compile_cudagraphs = False
 torch_compile_cache_dir = _DEFAULT_TORCH_COMPILE_CACHE_DIR
 # Full run automation
