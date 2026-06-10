@@ -197,7 +197,6 @@ def common_model_kwargs(
 ) -> dict:
     attnres_block_count_prior = (
         attnres_type == "block"
-        and attnres_block_average_mode == "count"
         and not attnres_block_learned_scale
         and not attnres_block_value_norm
     )

@@ -54,7 +54,7 @@ out = lrid_attention_residual_read(
 ```
 
 Model block mode passes `source_counts` only when
-`attnres_block_count_prior=True`, which is the default for count-mean block
+`attnres_block_count_prior=True`, which is the default for averaged block
 summaries. Count-biased direct reads and cached block-training reads use the
 cached-logit fused phase1 path, so the `log(count)` prior stays on the fused
 AttnRes path.

@@ -118,14 +118,13 @@ class ModelConfig:
             and self.attnres_block_count_prior
             and (
                 not self.attnres_block_average
-                or self.attnres_block_average_mode != "count"
                 or self.attnres_block_learned_scale
                 or self.attnres_block_value_norm
             )
         ):
             raise ValueError(
-                "attnres_block_count_prior requires count-mean block summaries: "
-                "attnres_block_average=True, attnres_block_average_mode='count', "
+                "attnres_block_count_prior requires averaged block summaries: "
+                "attnres_block_average=True, "
                 "attnres_block_learned_scale=False, and attnres_block_value_norm=False"
             )
         self.attn_res_query_init = (self.attn_res_query_init or "zero").lower()

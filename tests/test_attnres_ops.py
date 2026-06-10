@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import model as model_module
 from attnres_ops import (
     attention_residual_phase1_from_logits,
     attention_residual_phase2,
@@ -27,7 +28,7 @@ def test_attnres_block_average_mode_scales_block_source(mode, denominator):
         attnres_type="block",
         attnres_block_average=True,
         attnres_block_average_mode=mode,
-        attnres_block_count_prior=(mode == "count"),
+        attnres_block_count_prior=True,
         attnres_key_norm=False,
         use_lrid=True,
         lrid_rank=4,
@@ -252,12 +253,11 @@ def test_attnres_cached_phase2_applies_partial_count_prior():
     "overrides",
     [
         {"attnres_block_average": False},
-        {"attnres_block_average_mode": "sqrt"},
         {"attnres_block_learned_scale": True},
         {"attnres_block_value_norm": True},
     ],
 )
-def test_count_prior_requires_count_mean_block_sources(overrides):
+def test_count_prior_requires_averaged_block_sources(overrides):
     kwargs = dict(
         n_layer=1,
         n_head=2,
@@ -271,8 +271,27 @@ def test_count_prior_requires_count_mean_block_sources(overrides):
     )
     kwargs.update(overrides)
 
-    with pytest.raises(ValueError, match="attnres_block_count_prior requires count-mean block summaries"):
+    with pytest.raises(ValueError, match="attnres_block_count_prior requires averaged block summaries"):
         ModelConfig(**kwargs)
+
+
+def test_count_prior_allows_sqrt_block_average():
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_block_average=True,
+        attnres_block_average_mode="sqrt",
+        attnres_block_count_prior=True,
+    )
+
+    assert cfg.attnres_block_average_mode == "sqrt"
+    assert cfg.attnres_block_count_prior
 
 
 @pytest.mark.parametrize("use_lrid", [False, True])
@@ -304,6 +323,61 @@ def test_count_prior_uses_cached_fused_block_path(use_lrid):
     else:
         assert model._use_block_attnres_fused_training_path(None, False)
         assert not model._use_block_lrid_attnres_fused_training_path(None, False)
+
+
+@pytest.mark.parametrize("use_lrid", [False, True])
+def test_cached_fused_block_path_respects_count_prior_toggle(use_lrid, monkeypatch):
+    cfg_kwargs = dict(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        use_fused_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_average=True,
+        attnres_block_average_mode="count",
+        attn_res_query_init="normal",
+        attnres_training_cache_phase1=True,
+        use_lrid=use_lrid,
+        lrid_rank=4,
+        lrid_num_heads=1,
+    )
+    torch.manual_seed(31)
+    no_prior = OBPM(ModelConfig(**cfg_kwargs, attnres_block_count_prior=False)).train()
+    with_prior = OBPM(ModelConfig(**cfg_kwargs, attnres_block_count_prior=True)).train()
+    with_prior.load_state_dict(no_prior.state_dict(), strict=True)
+    idx = torch.randint(0, cfg_kwargs["vocab_size"], (2, cfg_kwargs["block_size"]))
+
+    original_phase1 = model_module.attention_residual_phase1_from_logits
+    captured = []
+
+    def wrapped_phase1(values, logits, *args, **kwargs):
+        captured.append(logits.detach().cpu())
+        return original_phase1(values, logits, *args, **kwargs)
+
+    monkeypatch.setattr(model_module, "attention_residual_phase1_from_logits", wrapped_phase1)
+    with torch.no_grad():
+        no_prior(idx, return_hidden=True)
+    no_prior_logits = captured[0]
+    captured.clear()
+
+    with torch.no_grad():
+        with_prior(idx, return_hidden=True)
+    prior_logits = captured[0]
+
+    assert no_prior_logits.size(1) == 2
+    diff = prior_logits - no_prior_logits
+    assert torch.allclose(diff[:, 0], torch.zeros_like(diff[:, 0]), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        diff[:, 1],
+        torch.full_like(diff[:, 1], torch.log(torch.tensor(2.0)).item()),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
