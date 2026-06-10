@@ -839,10 +839,18 @@ class OBPM(nn.Module):
         if self.training or not self.config.use_fused_attnres or not self._zero_query_fastpath_enabled:
             return False
         params = self._iter_attnres_query_params()
-        return len(params) == len(self._zero_query_fastpath_versions) and all(
+        versions_match = len(params) == len(self._zero_query_fastpath_versions) and all(
             param._version == version
             for param, version in zip(params, self._zero_query_fastpath_versions)
         )
+        if not versions_match:
+            self._zero_query_fastpath_enabled = False
+            return False
+        if not all(torch.count_nonzero(param.detach()).item() == 0 for param in params):
+            self._zero_query_fastpath_enabled = False
+            self._zero_query_fastpath_versions = ()
+            return False
+        return True
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         try:
