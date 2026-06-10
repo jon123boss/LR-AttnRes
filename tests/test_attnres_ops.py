@@ -41,6 +41,83 @@ def test_attnres_block_average_mode_scales_block_source(mode, denominator):
     assert torch.allclose(lrid_key, key / denominator)
 
 
+@pytest.mark.parametrize(
+    "init,expected",
+    [
+        ("count", [1.0, 0.5, 1.0, 0.5]),
+        ("sqrt", [1.0, 2.0 ** -0.5, 1.0, 2.0 ** -0.5]),
+        ("one", [1.0, 1.0, 1.0, 1.0]),
+        ("1/c", [1.0, 0.5, 1.0, 0.5]),
+        ("1/sqrtc", [1.0, 2.0 ** -0.5, 1.0, 2.0 ** -0.5]),
+        ("1", [1.0, 1.0, 1.0, 1.0]),
+    ],
+)
+def test_attnres_learned_block_scale_init_and_usage(init, expected):
+    cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_average=True,
+        attnres_block_average_mode="count",
+        attnres_block_learned_scale=True,
+        attnres_block_learned_scale_init=init,
+        attnres_key_norm=False,
+        use_lrid=True,
+        lrid_rank=4,
+        lrid_num_heads=1,
+    )
+    model = OBPM(cfg)
+    expected = torch.tensor(expected)
+    assert torch.allclose(model.transformer.attnres_block_scales.detach(), expected)
+
+    value = torch.full((1, 2, cfg.n_embd), 8.0)
+    key = torch.full((1, 2, cfg.lrid_rank), 4.0)
+    scale = expected[1]
+    assert torch.allclose(model._attnres_block_summary(value, 2, summary_idx=2), value * scale)
+    lrid_value, lrid_key = model._lrid_block_source(value, key, count=2, summary_idx=2)
+    assert torch.allclose(lrid_value, value * scale)
+    assert torch.allclose(lrid_key, key * scale)
+
+
+def test_attnres_block_value_norm_overrides_scaling():
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_block_average=True,
+        attnres_block_average_mode="count",
+        attnres_block_value_norm=True,
+        attnres_key_norm=False,
+        use_lrid=True,
+        lrid_rank=4,
+        lrid_num_heads=1,
+    )
+    model = OBPM(cfg)
+    value = torch.arange(1, 17, dtype=torch.float32).reshape(1, 2, cfg.n_embd)
+    key = torch.full((1, 2, cfg.lrid_rank), 4.0)
+
+    block_source = model._attnres_block_summary(value, 4, summary_idx=1)
+    rms = block_source.pow(2).mean(dim=-1).sqrt()
+    assert torch.allclose(rms, torch.ones_like(rms), atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(block_source, value / 4)
+
+    lrid_value, lrid_key = model._lrid_block_source(value, key, count=4, summary_idx=1)
+    lrid_rms = lrid_value.pow(2).mean(dim=-1).sqrt()
+    assert torch.allclose(lrid_rms, torch.ones_like(lrid_rms), atol=1e-6, rtol=1e-6)
+    assert torch.equal(lrid_key, key)
+
+
 def _cuda_device():
     if not torch.cuda.is_available() or not is_fused_attnres_available():
         pytest.skip("CUDA/Triton fused AttnRes path is not available")

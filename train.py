@@ -183,6 +183,9 @@ attnres_type = "block" # "full" or "block"
 attnres_num_blocks = 8
 attnres_block_average = False
 attnres_block_average_mode = "count" # count or sqrt
+attnres_block_learned_scale = False
+attnres_block_learned_scale_init = "count" # count, sqrt, or one
+attnres_block_value_norm = False
 attnres_key_norm = True
 attn_res_query_norm = False
 attn_res_query_init = "zero" # zero, normal, trunc_normal
@@ -485,6 +488,15 @@ def parse_args():
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=attnres_block_average)
     parser.add_argument("--no-attnres_block_average", dest="attnres_block_average", action="store_false")
     parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default=attnres_block_average_mode)
+    parser.add_argument("--attnres_block_learned_scale", type=_str_to_bool, nargs="?", const=True, default=attnres_block_learned_scale)
+    parser.add_argument("--no-attnres_block_learned_scale", dest="attnres_block_learned_scale", action="store_false")
+    parser.add_argument(
+        "--attnres_block_learned_scale_init",
+        choices=("count", "sqrt", "one", "1/c", "1/sqrtc", "1"),
+        default=attnres_block_learned_scale_init,
+    )
+    parser.add_argument("--attnres_block_value_norm", type=_str_to_bool, nargs="?", const=True, default=attnres_block_value_norm)
+    parser.add_argument("--no-attnres_block_value_norm", dest="attnres_block_value_norm", action="store_false")
     parser.add_argument("--attnres_key_norm", type=_str_to_bool, nargs="?", const=True, default=attnres_key_norm)
     parser.add_argument("--no-attnres_key_norm", dest="attnres_key_norm", action="store_false")
     parser.add_argument("--attn_res_query_norm", type=_str_to_bool, nargs="?", const=True, default=attn_res_query_norm)
@@ -563,6 +575,9 @@ attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
 attnres_block_average_mode = args.attnres_block_average_mode
+attnres_block_learned_scale = args.attnres_block_learned_scale
+attnres_block_learned_scale_init = args.attnres_block_learned_scale_init
+attnres_block_value_norm = args.attnres_block_value_norm
 attnres_key_norm = args.attnres_key_norm
 attn_res_query_norm = args.attn_res_query_norm
 attn_res_query_init = args.attn_res_query_init

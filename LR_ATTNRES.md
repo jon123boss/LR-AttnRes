@@ -159,6 +159,15 @@ partial block or completed block source value, mirroring outside source keys.
 When `--attnres_block_average` is enabled, that source value is scaled by the
 selected block-average denominator: the count by default, or the square root of
 the count with `--attnres_block_average_mode sqrt`.
+When `--attnres_block_learned_scale` is enabled, this fixed denominator is
+replaced by one learned scalar per partial/completed block source. The scalar is
+indexed by the residual source position: a live partial source after sublayer
+`i` uses the same scalar that the completed block ending at `i` will keep. The
+initializer is selected by `--attnres_block_learned_scale_init`: `count` starts
+from `1/c`, `sqrt` starts from `1/sqrt(c)`, and `one` starts from the raw sum.
+When `--attnres_block_value_norm` is enabled, the block source value is instead
+stateless RMS-normalized to unit RMS scale. This overrides fixed averaging and
+is mutually exclusive with learned block scaling.
 
 The token embedding is also a depth source, so it gets its own low-rank key projection:
 
@@ -336,6 +345,11 @@ In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
 key by the denominator would be removed by the later RMSNorm. The fused dynamic
 query, when enabled, remains the latest emitted query rather than an average.
+The same rule applies to learned scales: source values are always scaled, while
+precomputed LRID source keys are scaled only when key normalization is disabled.
+With block value normalization, precomputed LRID keys are left unchanged; keys
+projected from block values see the normalized value because the projection is
+applied after the block value normalization.
 
 When `--lrid_key_from_value` is enabled, block keys are not averaged separately.
 The key is projected from the current block source value, so any configured
@@ -513,6 +527,9 @@ Model config:
 use_lrid: bool
 attnres_block_average: bool
 attnres_block_average_mode: "count" | "sqrt"
+attnres_block_learned_scale: bool
+attnres_block_learned_scale_init: "count" | "sqrt" | "one"
+attnres_block_value_norm: bool
 attnres_key_norm: bool
 attn_res_query_norm: bool
 attn_res_query_init: "zero" | "normal" | "trunc_normal"
@@ -539,6 +556,11 @@ Training CLI:
 --attnres_block_average
 --no-attnres_block_average
 --attnres_block_average_mode {count,sqrt}
+--attnres_block_learned_scale
+--no-attnres_block_learned_scale
+--attnres_block_learned_scale_init {count,sqrt,one}
+--attnres_block_value_norm
+--no-attnres_block_value_norm
 --attnres_key_norm
 --no-attnres_key_norm
 --attn_res_query_norm

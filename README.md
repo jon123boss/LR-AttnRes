@@ -176,6 +176,11 @@ are configurable via `--attnres_key_norm`, `--attn_res_query_norm`, and
 `--attn_res_query_init`. Block summaries can be averaged with
 `--attnres_block_average`; by default this divides by the sublayer count, and
 `--attnres_block_average_mode sqrt` divides by the square root of the count.
+For a learnable alternative, `--attnres_block_learned_scale` gives each live
+partial/completed block source its own scalar, initialized with
+`--attnres_block_learned_scale_init {count,sqrt,one}`. To remove block value
+scale directly, `--attnres_block_value_norm` applies stateless RMSNorm to each
+block source value instead of scalar scaling.
 
 See [LR_ATTNRES.md](LR_ATTNRES.md) for the full design note, parameter cost,
 stability rationale, and experiment matrix.

@@ -187,7 +187,14 @@ def direct_lrid_output_tail_check(
     assert_close("lrid output-tail grad query", query_fused.grad, query_ref.grad, atol, rtol)
 
 
-def common_model_kwargs(use_lrid: bool, attnres_type: str, attnres_block_average_mode: str = "count") -> dict:
+def common_model_kwargs(
+    use_lrid: bool,
+    attnres_type: str,
+    attnres_block_average_mode: str = "count",
+    attnres_block_learned_scale: bool = False,
+    attnres_block_learned_scale_init: str = "count",
+    attnres_block_value_norm: bool = False,
+) -> dict:
     return dict(
         n_layer=3,
         n_head=4,
@@ -202,6 +209,9 @@ def common_model_kwargs(use_lrid: bool, attnres_type: str, attnres_block_average
         attnres_num_blocks=2,
         attnres_block_average=True,
         attnres_block_average_mode=attnres_block_average_mode,
+        attnres_block_learned_scale=attnres_block_learned_scale,
+        attnres_block_learned_scale_init=attnres_block_learned_scale_init,
+        attnres_block_value_norm=attnres_block_value_norm,
         attnres_key_norm=True,
         attn_res_query_init="normal",
         use_lrid=use_lrid,
@@ -218,6 +228,9 @@ def model_parity_check(
     attnres_type: str,
     lrid_key_from_output_tail: bool,
     attnres_block_average_mode: str,
+    attnres_block_learned_scale: bool,
+    attnres_block_learned_scale_init: str,
+    attnres_block_value_norm: bool,
     atol: float,
     rtol: float,
 ) -> None:
@@ -227,8 +240,19 @@ def model_parity_check(
         + (0 if attnres_type == "block" else 10)
         + (100 if lrid_key_from_output_tail else 0)
         + (1000 if attnres_block_average_mode == "sqrt" else 0)
+        + (2000 if attnres_block_learned_scale else 0)
+        + (3000 if attnres_block_learned_scale_init == "sqrt" else 0)
+        + (4000 if attnres_block_learned_scale_init == "one" else 0)
+        + (5000 if attnres_block_value_norm else 0)
     )
-    kwargs = common_model_kwargs(use_lrid, attnres_type, attnres_block_average_mode)
+    kwargs = common_model_kwargs(
+        use_lrid,
+        attnres_type,
+        attnres_block_average_mode,
+        attnres_block_learned_scale,
+        attnres_block_learned_scale_init,
+        attnres_block_value_norm,
+    )
     if use_lrid:
         kwargs["lrid_key_from_output_tail"] = lrid_key_from_output_tail
     ref = OBPM(ModelConfig(**kwargs, use_fused_attnres=False)).to(device=device, dtype=dtype).train()
@@ -247,7 +271,9 @@ def model_parity_check(
 
     prefix = (
         f"model use_lrid={use_lrid} tail_key={lrid_key_from_output_tail} "
-        f"type={attnres_type} block_avg_mode={attnres_block_average_mode}"
+        f"type={attnres_type} block_avg_mode={attnres_block_average_mode} "
+        f"learned_scale={attnres_block_learned_scale} learned_init={attnres_block_learned_scale_init} "
+        f"value_norm={attnres_block_value_norm}"
     )
     assert_close(f"{prefix} forward", actual, expected, atol, rtol)
     assert_close(f"{prefix} embedding grad", fused.transformer.wte.weight.grad, ref.transformer.wte.weight.grad, atol, rtol)
@@ -277,6 +303,9 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg.use_fused_attnres is False
         assert cfg.lrid_key_from_output_tail is False
         assert cfg.attnres_block_average_mode == "count"
+        assert cfg.attnres_block_learned_scale is False
+        assert cfg.attnres_block_learned_scale_init == "count"
+        assert cfg.attnres_block_value_norm is False
         if cfg.use_lrid:
             assert cfg.lrid_projection_rank == cfg.lrid_rank
 
@@ -295,15 +324,24 @@ def compatibility_check(device: torch.device) -> None:
         assert "use_fused_attnres" not in old_checkpoint_model_args
         assert "lrid_key_from_output_tail" not in old_checkpoint_model_args
         assert "attnres_block_average_mode" not in old_checkpoint_model_args
+        assert "attnres_block_learned_scale" not in old_checkpoint_model_args
+        assert "attnres_block_learned_scale_init" not in old_checkpoint_model_args
+        assert "attnres_block_value_norm" not in old_checkpoint_model_args
         assert cfg_from_old_checkpoint.use_fused_attnres is False
         assert cfg_from_old_checkpoint.lrid_key_from_output_tail is False
         assert cfg_from_old_checkpoint.attnres_block_average_mode == "count"
+        assert cfg_from_old_checkpoint.attnres_block_learned_scale is False
+        assert cfg_from_old_checkpoint.attnres_block_learned_scale_init == "count"
+        assert cfg_from_old_checkpoint.attnres_block_value_norm is False
 
         roundtrip_args = asdict(cfg_from_old_checkpoint)
         cfg_from_new_checkpoint = ModelConfig(**roundtrip_args)
         assert cfg_from_new_checkpoint.use_fused_attnres is False
         assert cfg_from_new_checkpoint.lrid_key_from_output_tail is False
         assert cfg_from_new_checkpoint.attnres_block_average_mode == "count"
+        assert cfg_from_new_checkpoint.attnres_block_learned_scale is False
+        assert cfg_from_new_checkpoint.attnres_block_learned_scale_init == "count"
+        assert cfg_from_new_checkpoint.attnres_block_value_norm is False
         print(f"PASS compat old {name} model_args defaults")
 
     tail_cfg = ModelConfig(**old_lrid_args, lrid_key_from_output_tail=True)
@@ -353,6 +391,37 @@ def main() -> None:
                             attnres_type,
                             lrid_key_from_output_tail,
                             attnres_block_average_mode,
+                            False,
+                            "count",
+                            False,
+                            atol,
+                            rtol,
+                        )
+                    if attnres_type == "block":
+                        for attnres_block_learned_scale_init in ["count", "sqrt", "one"]:
+                            model_parity_check(
+                                device,
+                                dtype,
+                                use_lrid,
+                                attnres_type,
+                                lrid_key_from_output_tail,
+                                "count",
+                                True,
+                                attnres_block_learned_scale_init,
+                                False,
+                                atol,
+                                rtol,
+                            )
+                        model_parity_check(
+                            device,
+                            dtype,
+                            use_lrid,
+                            attnres_type,
+                            lrid_key_from_output_tail,
+                            "count",
+                            False,
+                            "count",
+                            True,
                             atol,
                             rtol,
                         )

@@ -1016,7 +1016,10 @@ def main() -> None:
                 f"{key}: n_layer={loaded.model_config.n_layer}, "
                 f"attnres_type={loaded.model_config.attnres_type}, "
                 f"block_average={loaded.model_config.attnres_block_average}, "
-                f"block_average_mode={loaded.model_config.attnres_block_average_mode}"
+                f"block_average_mode={loaded.model_config.attnres_block_average_mode}, "
+                f"block_learned_scale={loaded.model_config.attnres_block_learned_scale}, "
+                f"block_learned_scale_init={loaded.model_config.attnres_block_learned_scale_init}, "
+                f"block_value_norm={loaded.model_config.attnres_block_value_norm}"
             )
 
             if val_loader is None:
