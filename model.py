@@ -815,6 +815,10 @@ class OBPM(nn.Module):
                     self._init_lrid_dynamic_query_projection(module, config.init_std, config.init_cutoff_factor)
     def to_mixed_precision(self, dtype=torch.bfloat16):
         self.to(dtype=dtype)
+        for name in ("attnres_block_alphas", "attnres_block_betas"):
+            if hasattr(self.transformer, name):
+                param = getattr(self.transformer, name)
+                param.data = param.data.float()
         return self
     
     def get_num_params(self):
@@ -878,7 +882,7 @@ class OBPM(nn.Module):
             return 2 * self.config.n_layer
         return int(self.config.attnres_num_blocks)
 
-    def _attnres_block_power_values(self, kind):
+    def _attnres_block_power_value_list(self, kind):
         if kind == "alpha":
             value = self.config.attnres_block_alpha
             scope = self.config.attnres_block_alpha_scope
@@ -896,6 +900,10 @@ class OBPM(nn.Module):
             values = [value] * length
         else:
             values = value
+        return [float(power) for power in values]
+
+    def _attnres_block_power_values(self, kind):
+        values = self._attnres_block_power_value_list(kind)
         return torch.tensor(values, dtype=torch.float32)
 
     def _make_attnres_block_power_init(self, kind):
@@ -930,11 +938,11 @@ class OBPM(nn.Module):
         idx = self._attnres_block_scope_index(scope, summary_idx)
         if learned:
             value = getattr(self.transformer, param_name)[idx]
-            if dtype is not None or device is not None:
-                value = value.to(dtype=dtype or value.dtype, device=device or value.device)
+            if device is not None:
+                value = value.to(device=device)
             return value
-        values = self._attnres_block_power_values(kind)
-        return float(values[idx].item())
+        values = self._attnres_block_power_value_list(kind)
+        return values[idx]
 
     def _attnres_block_alpha(self, summary_idx=None, dtype=None, device=None):
         return self._attnres_block_power("alpha", summary_idx=summary_idx, dtype=dtype, device=device)
@@ -1030,8 +1038,8 @@ class OBPM(nn.Module):
             return True
         if self.config.attnres_block_beta == "legacy":
             return self.config.attnres_block_count_prior
-        values = self._attnres_block_power_values("beta")
-        return bool(torch.any(values != 0.0).item())
+        values = self._attnres_block_power_value_list("beta")
+        return any(value != 0.0 for value in values)
 
     def _attnres_block_count_logit_bias(
         self,

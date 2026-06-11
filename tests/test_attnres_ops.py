@@ -210,6 +210,26 @@ def test_attnres_block_power_logging_values_use_live_learned_parameters():
     )
 
 
+def test_learned_alpha_beta_stay_fp32_after_mixed_precision():
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_block_alpha_learned=True,
+        attnres_block_beta_learned=True,
+    )
+    model = OBPM(cfg).to_mixed_precision(dtype=torch.bfloat16)
+
+    assert model.transformer.wte.weight.dtype == torch.bfloat16
+    assert model.transformer.attnres_block_alphas.dtype == torch.float32
+    assert model.transformer.attnres_block_betas.dtype == torch.float32
+
+
 def test_attnres_block_alpha_fixed_scalar_and_per_block_values():
     cfg = ModelConfig(
         n_layer=2,
