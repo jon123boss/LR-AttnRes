@@ -30,7 +30,8 @@ out = attention_residual_read(
     query,                  # Tensor [D]
     key_norm=True,
     normalize_output=False,
-    source_counts=None,     # optional count prior: logits += log(count)
+    source_counts=None,        # optional beta=1 wrapper: logits += log(count)
+    source_logit_biases=None,  # optional explicit source biases, e.g. beta * log(count)
 )
 # out: [B, T, D]
 ```
@@ -48,16 +49,17 @@ out = lrid_attention_residual_read(
     logit_scale=1.0 / (32 ** 0.5),
     key_norm=True,
     normalize_output=False,
-    source_counts=None,     # optional count prior: logits += log(count)
+    source_counts=None,        # optional beta=1 wrapper: logits += log(count)
+    source_logit_biases=None,  # optional explicit source biases, e.g. beta * log(count)
 )
 # out: [B, T, D]
 ```
 
-Model block mode passes `source_counts` only when
-`attnres_block_count_prior=True`, which is the default for averaged block
-summaries. Count-biased direct reads and cached block-training reads use the
-cached-logit fused phase1 path, so the `log(count)` prior stays on the fused
-AttnRes path.
+Model block mode now computes explicit `source_logit_biases` for
+`beta * log(count)` so fixed and learned beta share the same fused path.
+The public ops still accept `source_counts` as the beta=1 compatibility wrapper.
+Count-biased direct reads and cached block-training reads use the cached-logit
+fused phase1 path, so generalized block priors stay on fused AttnRes.
 
 Block training uses a cached-logit two-part read internally:
 

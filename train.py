@@ -184,6 +184,12 @@ attnres_num_blocks = 8
 attnres_block_average = True
 attnres_block_average_mode = "count" # count or sqrt
 attnres_block_count_prior = True
+attnres_block_alpha = "legacy" # legacy, float, or comma-separated floats
+attnres_block_beta = "legacy" # legacy, float, or comma-separated floats
+attnres_block_alpha_learned = False # True or False
+attnres_block_beta_learned = False # True or False
+attnres_block_alpha_scope = "shared" # shared, per_residual, or per_block
+attnres_block_beta_scope = "shared" # shared, per_residual, or per_block
 attnres_block_learned_scale = False
 attnres_block_learned_scale_init = "count" # count, sqrt, or one
 attnres_block_value_norm = False
@@ -491,6 +497,14 @@ def parse_args():
     parser.add_argument("--attnres_block_average_mode", choices=("count", "sqrt"), default=attnres_block_average_mode)
     parser.add_argument("--attnres_block_count_prior", type=_str_to_bool, nargs="?", const=True, default=attnres_block_count_prior)
     parser.add_argument("--no-attnres_block_count_prior", dest="attnres_block_count_prior", action="store_false")
+    parser.add_argument("--attnres_block_alpha", type=str, default=attnres_block_alpha)
+    parser.add_argument("--attnres_block_beta", type=str, default=attnres_block_beta)
+    parser.add_argument("--attnres_block_alpha_learned", type=_str_to_bool, nargs="?", const=True, default=attnres_block_alpha_learned)
+    parser.add_argument("--no-attnres_block_alpha_learned", dest="attnres_block_alpha_learned", action="store_false")
+    parser.add_argument("--attnres_block_beta_learned", type=_str_to_bool, nargs="?", const=True, default=attnres_block_beta_learned)
+    parser.add_argument("--no-attnres_block_beta_learned", dest="attnres_block_beta_learned", action="store_false")
+    parser.add_argument("--attnres_block_alpha_scope", choices=("shared", "per_residual", "per_block"), default=attnres_block_alpha_scope)
+    parser.add_argument("--attnres_block_beta_scope", choices=("shared", "per_residual", "per_block"), default=attnres_block_beta_scope)
     parser.add_argument("--attnres_block_learned_scale", type=_str_to_bool, nargs="?", const=True, default=attnres_block_learned_scale)
     parser.add_argument("--no-attnres_block_learned_scale", dest="attnres_block_learned_scale", action="store_false")
     parser.add_argument(
@@ -579,6 +593,12 @@ attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
 attnres_block_average_mode = args.attnres_block_average_mode
 attnres_block_count_prior = args.attnres_block_count_prior
+attnres_block_alpha = args.attnres_block_alpha
+attnres_block_beta = args.attnres_block_beta
+attnres_block_alpha_learned = args.attnres_block_alpha_learned
+attnres_block_beta_learned = args.attnres_block_beta_learned
+attnres_block_alpha_scope = args.attnres_block_alpha_scope
+attnres_block_beta_scope = args.attnres_block_beta_scope
 attnres_block_learned_scale = args.attnres_block_learned_scale
 attnres_block_learned_scale_init = args.attnres_block_learned_scale_init
 attnres_block_value_norm = args.attnres_block_value_norm

@@ -176,12 +176,13 @@ are configurable via `--attnres_key_norm`, `--attn_res_query_norm`, and
 `--attn_res_query_init`. Block summaries are averaged by default with
 `--attnres_block_average`; this divides by the sublayer count, and
 `--attnres_block_average_mode sqrt` divides by the square root of the count.
-Block AttnRes also adds a `log(count)` depth-logit prior by default for each
-compressed block source so a block receives the softmax mass of the sublayers it
-represents. Disable it for ablations with `--no-attnres_block_count_prior`.
-This prior requires averaged block summaries (`--attnres_block_average`); both
-`count` and `sqrt` averaging modes are supported, while learned-scale, raw-sum,
-and value-norm block summaries are rejected.
+For explicit experiments, `--attnres_block_alpha` sets the block value exponent
+in `sum(v_i) / count^alpha`, and `--attnres_block_beta` sets the logit prior
+`beta * log(count)`. The default `legacy` values preserve the old controls:
+count averaging is `alpha=1`, sqrt averaging is `alpha=0.5`, and
+`--attnres_block_count_prior` gives `beta=1` unless disabled. Alpha and beta can
+also be learned with `--attnres_block_alpha_learned` and
+`--attnres_block_beta_learned`, scoped by `{shared,per_residual,per_block}`.
 For a learnable alternative, `--attnres_block_learned_scale` gives each live
 partial/completed block source its own scalar, initialized with
 `--attnres_block_learned_scale_init {count,sqrt,one}`. To remove block value

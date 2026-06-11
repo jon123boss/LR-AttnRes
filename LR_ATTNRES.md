@@ -343,9 +343,13 @@ is the number of accumulated sublayers; set `--attnres_block_average_mode sqrt`
 to divide by the square root of that count. Each compressed block source also
 adds `log(count)` to its depth-routing logit by default so it receives the
 softmax prior mass of the sublayers it represents. Disable this prior for
-ablations with `--no-attnres_block_count_prior`. It requires averaged block
-summaries; both `count` and `sqrt` averaging modes are supported, while
-learned-scale, raw-sum, and value-norm block summaries are rejected.
+ablations with `--no-attnres_block_count_prior`.
+More generally, `--attnres_block_alpha` controls the value scale
+`sum(v_i) / count^alpha`, and `--attnres_block_beta` controls the depth-logit
+prior `beta * log(count)`. Their default `legacy` values reproduce the old
+flags: count averaging maps to `alpha=1`, sqrt averaging maps to `alpha=0.5`,
+and the count prior maps to `beta=1`. Alpha and beta can be learned and scoped
+as `shared`, `per_residual`, or `per_block`.
 In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
 key by the denominator would be removed by the later RMSNorm. The fused dynamic
@@ -533,6 +537,12 @@ use_lrid: bool
 attnres_block_average: bool
 attnres_block_average_mode: "count" | "sqrt"
 attnres_block_count_prior: bool
+attnres_block_alpha: "legacy" | float | comma-separated floats
+attnres_block_beta: "legacy" | float | comma-separated floats
+attnres_block_alpha_learned: bool
+attnres_block_beta_learned: bool
+attnres_block_alpha_scope: "shared" | "per_residual" | "per_block"
+attnres_block_beta_scope: "shared" | "per_residual" | "per_block"
 attnres_block_learned_scale: bool
 attnres_block_learned_scale_init: "count" | "sqrt" | "one"
 attnres_block_value_norm: bool
@@ -564,6 +574,14 @@ Training CLI:
 --attnres_block_average_mode {count,sqrt}
 --attnres_block_count_prior
 --no-attnres_block_count_prior
+--attnres_block_alpha {legacy,float,comma-list}
+--attnres_block_beta {legacy,float,comma-list}
+--attnres_block_alpha_learned
+--no-attnres_block_alpha_learned
+--attnres_block_beta_learned
+--no-attnres_block_beta_learned
+--attnres_block_alpha_scope {shared,per_residual,per_block}
+--attnres_block_beta_scope {shared,per_residual,per_block}
 --attnres_block_learned_scale
 --no-attnres_block_learned_scale
 --attnres_block_learned_scale_init {count,sqrt,one}

@@ -194,6 +194,12 @@ def common_model_kwargs(
     attnres_block_learned_scale: bool = False,
     attnres_block_learned_scale_init: str = "count",
     attnres_block_value_norm: bool = False,
+    attnres_block_alpha: str = "legacy",
+    attnres_block_beta: str = "legacy",
+    attnres_block_alpha_learned: bool = False,
+    attnres_block_beta_learned: bool = False,
+    attnres_block_alpha_scope: str = "shared",
+    attnres_block_beta_scope: str = "shared",
 ) -> dict:
     attnres_block_count_prior = (
         attnres_type == "block"
@@ -215,6 +221,12 @@ def common_model_kwargs(
         attnres_block_average=True,
         attnres_block_average_mode=attnres_block_average_mode,
         attnres_block_count_prior=attnres_block_count_prior,
+        attnres_block_alpha=attnres_block_alpha,
+        attnres_block_beta=attnres_block_beta,
+        attnres_block_alpha_learned=attnres_block_alpha_learned,
+        attnres_block_beta_learned=attnres_block_beta_learned,
+        attnres_block_alpha_scope=attnres_block_alpha_scope,
+        attnres_block_beta_scope=attnres_block_beta_scope,
         attnres_block_learned_scale=attnres_block_learned_scale,
         attnres_block_learned_scale_init=attnres_block_learned_scale_init,
         attnres_block_value_norm=attnres_block_value_norm,
@@ -239,6 +251,12 @@ def model_parity_check(
     attnres_block_value_norm: bool,
     atol: float,
     rtol: float,
+    attnres_block_alpha: str = "legacy",
+    attnres_block_beta: str = "legacy",
+    attnres_block_alpha_learned: bool = False,
+    attnres_block_beta_learned: bool = False,
+    attnres_block_alpha_scope: str = "shared",
+    attnres_block_beta_scope: str = "shared",
 ) -> None:
     torch.manual_seed(
         30
@@ -250,6 +268,12 @@ def model_parity_check(
         + (3000 if attnres_block_learned_scale_init == "sqrt" else 0)
         + (4000 if attnres_block_learned_scale_init == "one" else 0)
         + (5000 if attnres_block_value_norm else 0)
+        + (6000 if attnres_block_alpha != "legacy" else 0)
+        + (7000 if attnres_block_beta != "legacy" else 0)
+        + (8000 if attnres_block_alpha_learned else 0)
+        + (9000 if attnres_block_beta_learned else 0)
+        + (10000 if attnres_block_alpha_scope == "per_residual" else 0)
+        + (11000 if attnres_block_alpha_scope == "per_block" else 0)
     )
     kwargs = common_model_kwargs(
         use_lrid,
@@ -258,6 +282,12 @@ def model_parity_check(
         attnres_block_learned_scale,
         attnres_block_learned_scale_init,
         attnres_block_value_norm,
+        attnres_block_alpha,
+        attnres_block_beta,
+        attnres_block_alpha_learned,
+        attnres_block_beta_learned,
+        attnres_block_alpha_scope,
+        attnres_block_beta_scope,
     )
     if use_lrid:
         kwargs["lrid_key_from_output_tail"] = lrid_key_from_output_tail
@@ -279,7 +309,9 @@ def model_parity_check(
         f"model use_lrid={use_lrid} tail_key={lrid_key_from_output_tail} "
         f"type={attnres_type} block_avg_mode={attnres_block_average_mode} "
         f"learned_scale={attnres_block_learned_scale} learned_init={attnres_block_learned_scale_init} "
-        f"value_norm={attnres_block_value_norm}"
+        f"value_norm={attnres_block_value_norm} alpha={attnres_block_alpha} beta={attnres_block_beta} "
+        f"alpha_learned={attnres_block_alpha_learned} beta_learned={attnres_block_beta_learned} "
+        f"alpha_scope={attnres_block_alpha_scope} beta_scope={attnres_block_beta_scope}"
     )
     assert_close(f"{prefix} forward", actual, expected, atol, rtol)
     assert_close(f"{prefix} embedding grad", fused.transformer.wte.weight.grad, ref.transformer.wte.weight.grad, atol, rtol)
@@ -310,6 +342,12 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg.lrid_key_from_output_tail is False
         assert cfg.attnres_block_average_mode == "count"
         assert cfg.attnres_block_count_prior is True
+        assert cfg.attnres_block_alpha == "legacy"
+        assert cfg.attnres_block_beta == "legacy"
+        assert cfg.attnres_block_alpha_learned is False
+        assert cfg.attnres_block_beta_learned is False
+        assert cfg.attnres_block_alpha_scope == "shared"
+        assert cfg.attnres_block_beta_scope == "shared"
         assert cfg.attnres_block_learned_scale is False
         assert cfg.attnres_block_learned_scale_init == "count"
         assert cfg.attnres_block_value_norm is False
@@ -332,6 +370,12 @@ def compatibility_check(device: torch.device) -> None:
         assert "lrid_key_from_output_tail" not in old_checkpoint_model_args
         assert "attnres_block_average_mode" not in old_checkpoint_model_args
         assert "attnres_block_count_prior" not in old_checkpoint_model_args
+        assert "attnres_block_alpha" not in old_checkpoint_model_args
+        assert "attnres_block_beta" not in old_checkpoint_model_args
+        assert "attnres_block_alpha_learned" not in old_checkpoint_model_args
+        assert "attnres_block_beta_learned" not in old_checkpoint_model_args
+        assert "attnres_block_alpha_scope" not in old_checkpoint_model_args
+        assert "attnres_block_beta_scope" not in old_checkpoint_model_args
         assert "attnres_block_learned_scale" not in old_checkpoint_model_args
         assert "attnres_block_learned_scale_init" not in old_checkpoint_model_args
         assert "attnres_block_value_norm" not in old_checkpoint_model_args
@@ -339,6 +383,12 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg_from_old_checkpoint.lrid_key_from_output_tail is False
         assert cfg_from_old_checkpoint.attnres_block_average_mode == "count"
         assert cfg_from_old_checkpoint.attnres_block_count_prior is True
+        assert cfg_from_old_checkpoint.attnres_block_alpha == "legacy"
+        assert cfg_from_old_checkpoint.attnres_block_beta == "legacy"
+        assert cfg_from_old_checkpoint.attnres_block_alpha_learned is False
+        assert cfg_from_old_checkpoint.attnres_block_beta_learned is False
+        assert cfg_from_old_checkpoint.attnres_block_alpha_scope == "shared"
+        assert cfg_from_old_checkpoint.attnres_block_beta_scope == "shared"
         assert cfg_from_old_checkpoint.attnres_block_learned_scale is False
         assert cfg_from_old_checkpoint.attnres_block_learned_scale_init == "count"
         assert cfg_from_old_checkpoint.attnres_block_value_norm is False
@@ -349,6 +399,12 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg_from_new_checkpoint.lrid_key_from_output_tail is False
         assert cfg_from_new_checkpoint.attnres_block_average_mode == "count"
         assert cfg_from_new_checkpoint.attnres_block_count_prior is True
+        assert cfg_from_new_checkpoint.attnres_block_alpha == "legacy"
+        assert cfg_from_new_checkpoint.attnres_block_beta == "legacy"
+        assert cfg_from_new_checkpoint.attnres_block_alpha_learned is False
+        assert cfg_from_new_checkpoint.attnres_block_beta_learned is False
+        assert cfg_from_new_checkpoint.attnres_block_alpha_scope == "shared"
+        assert cfg_from_new_checkpoint.attnres_block_beta_scope == "shared"
         assert cfg_from_new_checkpoint.attnres_block_learned_scale is False
         assert cfg_from_new_checkpoint.attnres_block_learned_scale_init == "count"
         assert cfg_from_new_checkpoint.attnres_block_value_norm is False
@@ -408,6 +464,39 @@ def main() -> None:
                             rtol,
                         )
                     if attnres_type == "block":
+                        alpha_beta_cases = [
+                            ("0.75", "0.5", False, False, "shared", "shared"),
+                            ("0.75", "0.5", True, True, "shared", "shared"),
+                            ("0.1,0.2,0.3,0.4,0.5,0.6", "0.6,0.5,0.4,0.3,0.2,0.1", True, True, "per_residual", "per_residual"),
+                            ("0.5,1.0", "0.25,0.75", True, True, "per_block", "per_block"),
+                        ]
+                        for (
+                            attnres_block_alpha,
+                            attnres_block_beta,
+                            attnres_block_alpha_learned,
+                            attnres_block_beta_learned,
+                            attnres_block_alpha_scope,
+                            attnres_block_beta_scope,
+                        ) in alpha_beta_cases:
+                            model_parity_check(
+                                device,
+                                dtype,
+                                use_lrid,
+                                attnres_type,
+                                lrid_key_from_output_tail,
+                                "count",
+                                False,
+                                "count",
+                                False,
+                                atol,
+                                rtol,
+                                attnres_block_alpha=attnres_block_alpha,
+                                attnres_block_beta=attnres_block_beta,
+                                attnres_block_alpha_learned=attnres_block_alpha_learned,
+                                attnres_block_beta_learned=attnres_block_beta_learned,
+                                attnres_block_alpha_scope=attnres_block_alpha_scope,
+                                attnres_block_beta_scope=attnres_block_beta_scope,
+                            )
                         for attnres_block_learned_scale_init in ["count", "sqrt", "one"]:
                             model_parity_check(
                                 device,

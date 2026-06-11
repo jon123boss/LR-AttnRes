@@ -72,6 +72,12 @@ class ModelConfig:
     attnres_block_average: bool = True
     attnres_block_average_mode: str = "count"
     attnres_block_count_prior: bool = True
+    attnres_block_alpha: object = "legacy"
+    attnres_block_beta: object = "legacy"
+    attnres_block_alpha_learned: bool = False
+    attnres_block_beta_learned: bool = False
+    attnres_block_alpha_scope: str = "shared"
+    attnres_block_beta_scope: str = "shared"
     attnres_block_learned_scale: bool = False
     attnres_block_learned_scale_init: str = "count"
     attnres_block_value_norm: bool = False
@@ -104,6 +110,32 @@ class ModelConfig:
         self.attnres_block_average_mode = (self.attnres_block_average_mode or "count").lower()
         if self.attnres_block_average_mode not in {"count", "sqrt"}:
             raise ValueError("attnres_block_average_mode must be one of: count, sqrt")
+        self.attnres_block_alpha_scope = self._normalize_block_power_scope(
+            self.attnres_block_alpha_scope,
+            "attnres_block_alpha_scope",
+        )
+        self.attnres_block_beta_scope = self._normalize_block_power_scope(
+            self.attnres_block_beta_scope,
+            "attnres_block_beta_scope",
+        )
+        self.attnres_block_alpha = self._normalize_block_power_value(
+            self.attnres_block_alpha,
+            "attnres_block_alpha",
+        )
+        self.attnres_block_beta = self._normalize_block_power_value(
+            self.attnres_block_beta,
+            "attnres_block_beta",
+        )
+        self._validate_block_power_value_length(
+            self.attnres_block_alpha,
+            self.attnres_block_alpha_scope,
+            "attnres_block_alpha",
+        )
+        self._validate_block_power_value_length(
+            self.attnres_block_beta,
+            self.attnres_block_beta_scope,
+            "attnres_block_beta",
+        )
         self.attnres_block_learned_scale_init = self._normalize_block_scale_init(
             self.attnres_block_learned_scale_init
         )
@@ -113,18 +145,25 @@ class ModelConfig:
             raise ValueError("attnres_block_value_norm requires attnres_type='block'")
         if self.attnres_block_value_norm and self.attnres_block_learned_scale:
             raise ValueError("attnres_block_value_norm and attnres_block_learned_scale are mutually exclusive")
+        explicit_alpha_formula = (
+            self.attnres_block_alpha != "legacy"
+            or self.attnres_block_alpha_learned
+        )
+        if explicit_alpha_formula and (self.attnres_block_learned_scale or self.attnres_block_value_norm):
+            raise ValueError(
+                "attnres_block_alpha formula mode is mutually exclusive with "
+                "attnres_block_learned_scale and attnres_block_value_norm"
+            )
         if (
             self.attnres_type == "block"
             and self.attnres_block_count_prior
             and (
-                not self.attnres_block_average
-                or self.attnres_block_learned_scale
+                self.attnres_block_learned_scale
                 or self.attnres_block_value_norm
             )
         ):
             raise ValueError(
-                "attnres_block_count_prior requires averaged block summaries: "
-                "attnres_block_average=True, "
+                "attnres_block_count_prior requires alpha-formula block summaries: "
                 "attnres_block_learned_scale=False, and attnres_block_value_norm=False"
             )
         self.attn_res_query_init = (self.attn_res_query_init or "zero").lower()
@@ -178,6 +217,58 @@ class ModelConfig:
         raise ValueError(
             "attnres_block_learned_scale_init must be one of: count, sqrt, one"
         )
+
+    @staticmethod
+    def _normalize_block_power_scope(value, name):
+        value = str(value or "shared").lower().replace("-", "_")
+        aliases = {
+            "all": "shared",
+            "global": "shared",
+            "layer": "per_residual",
+            "layers": "per_residual",
+            "per_layer": "per_residual",
+            "residual": "per_residual",
+            "block": "per_block",
+            "blocks": "per_block",
+        }
+        value = aliases.get(value, value)
+        if value not in {"shared", "per_residual", "per_block"}:
+            raise ValueError(f"{name} must be one of: shared, per_residual, per_block")
+        return value
+
+    @staticmethod
+    def _normalize_block_power_value(value, name):
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text == "legacy":
+                return "legacy"
+            parts = [part.strip() for part in text.split(",")]
+            try:
+                if len(parts) == 1:
+                    return float(parts[0])
+                return [float(part) for part in parts]
+            except ValueError as exc:
+                raise ValueError(f"{name} must be 'legacy', a float, or comma-separated floats") from exc
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return [float(part) for part in value]
+        except TypeError as exc:
+            raise ValueError(f"{name} must be 'legacy', a float, or comma-separated floats") from exc
+
+    def _block_power_scope_length(self, scope):
+        if scope == "shared":
+            return 1
+        if scope == "per_residual":
+            return 2 * self.n_layer
+        return int(self.attnres_num_blocks)
+
+    def _validate_block_power_value_length(self, value, scope, name):
+        if value == "legacy" or isinstance(value, float):
+            return
+        expected = self._block_power_scope_length(scope)
+        if len(value) != expected:
+            raise ValueError(f"{name} list length must be {expected} for {scope} scope")
 
 
 class LRIDStaticKey(nn.Module):
@@ -510,12 +601,23 @@ class AttentionResidual(nn.Module):
             query = norm(query.float())
         return query.to(dtype)
 
-    def forward(self, values, source_counts=None):
+    def forward(self, values, source_counts=None, source_logit_biases=None):
         keys = norm(values) if self.use_key_norm else values
         logits = torch.einsum("d,sbtd->sbt", self._query(keys.dtype), keys)
+        if source_counts is not None and source_logit_biases is not None:
+            raise RuntimeError("source_counts and source_logit_biases are mutually exclusive")
         if source_counts is not None:
             log_counts = torch.as_tensor(source_counts, device=logits.device, dtype=torch.float32).log()
             logits = logits + log_counts.view(-1, 1, 1)
+        if source_logit_biases is not None:
+            bias_values = [
+                bias.to(device=logits.device, dtype=torch.float32).reshape(())
+                if torch.is_tensor(bias)
+                else torch.tensor(float(bias), device=logits.device, dtype=torch.float32)
+                for bias in source_logit_biases
+            ]
+            logit_bias = torch.stack(bias_values)
+            logits = logits + logit_bias.view(-1, 1, 1)
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         return torch.einsum("sbt,sbtd->btd", weights, values)
 
@@ -689,6 +791,16 @@ class OBPM(nn.Module):
                 "attnres_block_scales",
                 nn.Parameter(self._make_attnres_block_scale_init()),
             )
+        if self.use_attnres and self.attnres_type == "block" and config.attnres_block_alpha_learned:
+            self.transformer.register_parameter(
+                "attnres_block_alphas",
+                nn.Parameter(self._make_attnres_block_power_init("alpha")),
+            )
+        if self.use_attnres and self.attnres_type == "block" and config.attnres_block_beta_learned:
+            self.transformer.register_parameter(
+                "attnres_block_betas",
+                nn.Parameter(self._make_attnres_block_power_init("beta")),
+            )
         
         if not config.weight_tying:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -728,6 +840,100 @@ class OBPM(nn.Module):
             previous_end = block_end
         raise RuntimeError("Block summary index does not belong to any block")
 
+    def _attnres_block_bucket_idx(self, summary_idx):
+        if summary_idx is None:
+            raise RuntimeError("Block bucket scope requires a block summary index")
+        if summary_idx < 1 or summary_idx > 2 * self.config.n_layer:
+            raise RuntimeError("Block summary index is out of range")
+        for bucket_idx, block_end in enumerate(sorted(self.attnres_block_ends)):
+            if summary_idx <= block_end:
+                return bucket_idx
+        raise RuntimeError("Block summary index does not belong to any block")
+
+    def _attnres_block_scope_index(self, scope, summary_idx=None):
+        if scope == "shared":
+            return 0
+        if summary_idx is None:
+            raise RuntimeError(f"{scope} scope requires a block summary index")
+        if scope == "per_residual":
+            if summary_idx < 1 or summary_idx > 2 * self.config.n_layer:
+                raise RuntimeError("Block summary index is out of range")
+            return summary_idx - 1
+        return self._attnres_block_bucket_idx(summary_idx)
+
+    def _legacy_attnres_block_alpha(self):
+        if not self.config.attnres_block_average:
+            return 0.0
+        if self.config.attnres_block_average_mode == "sqrt":
+            return 0.5
+        return 1.0
+
+    def _legacy_attnres_block_beta(self):
+        return 1.0 if self.config.attnres_block_count_prior else 0.0
+
+    def _attnres_block_power_scope_length(self, scope):
+        if scope == "shared":
+            return 1
+        if scope == "per_residual":
+            return 2 * self.config.n_layer
+        return int(self.config.attnres_num_blocks)
+
+    def _attnres_block_power_values(self, kind):
+        if kind == "alpha":
+            value = self.config.attnres_block_alpha
+            scope = self.config.attnres_block_alpha_scope
+            legacy_value = self._legacy_attnres_block_alpha()
+        elif kind == "beta":
+            value = self.config.attnres_block_beta
+            scope = self.config.attnres_block_beta_scope
+            legacy_value = self._legacy_attnres_block_beta()
+        else:
+            raise RuntimeError("Unknown AttnRes block power kind")
+        length = self._attnres_block_power_scope_length(scope)
+        if value == "legacy":
+            values = [legacy_value] * length
+        elif isinstance(value, float):
+            values = [value] * length
+        else:
+            values = value
+        return torch.tensor(values, dtype=torch.float32)
+
+    def _make_attnres_block_power_init(self, kind):
+        return self._attnres_block_power_values(kind)
+
+    def _attnres_block_power(self, kind, summary_idx=None, dtype=None, device=None):
+        if kind == "alpha":
+            scope = self.config.attnres_block_alpha_scope
+            param_name = "attnres_block_alphas"
+            learned = self.config.attnres_block_alpha_learned
+        elif kind == "beta":
+            scope = self.config.attnres_block_beta_scope
+            param_name = "attnres_block_betas"
+            learned = self.config.attnres_block_beta_learned
+        else:
+            raise RuntimeError("Unknown AttnRes block power kind")
+        idx = self._attnres_block_scope_index(scope, summary_idx)
+        if learned:
+            value = getattr(self.transformer, param_name)[idx]
+            if dtype is not None or device is not None:
+                value = value.to(dtype=dtype or value.dtype, device=device or value.device)
+            return value
+        values = self._attnres_block_power_values(kind)
+        return float(values[idx].item())
+
+    def _attnres_block_alpha(self, summary_idx=None, dtype=None, device=None):
+        return self._attnres_block_power("alpha", summary_idx=summary_idx, dtype=dtype, device=device)
+
+    def _attnres_block_beta(self, read_idx=None, source_summary_idx=None, dtype=None, device=None):
+        summary_idx = read_idx if self.config.attnres_block_beta_scope == "per_residual" else source_summary_idx
+        return self._attnres_block_power("beta", summary_idx=summary_idx, dtype=dtype, device=device)
+
+    def _attnres_block_count_scale(self, count, alpha):
+        if torch.is_tensor(alpha):
+            log_count = alpha.new_tensor(float(count)).log()
+            return torch.exp(-alpha * log_count)
+        return float(count) ** (-float(alpha))
+
     def _make_attnres_block_scale_init(self):
         values = []
         for summary_idx in range(1, 2 * self.config.n_layer + 1):
@@ -754,9 +960,8 @@ class OBPM(nn.Module):
             if dtype is not None or device is not None:
                 scale = scale.to(dtype=dtype or scale.dtype, device=device or scale.device)
             return scale
-        if self.config.attnres_block_average:
-            return 1.0 / self._attnres_block_average_denominator(count)
-        return None
+        alpha = self._attnres_block_alpha(summary_idx=summary_idx, dtype=dtype, device=device)
+        return self._attnres_block_count_scale(count, alpha)
 
     def _attnres_block_summary(self, value, count, summary_idx=None):
         if self.config.attnres_block_value_norm:
@@ -804,21 +1009,108 @@ class OBPM(nn.Module):
         return count
 
     def _use_attnres_block_count_prior(self):
-        return self.attnres_type == "block" and self.config.attnres_block_count_prior
+        if self.attnres_type != "block":
+            return False
+        if self.config.attnres_block_beta_learned:
+            return True
+        if self.config.attnres_block_beta == "legacy":
+            return self.config.attnres_block_count_prior
+        values = self._attnres_block_power_values("beta")
+        return bool(torch.any(values != 0.0).item())
 
-    def _attnres_block_count_logit_bias(self, count):
+    def _attnres_block_count_logit_bias(
+        self,
+        count,
+        read_idx=None,
+        source_summary_idx=None,
+        dtype=None,
+        device=None,
+    ):
         if not self._use_attnres_block_count_prior():
             return 0.0
-        return math.log(float(count))
+        if count == 1:
+            return 0.0
+        beta = self._attnres_block_beta(
+            read_idx=read_idx,
+            source_summary_idx=source_summary_idx,
+            dtype=dtype,
+            device=device,
+        )
+        log_count = math.log(float(count))
+        if torch.is_tensor(beta):
+            return beta * beta.new_tensor(log_count)
+        beta = float(beta)
+        if beta == 0.0:
+            return 0.0
+        return beta * log_count
 
-    def _attnres_block_source_counts(self, completed_counts, partial_count=None):
+    def _attnres_biases_to_tensor(self, biases, device):
+        has_tensor = any(torch.is_tensor(bias) for bias in biases)
+        has_nonzero = any((not torch.is_tensor(bias)) and float(bias) != 0.0 for bias in biases)
+        if not has_tensor and not has_nonzero:
+            return None
+        return torch.stack(
+            [
+                bias.to(device=device, dtype=torch.float32).reshape(())
+                if torch.is_tensor(bias)
+                else torch.tensor(float(bias), device=device, dtype=torch.float32)
+                for bias in biases
+            ]
+        )
+
+    def _attnres_block_source_logit_biases(
+        self,
+        read_idx,
+        completed_counts,
+        completed_summary_idxs,
+        partial_count=None,
+        partial_summary_idx=None,
+    ):
         if not self._use_attnres_block_count_prior():
             return None
-        if partial_count is None:
-            return completed_counts
-        return completed_counts + [partial_count]
+        source_counts = completed_counts if partial_count is None else completed_counts + [partial_count]
+        source_summary_idxs = (
+            completed_summary_idxs
+            if partial_count is None
+            else completed_summary_idxs + [partial_summary_idx]
+        )
+        biases = [
+            self._attnres_block_count_logit_bias(
+                count,
+                read_idx=read_idx,
+                source_summary_idx=summary_idx,
+            )
+            for count, summary_idx in zip(source_counts, source_summary_idxs)
+        ]
+        has_tensor = any(torch.is_tensor(bias) for bias in biases)
+        has_nonzero = any((not torch.is_tensor(bias)) and float(bias) != 0.0 for bias in biases)
+        if not has_tensor and not has_nonzero:
+            return None
+        return biases
 
-    def _apply_attnres(self, residual_idx, sources, normalize_output=False, average_read=False, source_counts=None):
+    def _attnres_block_read_logit_biases(self, count, first_read, source_summary_idx, device):
+        if not self._use_attnres_block_count_prior() or count == 1:
+            return None
+        biases = [
+            self._attnres_block_count_logit_bias(
+                count,
+                read_idx=read_idx,
+                source_summary_idx=source_summary_idx,
+                device=device,
+            )
+            for read_idx in range(first_read, 2 * self.config.n_layer + 1)
+        ]
+        return self._attnres_biases_to_tensor(biases, device=device)
+
+    def _apply_attnres(
+        self,
+        residual_idx,
+        sources,
+        normalize_output=False,
+        average_read=False,
+        source_counts=None,
+        source_logit_biases=None,
+    ):
         if len(sources) == 1:
             return norm(sources[0]) if normalize_output else sources[0]
         if average_read:
@@ -832,9 +1124,10 @@ class OBPM(nn.Module):
                 residual.use_key_norm,
                 normalize_output=normalize_output,
                 source_counts=source_counts,
+                source_logit_biases=source_logit_biases,
             )
         values = torch.stack(sources, dim=0)
-        output = residual(values, source_counts=source_counts)
+        output = residual(values, source_counts=source_counts, source_logit_biases=source_logit_biases)
         return norm(output) if normalize_output else output
 
     def _attnres_query(self, residual_idx, dtype):
@@ -849,6 +1142,8 @@ class OBPM(nn.Module):
         interblock_lse,
         normalize_output=False,
         partial_count=1,
+        read_idx=None,
+        source_summary_idx=None,
     ):
         phase2 = attention_residual_phase2_torch if self.config.attnres_training_torch_phase2 else attention_residual_phase2
         return phase2(
@@ -858,7 +1153,11 @@ class OBPM(nn.Module):
             interblock_lse,
             self.config.attnres_key_norm,
             normalize_output=normalize_output,
-            logit_bias=self._attnres_block_count_logit_bias(partial_count),
+            logit_bias=self._attnres_block_count_logit_bias(
+                partial_count,
+                read_idx=read_idx,
+                source_summary_idx=source_summary_idx,
+            ),
         )
 
     def _apply_lrid_training_phase2(
@@ -870,6 +1169,8 @@ class OBPM(nn.Module):
         interblock_lse,
         normalize_output=False,
         partial_count=1,
+        read_idx=None,
+        source_summary_idx=None,
     ):
         phase2 = lrid_attention_residual_phase2_torch if self.config.attnres_training_torch_phase2 else lrid_attention_residual_phase2
         return phase2(
@@ -881,7 +1182,11 @@ class OBPM(nn.Module):
             self.config.lrid_logit_scale,
             self.config.attnres_key_norm,
             normalize_output=normalize_output,
-            logit_bias=self._attnres_block_count_logit_bias(partial_count),
+            logit_bias=self._attnres_block_count_logit_bias(
+                partial_count,
+                read_idx=read_idx,
+                source_summary_idx=source_summary_idx,
+            ),
         )
 
     def _forward_block_attnres_fused_training(
@@ -908,12 +1213,18 @@ class OBPM(nn.Module):
             dim=0,
         ).contiguous()
 
-        def make_source_logits(source, first_read, source_count=1):
+        def make_source_logits(source, first_read, source_count=1, source_summary_idx=None):
             key = norm(source) if self.config.attnres_key_norm else source
             queries = query_bank[first_read - 1:].to(key.dtype)
             logits = F.linear(key, queries).permute(2, 0, 1).contiguous()
-            if self._use_attnres_block_count_prior() and source_count != 1:
-                logits = logits + math.log(float(source_count))
+            logit_biases = self._attnres_block_read_logit_biases(
+                source_count,
+                first_read,
+                source_summary_idx,
+                logits.device,
+            )
+            if logit_biases is not None:
+                logits = logits + logit_biases.view(-1, 1, 1)
             return logits
 
         completed_blocks = [x]
@@ -986,6 +1297,8 @@ class OBPM(nn.Module):
                         phase_lses[phase_idx],
                         normalize_output=fused_read_norm,
                         partial_count=partial_count,
+                        read_idx=residual_idx,
+                        source_summary_idx=residual_idx,
                     )
             return norm(output) if fused_read_norm and (residual_idx == 0 or partial_block is None) else output
 
@@ -995,7 +1308,7 @@ class OBPM(nn.Module):
                 return
             completed_source = self._attnres_block_summary(partial_block, partial_count, residual_idx)
             completed_blocks.append(completed_source)
-            completed_logits.append(make_source_logits(completed_source, residual_idx, partial_count))
+            completed_logits.append(make_source_logits(completed_source, residual_idx, partial_count, residual_idx))
             completed_logit_first_reads.append(residual_idx)
             partial_block = None
             partial_count = 0
@@ -1075,7 +1388,7 @@ class OBPM(nn.Module):
                 key = norm(key.float()).to(source[0].dtype)
             return key
 
-        def make_source_logits(source, first_read, source_count=1):
+        def make_source_logits(source, first_read, source_count=1, source_summary_idx=None):
             key = source_key(source)
             queries = query_bank[first_read - 1:].to(key.dtype)
             logits = (
@@ -1084,8 +1397,14 @@ class OBPM(nn.Module):
                 .contiguous()
                 * self.config.lrid_logit_scale
             )
-            if self._use_attnres_block_count_prior() and source_count != 1:
-                logits = logits + math.log(float(source_count))
+            logit_biases = self._attnres_block_read_logit_biases(
+                source_count,
+                first_read,
+                source_summary_idx,
+                logits.device,
+            )
+            if logit_biases is not None:
+                logits = logits + logit_biases.view(-1, 1, 1)
             return logits
 
         embedding_source = self._embedding_lrid_source(x)
@@ -1164,6 +1483,8 @@ class OBPM(nn.Module):
                         phase_lses[phase_idx],
                         normalize_output=fused_read_norm,
                         partial_count=partial_count,
+                        read_idx=residual_idx,
+                        source_summary_idx=residual_idx,
                     )
             return norm(output) if fused_read_norm and (residual_idx == 0 or partial_block is None) else output
 
@@ -1173,7 +1494,7 @@ class OBPM(nn.Module):
                 return
             completed_source = current_partial_source(residual_idx)
             completed_values.append(completed_source[0])
-            completed_logits.append(make_source_logits(completed_source, residual_idx, partial_count))
+            completed_logits.append(make_source_logits(completed_source, residual_idx, partial_count, residual_idx))
             completed_logit_first_reads.append(residual_idx)
             partial_block = None
             partial_key = None
@@ -1311,6 +1632,7 @@ class OBPM(nn.Module):
         normalize_output=False,
         average_read=False,
         source_counts=None,
+        source_logit_biases=None,
     ):
         if len(sources) == 1:
             output = sources[0][0]
@@ -1349,6 +1671,7 @@ class OBPM(nn.Module):
                 self.config.attnres_key_norm,
                 normalize_output=normalize_output,
                 source_counts=source_counts,
+                source_logit_biases=source_logit_biases,
             )
 
         values = torch.stack(value_sources, dim=0)
@@ -1363,9 +1686,20 @@ class OBPM(nn.Module):
             logits = torch.einsum("sbthr,bthr->sbth", keys, query) * self.config.lrid_logit_scale
         else:
             logits = torch.einsum("sbthr,hr->sbth", keys, query) * self.config.lrid_logit_scale
+        if source_counts is not None and source_logit_biases is not None:
+            raise RuntimeError("source_counts and source_logit_biases are mutually exclusive")
         if source_counts is not None:
             log_counts = torch.as_tensor(source_counts, device=logits.device, dtype=torch.float32).log()
             logits = logits + log_counts.view(-1, 1, 1, 1)
+        if source_logit_biases is not None:
+            bias_values = [
+                bias.to(device=logits.device, dtype=torch.float32).reshape(())
+                if torch.is_tensor(bias)
+                else torch.tensor(float(bias), device=logits.device, dtype=torch.float32)
+                for bias in source_logit_biases
+            ]
+            logit_bias = torch.stack(bias_values)
+            logits = logits + logit_bias.view(-1, 1, 1, 1)
         weights = F.softmax(logits.float(), dim=0).to(values.dtype)
         output = torch.einsum("sbth,sbthd->bthd", weights, values)
         output = output.reshape(output.size(0), output.size(1), self.config.n_embd)
@@ -1487,6 +1821,7 @@ class OBPM(nn.Module):
                 block_ends = self.attnres_block_ends
                 completed_blocks = [embedding_source] if self.use_lrid else [embedding]
                 completed_block_counts = [1]
+                completed_block_summary_idxs = [None]
                 partial_block = None
                 partial_count = 0
                 if self.use_lrid:
@@ -1513,16 +1848,19 @@ class OBPM(nn.Module):
                         sources = completed_blocks if partial_block is None else completed_blocks + [
                             self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, attn_res_idx)
                         ]
-                        source_counts = self._attnres_block_source_counts(
+                        source_logit_biases = self._attnres_block_source_logit_biases(
+                            attn_res_idx,
                             completed_block_counts,
+                            completed_block_summary_idxs,
                             None if partial_block is None else partial_count,
+                            None if partial_block is None else attn_res_idx,
                         )
                         x = self._apply_lrid_attnres(
                             attn_res_idx,
                             sources,
                             normalize_output=fused_read_norm,
                             average_read=False,
-                            source_counts=source_counts,
+                            source_logit_biases=source_logit_biases,
                         )
 
                     attn_out = block.forward_attention(
@@ -1583,6 +1921,7 @@ class OBPM(nn.Module):
                                 self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, after_attn_idx)
                             )
                             completed_block_counts.append(partial_count)
+                            completed_block_summary_idxs.append(after_attn_idx)
                             partial_block = None
                             partial_key = None
                             partial_count = 0
@@ -1591,9 +1930,12 @@ class OBPM(nn.Module):
                         sources = completed_blocks if partial_block is None else completed_blocks + [
                             self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, after_attn_idx)
                         ]
-                        source_counts = self._attnres_block_source_counts(
+                        source_logit_biases = self._attnres_block_source_logit_biases(
+                            after_attn_idx,
                             completed_block_counts,
+                            completed_block_summary_idxs,
                             None if partial_block is None else partial_count,
+                            None if partial_block is None else after_attn_idx,
                         )
                         x = self._apply_lrid_attnres(
                             after_attn_idx,
@@ -1601,7 +1943,7 @@ class OBPM(nn.Module):
                             query_override=partial_query if self.config.lrid_input_dependent_query else None,
                             normalize_output=fused_read_norm,
                             average_read=False,
-                            source_counts=source_counts,
+                            source_logit_biases=source_logit_biases,
                         )
 
                     mlp_out = block.forward_mlp(
@@ -1653,6 +1995,7 @@ class OBPM(nn.Module):
                                 self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, after_mlp_idx)
                             )
                             completed_block_counts.append(partial_count)
+                            completed_block_summary_idxs.append(after_mlp_idx)
                             partial_block = None
                             partial_key = None
                             partial_count = 0
@@ -1669,16 +2012,19 @@ class OBPM(nn.Module):
                 else:
                     attn_res_idx = 2 * layer_idx
                     sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, attn_res_idx)]
-                    source_counts = self._attnres_block_source_counts(
+                    source_logit_biases = self._attnres_block_source_logit_biases(
+                        attn_res_idx,
                         completed_block_counts,
+                        completed_block_summary_idxs,
                         None if partial_block is None else partial_count,
+                        None if partial_block is None else attn_res_idx,
                     )
                     x = self._apply_attnres(
                         2 * layer_idx,
                         sources,
                         normalize_output=fused_read_norm,
                         average_read=False,
-                        source_counts=source_counts,
+                        source_logit_biases=source_logit_biases,
                     )
 
                 attn_out = block.forward_attention(
@@ -1711,19 +2057,23 @@ class OBPM(nn.Module):
                     if is_block_end:
                         completed_blocks.append(self._attnres_block_summary(partial_block, partial_count, after_attn_idx))
                         completed_block_counts.append(partial_count)
+                        completed_block_summary_idxs.append(after_attn_idx)
                         partial_block = None
                         partial_count = 0
                     sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, after_attn_idx)]
-                    source_counts = self._attnres_block_source_counts(
+                    source_logit_biases = self._attnres_block_source_logit_biases(
+                        after_attn_idx,
                         completed_block_counts,
+                        completed_block_summary_idxs,
                         None if partial_block is None else partial_count,
+                        None if partial_block is None else after_attn_idx,
                     )
                     x = self._apply_attnres(
                         after_attn_idx,
                         sources,
                         normalize_output=fused_read_norm,
                         average_read=False,
-                        source_counts=source_counts,
+                        source_logit_biases=source_logit_biases,
                     )
 
                 mlp_out = block.forward_mlp(x, x_is_normalized=fused_read_norm)
@@ -1744,6 +2094,7 @@ class OBPM(nn.Module):
                     if is_block_end:
                         completed_blocks.append(self._attnres_block_summary(partial_block, partial_count, after_mlp_idx))
                         completed_block_counts.append(partial_count)
+                        completed_block_summary_idxs.append(after_mlp_idx)
                         partial_block = None
                         partial_count = 0
             else:
@@ -1774,16 +2125,19 @@ class OBPM(nn.Module):
                     sources = completed_blocks if partial_block is None else completed_blocks + [
                         self._lrid_block_source(partial_block, partial_key, partial_query if self.config.lrid_input_dependent_query else None, partial_count, 2 * self.config.n_layer)
                     ]
-                    source_counts = self._attnres_block_source_counts(
+                    source_logit_biases = self._attnres_block_source_logit_biases(
+                        2 * self.config.n_layer,
                         completed_block_counts,
+                        completed_block_summary_idxs,
                         None if partial_block is None else partial_count,
+                        None if partial_block is None else 2 * self.config.n_layer,
                     )
                     x = self._apply_lrid_attnres(
                         2 * self.config.n_layer,
                         sources,
                         normalize_output=fused_read_norm,
                         average_read=False,
-                        source_counts=source_counts,
+                        source_logit_biases=source_logit_biases,
                     )
             elif self.attnres_type == "full":
                 x = self._apply_attnres(
@@ -1794,16 +2148,19 @@ class OBPM(nn.Module):
                 )
             else:
                 sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, 2 * self.config.n_layer)]
-                source_counts = self._attnres_block_source_counts(
+                source_logit_biases = self._attnres_block_source_logit_biases(
+                    2 * self.config.n_layer,
                     completed_block_counts,
+                    completed_block_summary_idxs,
                     None if partial_block is None else partial_count,
+                    None if partial_block is None else 2 * self.config.n_layer,
                 )
                 x = self._apply_attnres(
                     2 * self.config.n_layer,
                     sources,
                     normalize_output=fused_read_norm,
                     average_read=False,
-                    source_counts=source_counts,
+                    source_logit_biases=source_logit_biases,
                 )
         
         if not fused_read_norm:

@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -121,6 +123,188 @@ def test_attnres_block_value_norm_overrides_scaling():
     lrid_rms = lrid_value.pow(2).mean(dim=-1).sqrt()
     assert torch.allclose(lrid_rms, torch.ones_like(lrid_rms), atol=1e-6, rtol=1e-6)
     assert torch.equal(lrid_key, key)
+
+
+@pytest.mark.parametrize(
+    "scope,expected_shape",
+    [("shared", (1,)), ("per_residual", (4,)), ("per_block", (2,))],
+)
+def test_attnres_block_alpha_beta_learned_parameter_shapes(scope, expected_shape):
+    cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_alpha_learned=True,
+        attnres_block_beta_learned=True,
+        attnres_block_alpha_scope=scope,
+        attnres_block_beta_scope=scope,
+    )
+    model = OBPM(cfg)
+
+    assert tuple(model.transformer.attnres_block_alphas.shape) == expected_shape
+    assert tuple(model.transformer.attnres_block_betas.shape) == expected_shape
+
+
+def test_attnres_block_per_block_scope_uses_configured_num_blocks():
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=4,
+        attnres_block_alpha="0.25,0.5,0.75,1.0",
+        attnres_block_beta="0.0,0.1,0.2,0.3",
+        attnres_block_alpha_learned=True,
+        attnres_block_beta_learned=True,
+        attnres_block_alpha_scope="per_block",
+        attnres_block_beta_scope="per_block",
+    )
+    model = OBPM(cfg)
+
+    assert tuple(model.transformer.attnres_block_alphas.shape) == (4,)
+    assert tuple(model.transformer.attnres_block_betas.shape) == (4,)
+    assert math.isclose(float(model.transformer.attnres_block_alphas[0]), 0.25)
+    assert math.isclose(float(model.transformer.attnres_block_betas[0]), 0.0)
+
+
+def test_attnres_block_alpha_fixed_scalar_and_per_block_values():
+    cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_alpha="1.0,0.5",
+        attnres_block_alpha_scope="per_block",
+        attnres_block_count_prior=False,
+        attnres_key_norm=False,
+    )
+    model = OBPM(cfg)
+    value = torch.full((1, 2, cfg.n_embd), 8.0)
+
+    assert torch.allclose(model._attnres_block_summary(value, 4, summary_idx=1), value / 4.0)
+    assert torch.allclose(model._attnres_block_summary(value, 4, summary_idx=3), value / 2.0)
+
+
+def test_attnres_block_beta_fixed_per_residual_and_per_block_values():
+    residual_cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_beta="0.0,0.5,1.0,2.0",
+        attnres_block_beta_scope="per_residual",
+    )
+    residual_model = OBPM(residual_cfg)
+    assert math.isclose(
+        residual_model._attnres_block_count_logit_bias(4, read_idx=3, source_summary_idx=1),
+        math.log(4.0),
+    )
+
+    block_cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_beta="0.25,0.75",
+        attnres_block_beta_scope="per_block",
+    )
+    block_model = OBPM(block_cfg)
+    assert math.isclose(
+        block_model._attnres_block_count_logit_bias(4, read_idx=1, source_summary_idx=3),
+        0.75 * math.log(4.0),
+    )
+
+
+def test_attnres_block_power_list_length_validation():
+    with pytest.raises(ValueError, match="attnres_block_alpha list length must be 4"):
+        ModelConfig(
+            n_layer=2,
+            n_head=2,
+            n_embd=8,
+            mlp_hidden_dim=16,
+            vocab_size=32,
+            block_size=4,
+            use_attnres=True,
+            attnres_type="block",
+            attnres_block_alpha="0.25,0.5",
+            attnres_block_alpha_scope="per_residual",
+        )
+
+
+def test_source_logit_biases_read_keeps_bias_gradients():
+    torch.manual_seed(23)
+    values = [torch.randn(2, 3, 5, requires_grad=True) for _ in range(3)]
+    query = torch.randn(5, requires_grad=True)
+    source_logit_biases = torch.tensor([0.0, 0.7, -0.2], requires_grad=True)
+
+    output = attention_residual_read(
+        values,
+        query,
+        key_norm=True,
+        source_logit_biases=source_logit_biases,
+    )
+    output.float().square().mean().backward()
+
+    assert source_logit_biases.grad is not None
+    assert source_logit_biases.grad.abs().sum() > 0
+
+
+def test_learned_alpha_beta_get_gradients_in_cached_block_path():
+    torch.manual_seed(29)
+    cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        use_fused_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_alpha="0.75",
+        attnres_block_beta="0.5",
+        attnres_block_alpha_learned=True,
+        attnres_block_beta_learned=True,
+        attn_res_query_init="normal",
+        attnres_training_cache_phase1=True,
+        attnres_key_norm=False,
+    )
+    model = OBPM(cfg).train()
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+
+    output = model(idx, return_hidden=True)
+    output.float().square().mean().backward()
+
+    assert model.transformer.attnres_block_alphas.grad is not None
+    assert model.transformer.attnres_block_alphas.grad.abs().sum() > 0
+    assert model.transformer.attnres_block_betas.grad is not None
+    assert model.transformer.attnres_block_betas.grad.abs().sum() > 0
 
 
 def test_attnres_source_count_prior_matches_zero_query_uniform_average():
@@ -252,12 +436,11 @@ def test_attnres_cached_phase2_applies_partial_count_prior():
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"attnres_block_average": False},
         {"attnres_block_learned_scale": True},
         {"attnres_block_value_norm": True},
     ],
 )
-def test_count_prior_requires_averaged_block_sources(overrides):
+def test_count_prior_requires_alpha_formula_block_sources(overrides):
     kwargs = dict(
         n_layer=1,
         n_head=2,
@@ -271,7 +454,7 @@ def test_count_prior_requires_averaged_block_sources(overrides):
     )
     kwargs.update(overrides)
 
-    with pytest.raises(ValueError, match="attnres_block_count_prior requires averaged block summaries"):
+    with pytest.raises(ValueError, match="attnres_block_count_prior requires alpha-formula block summaries"):
         ModelConfig(**kwargs)
 
 
@@ -433,7 +616,7 @@ def test_fused_count_prior_matches_unfused_training_gradients(use_lrid, device_n
 
 @pytest.mark.parametrize("use_lrid", [False, True])
 @pytest.mark.parametrize("count_prior", [False, True])
-def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
+def test_block_forward_passes_expected_source_logit_biases(use_lrid, count_prior):
     cfg = ModelConfig(
         n_layer=3,
         n_head=2,
@@ -457,8 +640,21 @@ def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
     original = getattr(model, method_name)
 
     def wrapped(residual_idx, sources, *args, **kwargs):
-        source_counts = kwargs.get("source_counts")
-        records.append((residual_idx, None if source_counts is None else list(source_counts)))
+        source_logit_biases = kwargs.get("source_logit_biases")
+        if source_logit_biases is None:
+            records.append((residual_idx, None))
+        else:
+            records.append(
+                (
+                    residual_idx,
+                    [
+                        float(bias.detach().cpu())
+                        if torch.is_tensor(bias)
+                        else float(bias)
+                        for bias in source_logit_biases
+                    ],
+                )
+            )
         return original(residual_idx, sources, *args, **kwargs)
 
     setattr(model, method_name, wrapped)
@@ -467,13 +663,13 @@ def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
         model(idx, return_hidden=True)
 
     expected_with_prior = [
-        (0, [1]),
-        (1, [1, 1]),
-        (2, [1, 2]),
-        (3, [1, 3]),
-        (4, [1, 3, 1]),
-        (5, [1, 3, 2]),
-        (6, [1, 3, 3]),
+        (0, None),
+        (1, None),
+        (2, [0.0, math.log(2.0)]),
+        (3, [0.0, math.log(3.0)]),
+        (4, [0.0, math.log(3.0), 0.0]),
+        (5, [0.0, math.log(3.0), math.log(2.0)]),
+        (6, [0.0, math.log(3.0), math.log(3.0)]),
     ]
     expected = (
         expected_with_prior
@@ -481,7 +677,13 @@ def test_block_forward_passes_expected_source_counts(use_lrid, count_prior):
         else [(residual_idx, None) for residual_idx, _ in expected_with_prior]
     )
 
-    assert records == expected
+    assert len(records) == len(expected)
+    for actual, expected_item in zip(records, expected):
+        assert actual[0] == expected_item[0]
+        if expected_item[1] is None:
+            assert actual[1] is None
+        else:
+            assert actual[1] == pytest.approx(expected_item[1])
 
 
 def _cuda_device():
