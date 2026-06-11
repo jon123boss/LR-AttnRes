@@ -58,6 +58,8 @@ class WandbLogger:
         self.wandb.define_metric("gpu/*", step_metric="tokens_processed")
         self.wandb.define_metric("lambdas/*", step_metric="tokens_processed")
         self.wandb.define_metric("attnres_block_scales/*", step_metric="tokens_processed")
+        self.wandb.define_metric("attnres_block_alpha/*", step_metric="tokens_processed")
+        self.wandb.define_metric("attnres_block_beta/*", step_metric="tokens_processed")
         self.wandb.define_metric("model/num_params", step_metric="tokens_processed")
 
         self.active = True
@@ -152,6 +154,40 @@ class WandbLogger:
             log_dict["attnres_block_scales/min"] = float(min(scales))
             log_dict["attnres_block_scales/max"] = float(max(scales))
             log_dict["attnres_block_scales/mean"] = float(sum(scales) / len(scales))
+        self.run.log(log_dict)
+
+    def log_attnres_block_powers(self, kind, values, scope, tokens_processed):
+        if not self.active or values is None:
+            return
+        if kind not in {"alpha", "beta"}:
+            raise ValueError("kind must be 'alpha' or 'beta'")
+        if hasattr(values, "detach"):
+            values = values.detach().float().cpu().tolist()
+        else:
+            values = [float(value) for value in values]
+        if not values:
+            return
+
+        prefix = f"attnres_block_{kind}"
+        scope = scope or "shared"
+        if scope == "per_residual":
+            item_prefix = "residual"
+        elif scope == "per_block":
+            item_prefix = "block"
+        else:
+            item_prefix = "shared"
+
+        log_dict = {
+            "tokens_processed": int(tokens_processed),
+            f"{prefix}/min": float(min(values)),
+            f"{prefix}/max": float(max(values)),
+            f"{prefix}/mean": float(sum(values) / len(values)),
+        }
+        if item_prefix == "shared" and len(values) == 1:
+            log_dict[f"{prefix}/shared"] = float(values[0])
+        else:
+            for idx, value in enumerate(values, start=1):
+                log_dict[f"{prefix}/{item_prefix}_{idx:03d}"] = float(value)
         self.run.log(log_dict)
 
     def log_checkpoint(self, step, ckpt_path, config=None, artifact_name_prefix="obpm-ckpt-step"):

@@ -1031,6 +1031,19 @@ while tokens_processed < max_tokens and step < max_steps:
                 raw_model.attnres_block_ends,
                 tokens_processed,
             )
+        if getattr(raw_model, "use_attnres", False) and getattr(raw_model, "attnres_type", None) == "block":
+            logger.log_attnres_block_powers(
+                "alpha",
+                raw_model.attnres_block_power_values_for_logging("alpha"),
+                raw_model.config.attnres_block_alpha_scope,
+                tokens_processed,
+            )
+            logger.log_attnres_block_powers(
+                "beta",
+                raw_model.attnres_block_power_values_for_logging("beta"),
+                raw_model.config.attnres_block_beta_scope,
+                tokens_processed,
+            )
 
     if step % log_interval == 0:
         norm_str = f"{norm:.2f}" if norm is not None else "N/A"

@@ -177,6 +177,39 @@ def test_attnres_block_per_block_scope_uses_configured_num_blocks():
     assert math.isclose(float(model.transformer.attnres_block_betas[0]), 0.0)
 
 
+def test_attnres_block_power_logging_values_use_live_learned_parameters():
+    cfg = ModelConfig(
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=2,
+        attnres_block_alpha="0.25,0.5",
+        attnres_block_beta="0.75,1.0",
+        attnres_block_alpha_learned=True,
+        attnres_block_beta_learned=True,
+        attnres_block_alpha_scope="per_block",
+        attnres_block_beta_scope="per_block",
+    )
+    model = OBPM(cfg)
+    with torch.no_grad():
+        model.transformer.attnres_block_alphas.add_(1.0)
+        model.transformer.attnres_block_betas.sub_(0.25)
+
+    assert torch.allclose(
+        model.attnres_block_power_values_for_logging("alpha"),
+        torch.tensor([1.25, 1.5]),
+    )
+    assert torch.allclose(
+        model.attnres_block_power_values_for_logging("beta"),
+        torch.tensor([0.5, 0.75]),
+    )
+
+
 def test_attnres_block_alpha_fixed_scalar_and_per_block_values():
     cfg = ModelConfig(
         n_layer=2,

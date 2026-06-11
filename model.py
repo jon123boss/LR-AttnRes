@@ -901,6 +901,21 @@ class OBPM(nn.Module):
     def _make_attnres_block_power_init(self, kind):
         return self._attnres_block_power_values(kind)
 
+    def attnres_block_power_values_for_logging(self, kind):
+        if not self.use_attnres or self.attnres_type != "block":
+            return None
+        if kind == "alpha":
+            learned = self.config.attnres_block_alpha_learned
+            param_name = "attnres_block_alphas"
+        elif kind == "beta":
+            learned = self.config.attnres_block_beta_learned
+            param_name = "attnres_block_betas"
+        else:
+            raise RuntimeError("Unknown AttnRes block power kind")
+        if learned and hasattr(self.transformer, param_name):
+            return getattr(self.transformer, param_name).detach()
+        return self._attnres_block_power_values(kind)
+
     def _attnres_block_power(self, kind, summary_idx=None, dtype=None, device=None):
         if kind == "alpha":
             scope = self.config.attnres_block_alpha_scope
