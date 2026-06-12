@@ -1,0 +1,50 @@
+{
+  "os": "Linux-6.8.0-56-generic-x86_64-with-glibc2.39",
+  "python": "CPython 3.12.3",
+  "startedAt": "2026-06-05T23:04:43.081144Z",
+  "args": [
+    "--full_run"
+  ],
+  "program": "/workspace/LR-AttnRes/train.py",
+  "codePath": "train.py",
+  "codePathLocal": "train.py",
+  "git": {
+    "remote": "https://github.com/jon123boss/LR-AttnRes",
+    "commit": "324995a4caee5b4c5ab66182acc3b91cbb0c20e3"
+  },
+  "email": "jon123boss@gmail.com",
+  "root": "/workspace/LR-AttnRes",
+  "host": "1652358daaf5",
+  "executable": "/usr/local/bin/python",
+  "cpu_count": 80,
+  "cpu_count_logical": 160,
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "gpu_count": 2,
+  "disk": {
+    "/": {
+      "total": "107374182400",
+      "used": "1770536960"
+    }
+  },
+  "memory": {
+    "total": "1623318437888"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA H100 80GB HBM3",
+      "memoryTotal": "85520809984",
+      "cudaCores": 16896,
+      "architecture": "Hopper",
+      "uuid": "GPU-6f3d4f93-7d53-7e31-dc88-82e729fdad85"
+    },
+    {
+      "name": "NVIDIA H100 80GB HBM3",
+      "memoryTotal": "85520809984",
+      "cudaCores": 16896,
+      "architecture": "Hopper",
+      "uuid": "GPU-f75da73b-2290-c4e3-88f8-60ed00b79f9d"
+    }
+  ],
+  "cudaVersion": "12.8",
+  "writerId": "rvhcp1ft9ajmk8ap213al38kvdphk2az"
+}

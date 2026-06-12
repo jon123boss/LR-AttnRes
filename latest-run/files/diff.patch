@@ -1,0 +1,31 @@
+diff --git a/train.py b/train.py
+index 58408f2..c5e282a 100644
+--- a/train.py
++++ b/train.py
+@@ -136,12 +136,12 @@ ckpt_file_name = ''
+ # wandb logging
+ wandb_log = True
+ wandb_project = "LR-AttnRes"
+-wandb_run_name = "LRID"
++wandb_run_name = "Full Attnres"
+ # data
+ dataset_dir = "ultrafineweb20B_gpt4"
+-batch_size = 16
++batch_size = 4
+ block_size = 2048
+-grad_accum_steps = 8
++grad_accum_steps = 32
+ total_batch_size = batch_size * block_size * grad_accum_steps
+ tokenizer_model = _GPT4_TOKENIZER_MODEL
+ data_dtype = "uint32"
+@@ -178,8 +178,8 @@ flash_attention = True
+ init_std = 0.02
+ init_cutoff_factor = None
+ # Attention Residuals
+-use_attnres = False
+-attnres_type = "block" # "full" or "block"
++use_attnres = True
++attnres_type = "full" # "full" orfullck"
+ attnres_num_blocks = 8
+ attnres_block_average = False
+ attnres_key_norm = True

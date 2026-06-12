@@ -1,0 +1,330 @@
+_wandb:
+    value:
+        cli_version: 0.27.1
+        code_path: code/train.py
+        e:
+            rvhcp1ft9ajmk8ap213al38kvdphk2az:
+                args:
+                    - --full_run
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 80
+                cpu_count_logical: 160
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "107374182400"
+                        used: "1770536960"
+                email: jon123boss@gmail.com
+                executable: /usr/local/bin/python
+                git:
+                    commit: 324995a4caee5b4c5ab66182acc3b91cbb0c20e3
+                    remote: https://github.com/jon123boss/LR-AttnRes
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-6f3d4f93-7d53-7e31-dc88-82e729fdad85
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-f75da73b-2290-c4e3-88f8-60ed00b79f9d
+                host: 1652358daaf5
+                memory:
+                    total: "1623318437888"
+                os: Linux-6.8.0-56-generic-x86_64-with-glibc2.39
+                program: /workspace/LR-AttnRes/train.py
+                python: CPython 3.12.3
+                root: /workspace/LR-AttnRes
+                startedAt: "2026-06-05T23:04:43.081144Z"
+                writerId: rvhcp1ft9ajmk8ap213al38kvdphk2az
+        m:
+            - "1": tokens_processed
+              "6":
+                - 3
+              "7": []
+            - "1": lr
+              "5": 1
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": grad_norm
+              "5": 1
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": ms_per_step
+              "5": 1
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": tokens_per_s
+              "5": 1
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "1": model/num_params
+              "5": 1
+              "6":
+                - 1
+                - 3
+              "7": []
+            - "2": val/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": gpu/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": lambdas/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+            - "2": train/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 49
+            "2":
+                - 1
+                - 49
+            "3":
+                - 2
+                - 7
+                - 13
+                - 16
+                - 41
+                - 62
+            "4": 3.12.3
+            "5": 0.27.1
+            "12": 0.27.1
+            "13": linux-x86_64
+adamw_lr:
+    value: 0.0003
+adamw_weight_decay:
+    value: 0
+attn_res_query_init:
+    value: zero
+attn_res_query_norm:
+    value: false
+attnres_block_average:
+    value: false
+attnres_key_norm:
+    value: true
+attnres_num_blocks:
+    value: 8
+attnres_type:
+    value: full
+batch_size:
+    value: 4
+beta1:
+    value: 0.9
+beta2:
+    value: 0.95
+block_size:
+    value: 2048
+cautious:
+    value: true
+ce_inplace_backward:
+    value: true
+ckpt_file_name:
+    value: ""
+ckpt_interval:
+    value: 2500
+clip_qkv:
+    value: null
+configured_grad_accum_steps:
+    value: 32
+data_dtype:
+    value: uint32
+dataset_dir:
+    value: ultrafineweb20B_gpt4
+ddp_find_unused_parameters:
+    value: false
+ddp_preserve_global_batch:
+    value: true
+distributed:
+    value: true
+doc_separator_token:
+    value: 100257
+eval_interval:
+    value: 100
+eval_only:
+    value: false
+eval_steps:
+    value: 10
+flash_attention:
+    value: true
+full_run:
+    value: true
+full_run_eval:
+    value: true
+full_run_eval_mode:
+    value: full
+full_run_eval_torch_max_autotune:
+    value: false
+full_run_hf_private:
+    value: false
+full_run_hf_repo_id:
+    value: Jonnester/LR-AttnRes-Full
+global_grad_accum_steps:
+    value: 32
+grad_accum_steps:
+    value: 16
+grad_clip:
+    value: 1
+ignore_index:
+    value: -100
+init_cutoff_factor:
+    value: null
+init_from:
+    value: scratch
+init_std:
+    value: 0.02
+interactive_after_train:
+    value: false
+lm_head_chunk_size:
+    value: 1024
+local_rank:
+    value: 0
+log_interval:
+    value: 1
+lrid_add_static_embedding_key:
+    value: false
+lrid_add_static_source_key:
+    value: false
+lrid_input_dependent_query:
+    value: false
+lrid_key_from_value:
+    value: false
+lrid_key_from_value_shared:
+    value: false
+lrid_key_value_norm:
+    value: true
+lrid_logit_scale:
+    value: null
+lrid_num_heads:
+    value: 1
+lrid_query_from_value:
+    value: false
+lrid_query_from_value_shared:
+    value: false
+lrid_rank:
+    value: 32
+lrid_static_embedding_key:
+    value: false
+lrid_use_logit_scale:
+    value: false
+master_process:
+    value: true
+max_steps:
+    value: 38146
+max_tokens:
+    value: 10000000000
+mlp_hidden_dim:
+    value: 2816
+mlp_ratio:
+    value: null
+muon_lr:
+    value: 0.001
+muon_momentum:
+    value: 0.95
+muon_momentum_cooldown_steps:
+    value: 100
+muon_momentum_max:
+    value: 0.95
+muon_momentum_min:
+    value: 0.85
+muon_momentum_warmup_steps:
+    value: 300
+muon_weight_decay:
+    value: 0.1
+n_embd:
+    value: 1024
+n_head:
+    value: 16
+n_layer:
+    value: 24
+norm_pos:
+    value: before
+num_params:
+    value: 513697792
+num_workers:
+    value: 8
+out_dir:
+    value: out
+persistent_workers:
+    value: false
+pin_memory:
+    value: true
+qk_norm:
+    value: true
+rank:
+    value: 0
+reduction:
+    value: mean
+rope_theta:
+    value: 500000
+save_checkpoint:
+    value: true
+save_ckpt_at_end:
+    value: true
+sched_mode:
+    value: linear
+seed:
+    value: 42
+tokenizer_model:
+    value: gpt-4
+torch_compile:
+    value: true
+torch_compile_cache_dir:
+    value: /tmp/inductor_cache_rank0
+torch_compile_cudagraphs:
+    value: false
+torch_compile_max_autotune:
+    value: false
+total_batch_size:
+    value: 262144
+use_attnres:
+    value: true
+use_doc_masking:
+    value: true
+use_lrid:
+    value: false
+vocab_size:
+    value: 100277
+wandb_log:
+    value: true
+wandb_project:
+    value: LR-AttnRes
+wandb_run_name:
+    value: Full Attnres
+warmdown_steps:
+    value: 7629
+warmup_steps:
+    value: 2000
+weight_tying:
+    value: false
+world_size:
+    value: 2
+z_loss:
+    value: true
+z_loss_weight:
+    value: 1e-05

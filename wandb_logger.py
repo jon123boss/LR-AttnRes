@@ -83,6 +83,7 @@ class WandbLogger:
         tokens_processed,
         peak_gpu_memory_gb=None,
         peak_gpu_memory_reserved_gb=None,
+        extra_metrics=None,
     ):
         if not self.active:
             return
@@ -100,6 +101,8 @@ class WandbLogger:
             log_dict["gpu/peak_allocated_gb"] = float(peak_gpu_memory_gb)
         if peak_gpu_memory_reserved_gb is not None:
             log_dict["gpu/peak_reserved_gb"] = float(peak_gpu_memory_reserved_gb)
+        if extra_metrics:
+            log_dict.update(extra_metrics)
         self.run.log(log_dict)
 
     def log_eval(self, step, train_loss, val_loss, lr, tokens_processed):
@@ -136,17 +139,15 @@ class WandbLogger:
         
         self.run.log(log_dict)
 
-    def log_attnres_block_scales(self, scales, block_ends, tokens_processed):
-        if not self.active or scales is None:
-            return
+    def attnres_block_scales_metrics(self, scales, block_ends):
+        if scales is None:
+            return {}
         if hasattr(scales, "detach"):
             scales = scales.detach().float().cpu().tolist()
         else:
             scales = [float(scale) for scale in scales]
         block_ends = set(int(idx) for idx in (block_ends or ()))
-        log_dict = {
-            "tokens_processed": int(tokens_processed),
-        }
+        log_dict = {}
         for source_idx, scale in enumerate(scales, start=1):
             source_kind = "completed" if source_idx in block_ends else "partial"
             log_dict[f"attnres_block_scales/source_{source_idx:03d}_{source_kind}"] = float(scale)
@@ -154,11 +155,20 @@ class WandbLogger:
             log_dict["attnres_block_scales/min"] = float(min(scales))
             log_dict["attnres_block_scales/max"] = float(max(scales))
             log_dict["attnres_block_scales/mean"] = float(sum(scales) / len(scales))
+        return log_dict
+
+    def log_attnres_block_scales(self, scales, block_ends, tokens_processed):
+        if not self.active or scales is None:
+            return
+        log_dict = {
+            "tokens_processed": int(tokens_processed),
+            **self.attnres_block_scales_metrics(scales, block_ends),
+        }
         self.run.log(log_dict)
 
-    def log_attnres_block_powers(self, kind, values, scope, tokens_processed):
-        if not self.active or values is None:
-            return
+    def attnres_block_powers_metrics(self, kind, values, scope):
+        if values is None:
+            return {}
         if kind not in {"alpha", "beta"}:
             raise ValueError("kind must be 'alpha' or 'beta'")
         if hasattr(values, "detach"):
@@ -166,7 +176,7 @@ class WandbLogger:
         else:
             values = [float(value) for value in values]
         if not values:
-            return
+            return {}
 
         prefix = f"attnres_block_{kind}"
         scope = scope or "shared"
@@ -178,7 +188,6 @@ class WandbLogger:
             item_prefix = "shared"
 
         log_dict = {
-            "tokens_processed": int(tokens_processed),
             f"{prefix}/min": float(min(values)),
             f"{prefix}/max": float(max(values)),
             f"{prefix}/mean": float(sum(values) / len(values)),
@@ -188,6 +197,15 @@ class WandbLogger:
         else:
             for idx, value in enumerate(values, start=1):
                 log_dict[f"{prefix}/{item_prefix}_{idx:03d}"] = float(value)
+        return log_dict
+
+    def log_attnres_block_powers(self, kind, values, scope, tokens_processed):
+        if not self.active or values is None:
+            return
+        log_dict = {
+            "tokens_processed": int(tokens_processed),
+            **self.attnres_block_powers_metrics(kind, values, scope),
+        }
         self.run.log(log_dict)
 
     def log_checkpoint(self, step, ckpt_path, config=None, artifact_name_prefix="obpm-ckpt-step"):

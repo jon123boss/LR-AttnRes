@@ -1014,36 +1014,41 @@ while tokens_processed < max_tokens and step < max_steps:
         )
 
     if wandb_log:
+        raw_model = unwrap_model(model)
+        train_extra_metrics = {}
+        if (
+            getattr(raw_model.config, "attnres_block_learned_scale", False)
+            and hasattr(raw_model.transformer, "attnres_block_scales")
+        ):
+            train_extra_metrics.update(
+                logger.attnres_block_scales_metrics(
+                    raw_model.transformer.attnres_block_scales,
+                    raw_model.attnres_block_ends,
+                )
+            )
+        if getattr(raw_model, "use_attnres", False) and getattr(raw_model, "attnres_type", None) == "block":
+            train_extra_metrics.update(
+                logger.attnres_block_powers_metrics(
+                    "alpha",
+                    raw_model.attnres_block_power_values_for_logging("alpha"),
+                    raw_model.config.attnres_block_alpha_scope,
+                )
+            )
+            train_extra_metrics.update(
+                logger.attnres_block_powers_metrics(
+                    "beta",
+                    raw_model.attnres_block_power_values_for_logging("beta"),
+                    raw_model.config.attnres_block_beta_scope,
+                )
+            )
         logger.log_train(
             step, loss_accum, norm,
             muon_scheduler.get_last_lr()[0],
             ms_per_step, tokens_per_s, tokens_processed,
             peak_gpu_memory_gb=peak_gpu_memory_gb,
             peak_gpu_memory_reserved_gb=peak_gpu_memory_reserved_gb,
+            extra_metrics=train_extra_metrics,
         )
-        raw_model = unwrap_model(model)
-        if (
-            getattr(raw_model.config, "attnres_block_learned_scale", False)
-            and hasattr(raw_model.transformer, "attnres_block_scales")
-        ):
-            logger.log_attnres_block_scales(
-                raw_model.transformer.attnres_block_scales,
-                raw_model.attnres_block_ends,
-                tokens_processed,
-            )
-        if getattr(raw_model, "use_attnres", False) and getattr(raw_model, "attnres_type", None) == "block":
-            logger.log_attnres_block_powers(
-                "alpha",
-                raw_model.attnres_block_power_values_for_logging("alpha"),
-                raw_model.config.attnres_block_alpha_scope,
-                tokens_processed,
-            )
-            logger.log_attnres_block_powers(
-                "beta",
-                raw_model.attnres_block_power_values_for_logging("beta"),
-                raw_model.config.attnres_block_beta_scope,
-                tokens_processed,
-            )
 
     if step % log_interval == 0:
         norm_str = f"{norm:.2f}" if norm is not None else "N/A"
