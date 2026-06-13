@@ -5,6 +5,7 @@ import torch
 
 import model as model_module
 from attnres_ops import (
+    _lrid_list_dims_within_triton_limits,
     attention_residual_phase1_from_logits,
     attention_residual_phase2,
     attention_residual_phase2_torch,
@@ -230,6 +231,121 @@ def test_learned_alpha_beta_stay_fp32_after_mixed_precision():
     assert model.transformer.attnres_block_betas.dtype == torch.float32
 
 
+def test_attnres_block_split_sublayers_forward_and_fused_read_match():
+    torch.manual_seed(41)
+    common = dict(
+        n_layer=3,
+        n_head=2,
+        n_embd=16,
+        mlp_hidden_dim=32,
+        vocab_size=64,
+        block_size=8,
+        use_attnres=True,
+        attnres_type="block",
+        attnres_num_blocks=1,
+        attnres_block_average=True,
+        attnres_block_count_prior=True,
+        attnres_block_split_sublayers=True,
+        attnres_key_norm=True,
+        flash_attention=False,
+        norm_pos="before",
+    )
+    ref = OBPM(ModelConfig(**common, use_fused_attnres=False)).eval()
+    fused = OBPM(ModelConfig(**common, use_fused_attnres=True)).eval()
+    fused.load_state_dict(ref.state_dict())
+    idx = torch.randint(0, common["vocab_size"], (2, common["block_size"]))
+
+    with torch.no_grad():
+        expected = ref(idx, return_hidden=True)
+        actual = fused(idx, return_hidden=True)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_attnres_block_split_sublayers_keeps_separate_source_counts(monkeypatch):
+    cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        use_fused_attnres=False,
+        attnres_type="block",
+        attnres_num_blocks=1,
+        attnres_block_average=True,
+        attnres_block_count_prior=True,
+        attnres_block_split_sublayers=True,
+        norm_pos="before",
+    )
+    model = OBPM(cfg).eval()
+    captured = []
+    original = OBPM._apply_attnres
+
+    def wrapped(self, residual_idx, sources, *args, **kwargs):
+        biases = kwargs.get("source_logit_biases")
+        captured.append(
+            (
+                residual_idx,
+                len(sources),
+                None if biases is None else [float(bias) for bias in biases],
+            )
+        )
+        return original(self, residual_idx, sources, *args, **kwargs)
+
+    monkeypatch.setattr(OBPM, "_apply_attnres", wrapped)
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    with torch.no_grad():
+        model(idx, return_hidden=True)
+
+    assert [(idx, n_sources) for idx, n_sources, _ in captured] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 3),
+        (4, 3),
+    ]
+    assert captured[3][2] == pytest.approx([0.0, math.log(2.0), 0.0])
+    assert captured[4][2] == pytest.approx([0.0, math.log(2.0), math.log(2.0)])
+
+
+@pytest.mark.parametrize("input_dependent_query", [False, True])
+def test_attnres_block_split_sublayers_lrid_forward_and_fused_read_match(input_dependent_query):
+    torch.manual_seed(43)
+    common = dict(
+        n_layer=3,
+        n_head=2,
+        n_embd=16,
+        mlp_hidden_dim=32,
+        vocab_size=64,
+        block_size=8,
+        use_attnres=True,
+        use_lrid=True,
+        lrid_rank=4,
+        lrid_input_dependent_query=input_dependent_query,
+        lrid_key_from_output_tail=True,
+        attnres_type="block",
+        attnres_num_blocks=1,
+        attnres_block_average=True,
+        attnres_block_count_prior=True,
+        attnres_block_split_sublayers=True,
+        attnres_key_norm=True,
+        flash_attention=False,
+        norm_pos="before",
+    )
+    ref = OBPM(ModelConfig(**common, use_fused_attnres=False)).eval()
+    fused = OBPM(ModelConfig(**common, use_fused_attnres=True)).eval()
+    fused.load_state_dict(ref.state_dict())
+    idx = torch.randint(0, common["vocab_size"], (2, common["block_size"]))
+
+    with torch.no_grad():
+        expected = ref(idx, return_hidden=True)
+        actual = fused(idx, return_hidden=True)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_attnres_block_alpha_fixed_scalar_and_per_block_values():
     cfg = ModelConfig(
         n_layer=2,
@@ -394,6 +510,14 @@ def test_lrid_source_count_prior_matches_zero_query_uniform_average():
     expected = (embedding + 3 * block_mean) / 4
 
     assert torch.allclose(actual, expected)
+
+
+def test_lrid_triton_dimension_limit_rejects_r512_single_head():
+    values = [torch.empty(1, 1, 1024), torch.empty(1, 1, 1024)]
+    keys = [torch.empty(1, 1, 512), torch.empty(1, 1, 512)]
+
+    assert not _lrid_list_dims_within_triton_limits(values, keys, num_heads=1)
+    assert _lrid_list_dims_within_triton_limits(values, keys, num_heads=2)
 
 
 def test_attnres_source_count_prior_read_matches_torch_gradients():
@@ -785,6 +909,24 @@ def test_fused_lrid_static_query_matches_torch(num_heads, key_norm):
 
     expected = lrid_attention_residual_read_torch(sources, keys, query, num_heads, 0.25, key_norm)
     actual = lrid_attention_residual_read(sources, keys, query, num_heads, 0.25, key_norm, force_triton=True)
+    torch.cuda.synchronize()
+    _assert_close(actual, expected, dtype)
+
+
+def test_fused_lrid_r512_single_head_eval_falls_back_to_torch():
+    device = _cuda_device()
+    torch.manual_seed(26)
+    dtype = torch.float32
+    num_heads = 1
+    rank = 512
+    n_embd = 1024
+    sources = [torch.randn(1, 3, n_embd, device=device, dtype=dtype) for _ in range(3)]
+    keys = [torch.randn(1, 3, rank, device=device, dtype=dtype) for _ in range(3)]
+    query = torch.randn(num_heads, rank // num_heads, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        expected = lrid_attention_residual_read_torch(sources, keys, query, num_heads, 1.0, True)
+        actual = lrid_attention_residual_read(sources, keys, query, num_heads, 1.0, True)
     torch.cuda.synchronize()
     _assert_close(actual, expected, dtype)
 

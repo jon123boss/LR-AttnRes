@@ -78,6 +78,7 @@ class ModelConfig:
     attnres_block_beta_learned: bool = False
     attnres_block_alpha_scope: str = "shared"
     attnres_block_beta_scope: str = "shared"
+    attnres_block_split_sublayers: bool = False
     attnres_block_learned_scale: bool = False
     attnres_block_learned_scale_init: str = "count"
     attnres_block_value_norm: bool = False
@@ -1111,6 +1112,179 @@ class OBPM(nn.Module):
             return None
         return biases
 
+    def _attnres_block_logit_biases_for_sources(self, read_idx, source_counts, source_summary_idxs):
+        if not self._use_attnres_block_count_prior():
+            return None
+        biases = [
+            self._attnres_block_count_logit_bias(
+                count,
+                read_idx=read_idx,
+                source_summary_idx=summary_idx,
+            )
+            for count, summary_idx in zip(source_counts, source_summary_idxs)
+        ]
+        has_tensor = any(torch.is_tensor(bias) for bias in biases)
+        has_nonzero = any((not torch.is_tensor(bias)) and float(bias) != 0.0 for bias in biases)
+        if not has_tensor and not has_nonzero:
+            return None
+        return biases
+
+    def _attnres_split_partial_entries(self, partial_values, partial_counts, partial_summary_idxs):
+        entries = []
+        for value, count, summary_idx in zip(partial_values, partial_counts, partial_summary_idxs):
+            if value is None:
+                continue
+            entries.append((value, count, summary_idx))
+        return entries
+
+    def _attnres_split_partial_sources(self, partial_values, partial_counts, partial_summary_idxs):
+        return [
+            self._attnres_block_summary(value, count, summary_idx)
+            for value, count, summary_idx in self._attnres_split_partial_entries(
+                partial_values,
+                partial_counts,
+                partial_summary_idxs,
+            )
+        ]
+
+    def _attnres_split_source_logit_biases(
+        self,
+        read_idx,
+        completed_counts,
+        completed_summary_idxs,
+        partial_values,
+        partial_counts,
+        partial_summary_idxs,
+    ):
+        partial_entries = self._attnres_split_partial_entries(
+            partial_values,
+            partial_counts,
+            partial_summary_idxs,
+        )
+        source_counts = completed_counts + [count for _, count, _ in partial_entries]
+        source_summary_idxs = completed_summary_idxs + [summary_idx for _, _, summary_idx in partial_entries]
+        return self._attnres_block_logit_biases_for_sources(
+            read_idx,
+            source_counts,
+            source_summary_idxs,
+        )
+
+    def _attnres_split_add_partial(self, partial_values, partial_counts, partial_summary_idxs, slot, value, summary_idx):
+        if partial_values[slot] is None:
+            partial_values[slot] = value
+            partial_counts[slot] = 1
+        else:
+            partial_values[slot] = partial_values[slot] + value
+            partial_counts[slot] += 1
+        partial_summary_idxs[slot] = summary_idx
+
+    def _attnres_split_flush_partials(
+        self,
+        completed_blocks,
+        completed_counts,
+        completed_summary_idxs,
+        partial_values,
+        partial_counts,
+        partial_summary_idxs,
+    ):
+        for slot, (value, count, summary_idx) in enumerate(
+            zip(partial_values, partial_counts, partial_summary_idxs)
+        ):
+            if value is None:
+                continue
+            completed_blocks.append(self._attnres_block_summary(value, count, summary_idx))
+            completed_counts.append(count)
+            completed_summary_idxs.append(summary_idx)
+            partial_values[slot] = None
+            partial_counts[slot] = 0
+            partial_summary_idxs[slot] = None
+
+    def _lrid_split_add_partial(
+        self,
+        partial_values,
+        partial_keys,
+        partial_queries,
+        partial_counts,
+        partial_summary_idxs,
+        slot,
+        value,
+        lrid_key,
+        lrid_query,
+        summary_idx,
+        key_projector=None,
+        query_projector=None,
+    ):
+        if partial_values[slot] is None:
+            partial_values[slot] = value
+            partial_counts[slot] = 1
+        else:
+            partial_values[slot] = partial_values[slot] + value
+            partial_counts[slot] += 1
+        partial_summary_idxs[slot] = summary_idx
+
+        block_source_value = self._attnres_block_summary(
+            partial_values[slot],
+            partial_counts[slot],
+            summary_idx,
+        )
+        if self.config.lrid_key_from_value_shared:
+            partial_keys[slot] = None
+        elif self.config.lrid_key_from_value:
+            partial_keys[slot] = key_projector(block_source_value)
+        else:
+            partial_keys[slot] = (
+                lrid_key
+                if partial_counts[slot] == 1
+                else partial_keys[slot] + lrid_key
+            )
+
+        if self.config.lrid_input_dependent_query:
+            if self.config.lrid_query_from_value_shared:
+                partial_queries[slot] = None
+            elif self.config.lrid_query_from_value:
+                partial_queries[slot] = query_projector(block_source_value)
+            else:
+                partial_queries[slot] = lrid_query
+
+    def _lrid_split_flush_partials(
+        self,
+        completed_blocks,
+        completed_counts,
+        completed_summary_idxs,
+        partial_values,
+        partial_keys,
+        partial_queries,
+        partial_counts,
+        partial_summary_idxs,
+    ):
+        for slot, (value, key, query, count, summary_idx) in enumerate(
+            zip(
+                partial_values,
+                partial_keys,
+                partial_queries,
+                partial_counts,
+                partial_summary_idxs,
+            )
+        ):
+            if value is None:
+                continue
+            completed_blocks.append(
+                self._lrid_block_source(
+                    value,
+                    key,
+                    query if self.config.lrid_input_dependent_query else None,
+                    count,
+                    summary_idx,
+                )
+            )
+            completed_counts.append(count)
+            completed_summary_idxs.append(summary_idx)
+            partial_values[slot] = None
+            partial_keys[slot] = None
+            partial_queries[slot] = None
+            partial_counts[slot] = 0
+            partial_summary_idxs[slot] = None
+
     def _attnres_block_read_logit_biases(self, count, first_read, source_summary_idx, device):
         if not self._use_attnres_block_count_prior() or count == 1:
             return None
@@ -1182,6 +1356,262 @@ class OBPM(nn.Module):
                 source_summary_idx=source_summary_idx,
             ),
         )
+
+    def _forward_block_attnres_split_sublayers(
+        self,
+        x,
+        past_kv=None,
+        use_cache=False,
+        cu_doc_len=None,
+        max_doc_len=None,
+        return_hidden=False,
+        fused_read_norm=False,
+    ):
+        if past_kv is not None or use_cache:
+            raise NotImplementedError("KV-cache generation is not supported with attention residuals yet.")
+        if self.use_lrid:
+            raise NotImplementedError("attnres_block_split_sublayers is currently implemented for non-LRID block AttnRes.")
+
+        completed_blocks = [x]
+        completed_block_counts = [1]
+        completed_block_summary_idxs = [None]
+        partial_values = [None, None]
+        partial_counts = [0, 0]
+        partial_summary_idxs = [None, None]
+        block_end_set = self.attnres_block_ends
+
+        def read_residual(residual_idx):
+            sources = completed_blocks + self._attnres_split_partial_sources(
+                partial_values,
+                partial_counts,
+                partial_summary_idxs,
+            )
+            source_logit_biases = self._attnres_split_source_logit_biases(
+                residual_idx,
+                completed_block_counts,
+                completed_block_summary_idxs,
+                partial_values,
+                partial_counts,
+                partial_summary_idxs,
+            )
+            return self._apply_attnres(
+                residual_idx,
+                sources,
+                normalize_output=fused_read_norm,
+                average_read=False,
+                source_logit_biases=source_logit_biases,
+            )
+
+        def add_partial(slot, value, summary_idx):
+            self._attnres_split_add_partial(
+                partial_values,
+                partial_counts,
+                partial_summary_idxs,
+                slot,
+                value,
+                summary_idx,
+            )
+
+        def flush_if_block_end(residual_idx):
+            if residual_idx not in block_end_set:
+                return
+            self._attnres_split_flush_partials(
+                completed_blocks,
+                completed_block_counts,
+                completed_block_summary_idxs,
+                partial_values,
+                partial_counts,
+                partial_summary_idxs,
+            )
+
+        for layer_idx, block in enumerate(self.transformer.layers):
+            x = read_residual(2 * layer_idx)
+            attn_out = block.forward_attention(
+                x,
+                past_kv=None,
+                use_cache=False,
+                cu_doc_len=cu_doc_len,
+                max_doc_len=max_doc_len,
+                x_is_normalized=fused_read_norm,
+            )
+            add_partial(0, attn_out, 2 * layer_idx + 1)
+            flush_if_block_end(2 * layer_idx + 1)
+
+            x = read_residual(2 * layer_idx + 1)
+            mlp_out = block.forward_mlp(x, x_is_normalized=fused_read_norm)
+            add_partial(1, mlp_out, 2 * layer_idx + 2)
+            flush_if_block_end(2 * layer_idx + 2)
+
+        x = read_residual(2 * self.config.n_layer)
+        if not fused_read_norm:
+            x = norm(x)
+
+        if return_hidden:
+            return x
+
+        if self.config.weight_tying:
+            return F.linear(x, self.transformer.wte.weight, None)
+        return self.lm_head(x)
+
+    def _forward_block_lrid_attnres_split_sublayers(
+        self,
+        x,
+        past_kv=None,
+        use_cache=False,
+        cu_doc_len=None,
+        max_doc_len=None,
+        return_hidden=False,
+        fused_read_norm=False,
+    ):
+        if past_kv is not None or use_cache:
+            raise NotImplementedError("KV-cache generation is not supported with attention residuals yet.")
+
+        completed_blocks = [self._embedding_lrid_source(x)]
+        completed_block_counts = [1]
+        completed_block_summary_idxs = [None]
+        partial_values = [None, None]
+        partial_keys = [None, None]
+        partial_queries = [None, None]
+        partial_counts = [0, 0]
+        partial_summary_idxs = [None, None]
+        latest_partial_slot = None
+        block_end_set = self.attnres_block_ends
+
+        def read_residual(residual_idx):
+            partial_sources = []
+            query_override = None
+            for slot, (value, key, query, count, summary_idx) in enumerate(
+                zip(
+                    partial_values,
+                    partial_keys,
+                    partial_queries,
+                    partial_counts,
+                    partial_summary_idxs,
+                )
+            ):
+                if value is None:
+                    continue
+                source = self._lrid_block_source(
+                    value,
+                    key,
+                    query if self.config.lrid_input_dependent_query else None,
+                    count,
+                    summary_idx,
+                )
+                partial_sources.append(source)
+                if self.config.lrid_input_dependent_query and slot == latest_partial_slot:
+                    query_override = source[2]
+            sources = completed_blocks + partial_sources
+            source_logit_biases = self._attnres_split_source_logit_biases(
+                residual_idx,
+                completed_block_counts,
+                completed_block_summary_idxs,
+                partial_values,
+                partial_counts,
+                partial_summary_idxs,
+            )
+            return self._apply_lrid_attnres(
+                residual_idx,
+                sources,
+                query_override=query_override,
+                normalize_output=fused_read_norm,
+                average_read=False,
+                source_logit_biases=source_logit_biases,
+            )
+
+        def add_partial(slot, value, lrid_key, lrid_query, summary_idx, key_projector, query_projector=None):
+            nonlocal latest_partial_slot
+            self._lrid_split_add_partial(
+                partial_values,
+                partial_keys,
+                partial_queries,
+                partial_counts,
+                partial_summary_idxs,
+                slot,
+                value,
+                lrid_key,
+                lrid_query,
+                summary_idx,
+                key_projector=key_projector,
+                query_projector=query_projector,
+            )
+            latest_partial_slot = slot
+
+        def flush_if_block_end(residual_idx):
+            nonlocal latest_partial_slot
+            if residual_idx not in block_end_set:
+                return
+            self._lrid_split_flush_partials(
+                completed_blocks,
+                completed_block_counts,
+                completed_block_summary_idxs,
+                partial_values,
+                partial_keys,
+                partial_queries,
+                partial_counts,
+                partial_summary_idxs,
+            )
+            latest_partial_slot = None
+
+        for layer_idx, block in enumerate(self.transformer.layers):
+            x = read_residual(2 * layer_idx)
+            attn_out = block.forward_attention(
+                x,
+                past_kv=None,
+                use_cache=False,
+                cu_doc_len=cu_doc_len,
+                max_doc_len=max_doc_len,
+                x_is_normalized=fused_read_norm,
+                emit_lrid_key=True,
+            )
+            if self.config.lrid_input_dependent_query:
+                attn_out, lrid_key, lrid_query = attn_out
+            else:
+                attn_out, lrid_key = attn_out
+                lrid_query = None
+            add_partial(
+                0,
+                attn_out,
+                lrid_key,
+                lrid_query,
+                2 * layer_idx + 1,
+                block.attn.c_proj.project_key_from_value,
+                block.attn.c_proj.project_query_from_value,
+            )
+            flush_if_block_end(2 * layer_idx + 1)
+
+            x = read_residual(2 * layer_idx + 1)
+            mlp_out = block.forward_mlp(
+                x,
+                x_is_normalized=fused_read_norm,
+                emit_lrid_key=True,
+            )
+            if self.config.lrid_input_dependent_query:
+                mlp_out, lrid_key, lrid_query = mlp_out
+            else:
+                mlp_out, lrid_key = mlp_out
+                lrid_query = None
+            add_partial(
+                1,
+                mlp_out,
+                lrid_key,
+                lrid_query,
+                2 * layer_idx + 2,
+                block.mlp.fc2.project_key_from_value,
+                block.mlp.fc2.project_query_from_value,
+            )
+            flush_if_block_end(2 * layer_idx + 2)
+
+        x = read_residual(2 * self.config.n_layer)
+        if not fused_read_norm:
+            x = norm(x)
+
+        if return_hidden:
+            return x
+
+        if self.config.weight_tying:
+            return F.linear(x, self.transformer.wte.weight, None)
+        return self.lm_head(x)
 
     def _apply_lrid_training_phase2(
         self,
@@ -1812,6 +2242,32 @@ class OBPM(nn.Module):
             and self.config.attnres_fuse_read_norm
             and (not self.use_lrid or self.config.lrid_num_heads == 1)
         )
+        if (
+            self.use_attnres
+            and self.attnres_type == "block"
+            and self.config.attnres_block_split_sublayers
+            and past_kv is None
+            and not use_cache
+        ):
+            if self.use_lrid:
+                return self._forward_block_lrid_attnres_split_sublayers(
+                    x,
+                    past_kv=past_kv,
+                    use_cache=use_cache,
+                    cu_doc_len=cu_doc_len,
+                    max_doc_len=max_doc_len,
+                    return_hidden=return_hidden,
+                    fused_read_norm=fused_read_norm,
+                )
+            return self._forward_block_attnres_split_sublayers(
+                x,
+                past_kv=past_kv,
+                use_cache=use_cache,
+                cu_doc_len=cu_doc_len,
+                max_doc_len=max_doc_len,
+                return_hidden=return_hidden,
+                fused_read_norm=fused_read_norm,
+            )
         if self._use_block_attnres_fused_training_path(past_kv, use_cache):
             return self._forward_block_attnres_fused_training(
                 x,

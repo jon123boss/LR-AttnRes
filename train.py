@@ -190,6 +190,7 @@ attnres_block_alpha_learned = False # True or False
 attnres_block_beta_learned = False # True or False
 attnres_block_alpha_scope = "shared" # shared, per_residual, or per_block
 attnres_block_beta_scope = "shared" # shared, per_residual, or per_block
+attnres_block_split_sublayers = False # True keeps separate attention and MLP summaries per block
 attnres_block_learned_scale = False
 attnres_block_learned_scale_init = "count" # count, sqrt, or one
 attnres_block_value_norm = False
@@ -505,6 +506,8 @@ def parse_args():
     parser.add_argument("--no-attnres_block_beta_learned", dest="attnres_block_beta_learned", action="store_false")
     parser.add_argument("--attnres_block_alpha_scope", choices=("shared", "per_residual", "per_block"), default=attnres_block_alpha_scope)
     parser.add_argument("--attnres_block_beta_scope", choices=("shared", "per_residual", "per_block"), default=attnres_block_beta_scope)
+    parser.add_argument("--attnres_block_split_sublayers", type=_str_to_bool, nargs="?", const=True, default=attnres_block_split_sublayers)
+    parser.add_argument("--no-attnres_block_split_sublayers", dest="attnres_block_split_sublayers", action="store_false")
     parser.add_argument("--attnres_block_learned_scale", type=_str_to_bool, nargs="?", const=True, default=attnres_block_learned_scale)
     parser.add_argument("--no-attnres_block_learned_scale", dest="attnres_block_learned_scale", action="store_false")
     parser.add_argument(
@@ -599,6 +602,7 @@ attnres_block_alpha_learned = args.attnres_block_alpha_learned
 attnres_block_beta_learned = args.attnres_block_beta_learned
 attnres_block_alpha_scope = args.attnres_block_alpha_scope
 attnres_block_beta_scope = args.attnres_block_beta_scope
+attnres_block_split_sublayers = args.attnres_block_split_sublayers
 attnres_block_learned_scale = args.attnres_block_learned_scale
 attnres_block_learned_scale_init = args.attnres_block_learned_scale_init
 attnres_block_value_norm = args.attnres_block_value_norm

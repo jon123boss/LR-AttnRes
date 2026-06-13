@@ -168,6 +168,12 @@ from `1/c`, `sqrt` starts from `1/sqrt(c)`, and `one` starts from the raw sum.
 When `--attnres_block_value_norm` is enabled, the block source value is instead
 stateless RMS-normalized to unit RMS scale. This overrides fixed averaging and
 is mutually exclusive with learned block scaling.
+Use `--attnres_block_split_sublayers` to keep attention-output summaries and
+MLP-output summaries separate inside each compressed block. For example, with
+24 layers and 8 blocks, a completed block emits at most two sources instead of
+one: one summary for the three attention outputs and one summary for the three
+MLP outputs. This targets the case where scalar count corrections cannot recover
+source-type routing information lost by averaging all sublayers together.
 
 The token embedding is also a depth source, so it gets its own low-rank key projection:
 
@@ -350,6 +356,10 @@ prior `beta * log(count)`. Their default `legacy` values reproduce the old
 flags: count averaging maps to `alpha=1`, sqrt averaging maps to `alpha=0.5`,
 and the count prior maps to `beta=1`. Alpha and beta can be learned and scoped
 as `shared`, `per_residual`, or `per_block`.
+`--attnres_block_split_sublayers` is a structural block compression variant:
+each compressed block keeps separate attention-output and MLP-output summaries.
+The count prior and alpha/beta scaling are then applied to each split summary
+using that summary's own source count.
 In LR AttnRes, emitted block source keys are scaled only when
 `--no-attnres_key_norm` is used; when key normalization is enabled, dividing a
 key by the denominator would be removed by the later RMSNorm. The fused dynamic
@@ -543,6 +553,7 @@ attnres_block_alpha_learned: bool
 attnres_block_beta_learned: bool
 attnres_block_alpha_scope: "shared" | "per_residual" | "per_block"
 attnres_block_beta_scope: "shared" | "per_residual" | "per_block"
+attnres_block_split_sublayers: bool
 attnres_block_learned_scale: bool
 attnres_block_learned_scale_init: "count" | "sqrt" | "one"
 attnres_block_value_norm: bool
@@ -582,6 +593,8 @@ Training CLI:
 --no-attnres_block_beta_learned
 --attnres_block_alpha_scope {shared,per_residual,per_block}
 --attnres_block_beta_scope {shared,per_residual,per_block}
+--attnres_block_split_sublayers
+--no-attnres_block_split_sublayers
 --attnres_block_learned_scale
 --no-attnres_block_learned_scale
 --attnres_block_learned_scale_init {count,sqrt,one}

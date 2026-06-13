@@ -110,6 +110,7 @@ def get_model(config, device):
             attnres_block_beta_learned = config.get("attnres_block_beta_learned", False),
             attnres_block_alpha_scope = config.get("attnres_block_alpha_scope", "shared"),
             attnres_block_beta_scope = config.get("attnres_block_beta_scope", "shared"),
+            attnres_block_split_sublayers = config.get("attnres_block_split_sublayers", False),
             attnres_block_learned_scale = config.get("attnres_block_learned_scale", False),
             attnres_block_learned_scale_init = config.get("attnres_block_learned_scale_init", "count"),
             attnres_block_value_norm = config.get("attnres_block_value_norm", False),

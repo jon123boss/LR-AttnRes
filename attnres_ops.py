@@ -4316,10 +4316,26 @@ def _lrid_read_from_count_logits(
 
 
 
-def _can_use_triton_lrid_list(values, keys, query: Tensor) -> bool:
+def _lrid_list_dims_within_triton_limits(values, keys, num_heads: int) -> bool:
+    try:
+        H = int(num_heads)
+    except (TypeError, ValueError):
+        return False
+    if H < 1:
+        return False
+    D = values[0].size(-1)
+    R = keys[0].size(-1)
+    if D % H != 0 or R % H != 0:
+        return False
+    return D // H <= 4096 and R // H <= 256
+
+
+def _can_use_triton_lrid_list(values, keys, query: Tensor, num_heads: int) -> bool:
     if not _TRITON_AVAILABLE or isinstance(values, Tensor) or isinstance(keys, Tensor):
         return False
     if len(values) != len(keys) or len(values) < 2 or len(values) > 16:
+        return False
+    if not _lrid_list_dims_within_triton_limits(values, keys, num_heads):
         return False
     allowed_dtypes = {torch.float16, torch.bfloat16, torch.float32}
     tensors = (*values, *keys)
@@ -4857,7 +4873,7 @@ def lrid_attention_residual_read(
             force_triton=force_triton,
             normalize_output=normalize_output,
         )
-    if source_counts is None and _can_use_triton_lrid_list(values, keys, query):
+    if source_counts is None and _can_use_triton_lrid_list(values, keys, query, num_heads):
         if torch.is_grad_enabled():
             training_kernel_mode = _training_kernel_mode()
             if training_kernel_mode in {"auto", "triton_op"} and _lrid_read_list_library_op is not None and query.dim() != 4:

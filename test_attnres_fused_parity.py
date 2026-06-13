@@ -200,6 +200,7 @@ def common_model_kwargs(
     attnres_block_beta_learned: bool = False,
     attnres_block_alpha_scope: str = "shared",
     attnres_block_beta_scope: str = "shared",
+    attnres_block_split_sublayers: bool = False,
 ) -> dict:
     attnres_block_count_prior = (
         attnres_type == "block"
@@ -227,6 +228,7 @@ def common_model_kwargs(
         attnres_block_beta_learned=attnres_block_beta_learned,
         attnres_block_alpha_scope=attnres_block_alpha_scope,
         attnres_block_beta_scope=attnres_block_beta_scope,
+        attnres_block_split_sublayers=attnres_block_split_sublayers,
         attnres_block_learned_scale=attnres_block_learned_scale,
         attnres_block_learned_scale_init=attnres_block_learned_scale_init,
         attnres_block_value_norm=attnres_block_value_norm,
@@ -257,6 +259,7 @@ def model_parity_check(
     attnres_block_beta_learned: bool = False,
     attnres_block_alpha_scope: str = "shared",
     attnres_block_beta_scope: str = "shared",
+    attnres_block_split_sublayers: bool = False,
 ) -> None:
     torch.manual_seed(
         30
@@ -274,6 +277,7 @@ def model_parity_check(
         + (9000 if attnres_block_beta_learned else 0)
         + (10000 if attnres_block_alpha_scope == "per_residual" else 0)
         + (11000 if attnres_block_alpha_scope == "per_block" else 0)
+        + (12000 if attnres_block_split_sublayers else 0)
     )
     kwargs = common_model_kwargs(
         use_lrid,
@@ -288,6 +292,7 @@ def model_parity_check(
         attnres_block_beta_learned,
         attnres_block_alpha_scope,
         attnres_block_beta_scope,
+        attnres_block_split_sublayers,
     )
     if use_lrid:
         kwargs["lrid_key_from_output_tail"] = lrid_key_from_output_tail
@@ -311,7 +316,8 @@ def model_parity_check(
         f"learned_scale={attnres_block_learned_scale} learned_init={attnres_block_learned_scale_init} "
         f"value_norm={attnres_block_value_norm} alpha={attnres_block_alpha} beta={attnres_block_beta} "
         f"alpha_learned={attnres_block_alpha_learned} beta_learned={attnres_block_beta_learned} "
-        f"alpha_scope={attnres_block_alpha_scope} beta_scope={attnres_block_beta_scope}"
+        f"alpha_scope={attnres_block_alpha_scope} beta_scope={attnres_block_beta_scope} "
+        f"split_sublayers={attnres_block_split_sublayers}"
     )
     assert_close(f"{prefix} forward", actual, expected, atol, rtol)
     assert_close(f"{prefix} embedding grad", fused.transformer.wte.weight.grad, ref.transformer.wte.weight.grad, atol, rtol)
@@ -348,6 +354,7 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg.attnres_block_beta_learned is False
         assert cfg.attnres_block_alpha_scope == "shared"
         assert cfg.attnres_block_beta_scope == "shared"
+        assert cfg.attnres_block_split_sublayers is False
         assert cfg.attnres_block_learned_scale is False
         assert cfg.attnres_block_learned_scale_init == "count"
         assert cfg.attnres_block_value_norm is False
@@ -376,6 +383,7 @@ def compatibility_check(device: torch.device) -> None:
         assert "attnres_block_beta_learned" not in old_checkpoint_model_args
         assert "attnres_block_alpha_scope" not in old_checkpoint_model_args
         assert "attnres_block_beta_scope" not in old_checkpoint_model_args
+        assert "attnres_block_split_sublayers" not in old_checkpoint_model_args
         assert "attnres_block_learned_scale" not in old_checkpoint_model_args
         assert "attnres_block_learned_scale_init" not in old_checkpoint_model_args
         assert "attnres_block_value_norm" not in old_checkpoint_model_args
@@ -389,6 +397,7 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg_from_old_checkpoint.attnres_block_beta_learned is False
         assert cfg_from_old_checkpoint.attnres_block_alpha_scope == "shared"
         assert cfg_from_old_checkpoint.attnres_block_beta_scope == "shared"
+        assert cfg_from_old_checkpoint.attnres_block_split_sublayers is False
         assert cfg_from_old_checkpoint.attnres_block_learned_scale is False
         assert cfg_from_old_checkpoint.attnres_block_learned_scale_init == "count"
         assert cfg_from_old_checkpoint.attnres_block_value_norm is False
@@ -405,6 +414,7 @@ def compatibility_check(device: torch.device) -> None:
         assert cfg_from_new_checkpoint.attnres_block_beta_learned is False
         assert cfg_from_new_checkpoint.attnres_block_alpha_scope == "shared"
         assert cfg_from_new_checkpoint.attnres_block_beta_scope == "shared"
+        assert cfg_from_new_checkpoint.attnres_block_split_sublayers is False
         assert cfg_from_new_checkpoint.attnres_block_learned_scale is False
         assert cfg_from_new_checkpoint.attnres_block_learned_scale_init == "count"
         assert cfg_from_new_checkpoint.attnres_block_value_norm is False
@@ -523,6 +533,20 @@ def main() -> None:
                             True,
                             atol,
                             rtol,
+                        )
+                        model_parity_check(
+                            device,
+                            dtype,
+                            use_lrid,
+                            attnres_type,
+                            lrid_key_from_output_tail,
+                            "count",
+                            False,
+                            "count",
+                            False,
+                            atol,
+                            rtol,
+                            attnres_block_split_sublayers=True,
                         )
 
     if args.mode in {"all", "compat"}:

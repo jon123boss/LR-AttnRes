@@ -183,6 +183,9 @@ count averaging is `alpha=1`, sqrt averaging is `alpha=0.5`, and
 `--attnres_block_count_prior` gives `beta=1` unless disabled. Alpha and beta can
 also be learned with `--attnres_block_alpha_learned` and
 `--attnres_block_beta_learned`, scoped by `{shared,per_residual,per_block}`.
+Use `--attnres_block_split_sublayers` to keep separate attention-output and
+MLP-output summaries inside each compressed block. This preserves a coarse
+source-type routing axis while still using far fewer sources than full AttnRes.
 For a learnable alternative, `--attnres_block_learned_scale` gives each live
 partial/completed block source its own scalar, initialized with
 `--attnres_block_learned_scale_init {count,sqrt,one}`. To remove block value
