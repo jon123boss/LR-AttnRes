@@ -913,7 +913,7 @@ def test_fused_lrid_static_query_matches_torch(num_heads, key_norm):
     _assert_close(actual, expected, dtype)
 
 
-def test_fused_lrid_r512_single_head_eval_falls_back_to_torch():
+def test_fused_lrid_r512_single_head_eval_matches_torch():
     device = _cuda_device()
     torch.manual_seed(26)
     dtype = torch.float32
