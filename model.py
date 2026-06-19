@@ -1999,6 +1999,317 @@ class OBPM(nn.Module):
             return F.linear(x, self.transformer.wte.weight, None)
         return self.lm_head(x)
 
+    def _forward_block_lrid_attnres_split_fused_training(
+        self,
+        x,
+        past_kv=None,
+        use_cache=False,
+        cu_doc_len=None,
+        max_doc_len=None,
+        return_hidden=False,
+        fused_read_norm=False,
+    ):
+        if past_kv is not None or use_cache:
+            raise NotImplementedError("KV-cache generation is not supported with attention residuals yet.")
+        if self.config.lrid_input_dependent_query:
+            raise NotImplementedError("Cached split LRID training does not support input-dependent queries.")
+
+        total_sublayers = 2 * self.config.n_layer
+        block_ends = sorted(self.attnres_block_ends)
+        block_end_set = self.attnres_block_ends
+        key_dim = self.config.lrid_rank
+        query_bank = torch.stack(
+            [
+                self.transformer.lrid_queries[self._attnres_query_idx(read_idx)].reshape(key_dim)
+                for read_idx in range(1, total_sublayers + 1)
+            ],
+            dim=0,
+        )
+        if self.config.attn_res_query_norm:
+            query_bank = norm(query_bank.float()).to(x.dtype)
+        else:
+            query_bank = query_bank.to(x.dtype)
+        query_bank = query_bank.contiguous()
+
+        def source_key(source):
+            key = source[1].reshape(source[1].size(0), source[1].size(1), key_dim)
+            if self.config.attnres_key_norm:
+                key = norm(key.float()).to(source[0].dtype)
+            return key
+
+        def add_logit_bias(logit, count, read_idx, source_summary_idx):
+            bias = self._attnres_block_count_logit_bias(
+                count,
+                read_idx=read_idx,
+                source_summary_idx=source_summary_idx,
+            )
+            if torch.is_tensor(bias):
+                return logit + bias.to(device=logit.device, dtype=torch.float32).reshape(())
+            if float(bias) != 0.0:
+                return logit + float(bias)
+            return logit
+
+        def make_source_logits(source, first_read, source_count=1, source_summary_idx=None):
+            key = source_key(source)
+            queries = query_bank[first_read - 1:].to(key.dtype)
+            logits = (
+                F.linear(key, queries)
+                .permute(2, 0, 1)
+                .contiguous()
+                * self.config.lrid_logit_scale
+            )
+            logit_biases = self._attnres_block_read_logit_biases(
+                source_count,
+                first_read,
+                source_summary_idx,
+                logits.device,
+            )
+            if logit_biases is not None:
+                logits = logits + logit_biases.view(-1, 1, 1)
+            return logits
+
+        embedding_source = self._embedding_lrid_source(x)
+        completed_values = [embedding_source[0]]
+        completed_logits = [make_source_logits(embedding_source, 1, 1)]
+        completed_logit_first_reads = [1]
+        partial_values = [None, None]
+        partial_keys = [None, None]
+        partial_queries = [None, None]
+        partial_counts = [0, 0]
+        partial_summary_idxs = [None, None]
+        phase_first_read = None
+        phase_end = None
+        phase_outputs = None
+        phase_lses = None
+
+        def next_phase_end(residual_idx):
+            for block_end in block_ends:
+                if block_end > residual_idx:
+                    return block_end
+            return residual_idx + 1
+
+        def invalidate_phase():
+            nonlocal phase_first_read, phase_end, phase_outputs, phase_lses
+            phase_first_read = None
+            phase_end = None
+            phase_outputs = None
+            phase_lses = None
+
+        def ensure_phase(residual_idx):
+            nonlocal phase_first_read, phase_end, phase_outputs, phase_lses
+            if residual_idx < 1:
+                return
+            if phase_outputs is not None and phase_first_read <= residual_idx < phase_end:
+                return
+            phase_first_read = residual_idx
+            phase_end = next_phase_end(residual_idx)
+            if len(completed_values) == 1:
+                logit_offset = phase_first_read - completed_logit_first_reads[0]
+                phase_lse = completed_logits[0][logit_offset:phase_end - completed_logit_first_reads[0]].float()
+                phase_outputs = completed_values[0].unsqueeze(0).expand(phase_lse.size(0), -1, -1, -1).unbind(0)
+                phase_lses = phase_lse.unbind(0)
+                return
+            phase_logits = torch.stack(
+                [
+                    source_logits[phase_first_read - first_read:phase_end - first_read]
+                    for source_logits, first_read in zip(completed_logits, completed_logit_first_reads)
+                ],
+                dim=1,
+            ).contiguous()
+            phase_output, phase_lse = attention_residual_phase1_from_logits(
+                completed_values,
+                phase_logits,
+            )
+            phase_outputs = phase_output.unbind(0)
+            phase_lses = phase_lse.unbind(0)
+
+        def current_partial_sources():
+            sources = []
+            for value, key, query, count, summary_idx in zip(
+                partial_values,
+                partial_keys,
+                partial_queries,
+                partial_counts,
+                partial_summary_idxs,
+            ):
+                if value is None:
+                    continue
+                source = self._lrid_block_source(
+                    value,
+                    key,
+                    query if self.config.lrid_input_dependent_query else None,
+                    count,
+                    summary_idx,
+                )
+                sources.append((source, count, summary_idx))
+            return sources
+
+        def merge_partial_sources(partial_sources, interblock_output, interblock_lse, residual_idx):
+            query = query_bank[self._attnres_query_idx(residual_idx)]
+            partial_logits = []
+            partial_values_for_output = []
+            for source, count, summary_idx in partial_sources:
+                key = source_key(source)
+                logit = (
+                    torch.sum(key * query.to(key.dtype).view(1, 1, key_dim), dim=-1)
+                    * self.config.lrid_logit_scale
+                )
+                logit = add_logit_bias(logit.float(), count, residual_idx, summary_idx)
+                partial_logits.append(logit)
+                partial_values_for_output.append(source[0])
+
+            partial_logits = torch.stack(partial_logits, dim=0)
+            total_lse = torch.logsumexp(
+                torch.cat([interblock_lse.float().unsqueeze(0), partial_logits], dim=0),
+                dim=0,
+            )
+            completed_weight = torch.exp(interblock_lse.float() - total_lse).to(interblock_output.dtype)
+            output = interblock_output * completed_weight.unsqueeze(-1)
+            partial_weights = torch.exp(partial_logits - total_lse.unsqueeze(0)).to(interblock_output.dtype)
+            for weight, value in zip(partial_weights, partial_values_for_output):
+                output = output + weight.unsqueeze(-1) * value
+            return norm(output) if fused_read_norm else output
+
+        def read_residual(residual_idx):
+            if residual_idx == 0:
+                output = completed_values[0]
+                return norm(output) if fused_read_norm else output
+
+            ensure_phase(residual_idx)
+            phase_idx = residual_idx - phase_first_read
+            interblock_output = phase_outputs[phase_idx]
+            partial_sources = current_partial_sources()
+            if len(partial_sources) == 0:
+                output = interblock_output
+                return norm(output) if fused_read_norm else output
+            if len(partial_sources) == 1:
+                source, count, summary_idx = partial_sources[0]
+                query = query_bank[self._attnres_query_idx(residual_idx)].to(source[1].dtype)
+                return self._apply_lrid_training_phase2(
+                    source[0],
+                    source[1].reshape(source[1].size(0), source[1].size(1), key_dim),
+                    query,
+                    interblock_output,
+                    phase_lses[phase_idx],
+                    normalize_output=fused_read_norm,
+                    partial_count=count,
+                    read_idx=residual_idx,
+                    source_summary_idx=summary_idx,
+                )
+            return merge_partial_sources(
+                partial_sources,
+                interblock_output,
+                phase_lses[phase_idx],
+                residual_idx,
+            )
+
+        def append_partials_if_block_end(residual_idx):
+            if residual_idx not in block_end_set:
+                return
+            appended = False
+            for slot, (value, key, query, count, summary_idx) in enumerate(
+                zip(
+                    partial_values,
+                    partial_keys,
+                    partial_queries,
+                    partial_counts,
+                    partial_summary_idxs,
+                )
+            ):
+                if value is None:
+                    continue
+                completed_source = self._lrid_block_source(
+                    value,
+                    key,
+                    query if self.config.lrid_input_dependent_query else None,
+                    count,
+                    summary_idx,
+                )
+                completed_values.append(completed_source[0])
+                completed_logits.append(
+                    make_source_logits(
+                        completed_source,
+                        residual_idx,
+                        count,
+                        summary_idx,
+                    )
+                )
+                completed_logit_first_reads.append(residual_idx)
+                partial_values[slot] = None
+                partial_keys[slot] = None
+                partial_queries[slot] = None
+                partial_counts[slot] = 0
+                partial_summary_idxs[slot] = None
+                appended = True
+            if appended:
+                invalidate_phase()
+
+        def add_partial(slot, value, lrid_key, lrid_query, summary_idx, key_projector, query_projector=None):
+            self._lrid_split_add_partial(
+                partial_values,
+                partial_keys,
+                partial_queries,
+                partial_counts,
+                partial_summary_idxs,
+                slot,
+                value,
+                lrid_key,
+                lrid_query,
+                summary_idx,
+                key_projector=key_projector,
+                query_projector=query_projector,
+            )
+
+        for layer_idx, block in enumerate(self.transformer.layers):
+            x = read_residual(2 * layer_idx)
+            attn_out, lrid_key = block.forward_attention(
+                x,
+                past_kv=None,
+                use_cache=False,
+                cu_doc_len=cu_doc_len,
+                max_doc_len=max_doc_len,
+                x_is_normalized=fused_read_norm,
+                emit_lrid_key=True,
+            )
+            add_partial(
+                0,
+                attn_out,
+                lrid_key,
+                None,
+                2 * layer_idx + 1,
+                block.attn.c_proj.project_key_from_value,
+                block.attn.c_proj.project_query_from_value,
+            )
+            append_partials_if_block_end(2 * layer_idx + 1)
+
+            x = read_residual(2 * layer_idx + 1)
+            mlp_out, lrid_key = block.forward_mlp(
+                x,
+                x_is_normalized=fused_read_norm,
+                emit_lrid_key=True,
+            )
+            add_partial(
+                1,
+                mlp_out,
+                lrid_key,
+                None,
+                2 * layer_idx + 2,
+                block.mlp.fc2.project_key_from_value,
+                block.mlp.fc2.project_query_from_value,
+            )
+            append_partials_if_block_end(2 * layer_idx + 2)
+
+        x = read_residual(total_sublayers)
+        if not fused_read_norm:
+            x = norm(x)
+
+        if return_hidden:
+            return x
+
+        if self.config.weight_tying:
+            return F.linear(x, self.transformer.wte.weight, None)
+        return self.lm_head(x)
+
     def _use_block_attnres_fused_training_path(self, past_kv, use_cache):
         return (
             self.use_attnres
@@ -2025,6 +2336,12 @@ class OBPM(nn.Module):
             and not self.config.lrid_key_from_value_shared
             and not self.config.lrid_query_from_value
             and not self.config.lrid_query_from_value_shared
+        )
+
+    def _use_block_lrid_attnres_split_fused_training_path(self, past_kv, use_cache):
+        return (
+            self.config.attnres_block_split_sublayers
+            and self._use_block_lrid_attnres_fused_training_path(past_kv, use_cache)
         )
 
     def _project_lrid_source_key(self, value):
@@ -2250,6 +2567,16 @@ class OBPM(nn.Module):
             and not use_cache
         ):
             if self.use_lrid:
+                if self._use_block_lrid_attnres_split_fused_training_path(past_kv, use_cache):
+                    return self._forward_block_lrid_attnres_split_fused_training(
+                        x,
+                        past_kv=past_kv,
+                        use_cache=use_cache,
+                        cu_doc_len=cu_doc_len,
+                        max_doc_len=max_doc_len,
+                        return_hidden=return_hidden,
+                        fused_read_norm=fused_read_norm,
+                    )
                 return self._forward_block_lrid_attnres_split_sublayers(
                     x,
                     past_kv=past_kv,

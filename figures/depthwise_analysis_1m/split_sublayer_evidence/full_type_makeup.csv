@@ -1,0 +1,11 @@
+repo_id,label,group,group_name,embedding,attention,mlp
+Jonnester/LR-AttnRes-Full,Standard AttnRes Full,standard_attnres,Standard AttnRes,0.0942323860880505,0.39875072274888446,0.5070168909376483
+Jonnester/LR-AttnRes-tail-r16,Sliced LR-AttnRes Full r=16,sliced_lr_attnres,Sliced LR-AttnRes,0.11085266275691034,0.4479436733222662,0.4412036639514258
+Jonnester/LR-AttnRes-tail-r32,Sliced LR-AttnRes Full r=32,sliced_lr_attnres,Sliced LR-AttnRes,0.1304017637482766,0.4367736775026123,0.43282455810030857
+Jonnester/LR-AttnRes-tail-r64,Sliced LR-AttnRes Full r=64,sliced_lr_attnres,Sliced LR-AttnRes,0.14831065026024826,0.4050277813584929,0.44666156726261486
+Jonnester/LR-AttnRes-tail-r128,Sliced LR-AttnRes Full r=128,sliced_lr_attnres,Sliced LR-AttnRes,0.150880235733482,0.3894917785907112,0.4596279845218083
+Jonnester/LR-AttnRes-tail-r256,Sliced LR-AttnRes Full r=256,sliced_lr_attnres,Sliced LR-AttnRes,0.14450550832732664,0.37942273528995,0.4760717553843594
+Jonnester/LR-AttnRes-tail-r512,Sliced LR-AttnRes Full r=512,sliced_lr_attnres,Sliced LR-AttnRes,0.14938481815972018,0.37596199322925644,0.47465318686415275
+Jonnester/LR-AttnRes-Full-16,Projected LR-AttnRes Full r=16,lr_attnres,Projected LR-AttnRes,0.10246104084404543,0.44859835939298237,0.4489406006481545
+Jonnester/LR-AttnRes-Full-32,Projected LR-AttnRes Full r=32,lr_attnres,Projected LR-AttnRes,0.10804727052017886,0.4373100364596052,0.4546426927562308
+Jonnester/LR-AttnRes-Full-64,Projected LR-AttnRes Full r=64,lr_attnres,Projected LR-AttnRes,0.09576788453936076,0.44388676009606726,0.4603453555930646

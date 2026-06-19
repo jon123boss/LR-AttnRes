@@ -1,0 +1,10 @@
+repo_id,label,embedding_mean,attention_mean,mlp_mean
+Jonnester/LR-AttnRes-n4,Standard AttnRes n=4,0.197446795,0.433346501,0.369206704
+Jonnester/LR-AttnRes-n8,Standard AttnRes n=8,0.130077064,0.472176963,0.397745972
+Jonnester/LR-AttnRes-n16,Standard AttnRes n=16,0.095316380,0.427053457,0.477630163
+Jonnester/LR-AttnRes-tail-r64-n4,Sliced LR-AttnRes n=4 r=64,0.324532286,0.375554806,0.299912908
+Jonnester/LR-AttnRes-tail-r64-n8,Sliced LR-AttnRes n=8 r=64,0.243837366,0.426514225,0.329648409
+Jonnester/LR-AttnRes-tail-r64-n16,Sliced LR-AttnRes n=16 r=64,0.190183389,0.398073016,0.411743594
+Jonnester/LR-AttnRes-n4-r32,Projected LR-AttnRes n=4 r=32,0.084032436,0.479613399,0.436354165
+Jonnester/LR-AttnRes-LR-n8-r32,Projected LR-AttnRes n=8 r=32,0.087786562,0.479544760,0.432668678
+Jonnester/LR-AttnRes-n16-r32,Projected LR-AttnRes n=16 r=32,0.086678829,0.451247173,0.462073998

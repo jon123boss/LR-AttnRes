@@ -1685,25 +1685,96 @@ def choose_representative_models(results: list[AnalysisResult]) -> list[Analysis
     return out
 
 
+def choose_effective_sources_comparison_models(results: list[AnalysisResult]) -> list[AnalysisResult]:
+    selected = [
+        result
+        for result in results
+        if (
+            result.group == "standard_attnres"
+            and (
+                result.attnres_type == "full"
+                or (result.attnres_type == "block" and result.attnres_num_blocks == 8)
+            )
+        )
+        or (
+            result.group == "sliced_lr_attnres"
+            and (
+                (result.attnres_type == "full" and result.lrid_rank == 64)
+                or (result.attnres_type == "block" and result.attnres_num_blocks == 8 and result.lrid_rank == 64)
+            )
+        )
+        or (
+            result.group == "lr_attnres"
+            and (
+                (result.attnres_type == "full" and result.lrid_rank == 32)
+                or (result.attnres_type == "block" and result.attnres_num_blocks == 8 and result.lrid_rank == 32)
+            )
+        )
+    ]
+    return sorted(selected, key=model_sort_key)
+
+
 def plot_site_metric_lines(
     results: list[AnalysisResult],
     metric: str,
     ylabel: str,
     basename: str,
     output_dir: Path,
+    representative_only: bool = True,
+    solid_lines: bool = False,
+    selected_results: Optional[list[AnalysisResult]] = None,
 ) -> None:
-    representative_ids = {result.repo_id for result in choose_representative_models(results)}
-    line_results = [
-        result
-        for result in results
-        if result.attention_site_metrics and result.repo_id in representative_ids
-    ]
+    if selected_results is not None:
+        selected_ids = {result.repo_id for result in selected_results}
+        line_results = [
+            result
+            for result in results
+            if result.attention_site_metrics and result.repo_id in selected_ids
+        ]
+    elif representative_only:
+        representative_ids = {result.repo_id for result in choose_representative_models(results)}
+        line_results = [
+            result
+            for result in results
+            if result.attention_site_metrics and result.repo_id in representative_ids
+        ]
+    else:
+        line_results = [result for result in results if result.attention_site_metrics]
     if not line_results:
         return
+    line_results = sorted(line_results, key=model_sort_key)
     set_academic_rcparams()
-    fig, ax = plt.subplots(figsize=FIGSIZE)
+    compact_selection = selected_results is not None
+    fig, ax = plt.subplots(figsize=FIGSIZE if representative_only or compact_selection else (8.2, 5.25))
     fig.patch.set_facecolor("white")
-    for result in sorted(line_results, key=model_sort_key):
+    color_by_repo: dict[str, Any] = {}
+    if compact_selection and line_results and all(
+        result.group in {"standard_attnres", "sliced_lr_attnres", "lr_attnres"} for result in line_results
+    ):
+        gradient_by_group = {
+            "standard_attnres": mpl.colors.LinearSegmentedColormap.from_list(
+                "standard_attnres_blue_gradient",
+                ["#2563EB", "#0B2E6B"],
+            ),
+            "sliced_lr_attnres": mpl.colors.LinearSegmentedColormap.from_list(
+                "sliced_full_yellow_gradient",
+                ["#F59E0B", "#92400E"],
+            ),
+            "lr_attnres": mpl.colors.LinearSegmentedColormap.from_list(
+                "projected_full_red_gradient",
+                ["#EF4444", "#7F1D1D"],
+            ),
+        }
+        for group, cmap in gradient_by_group.items():
+            group_results = [result for result in line_results if result.group == group]
+            denom = max(len(group_results) - 1, 1)
+            color_by_repo.update(
+                {result.repo_id: cmap(idx / denom) for idx, result in enumerate(group_results)}
+            )
+    elif not representative_only:
+        cmap = plt.get_cmap("tab20")
+        color_by_repo = {result.repo_id: cmap(idx % cmap.N) for idx, result in enumerate(line_results)}
+    for result in line_results:
         rows = sorted(result.attention_site_metrics, key=lambda row: int(row["residual_idx"]))
         xs = np.array([row["residual_idx"] for row in rows], dtype=float)
         ys = np.array([safe_float(row.get(metric)) for row in rows], dtype=object)
@@ -1712,18 +1783,29 @@ def plot_site_metric_lines(
             continue
         y_float = np.array([float(value) for value in ys[valid]], dtype=float)
         style = STYLE[result.group]
-        linestyle = "-" if result.attnres_type == "full" else "--"
+        color = color_by_repo.get(result.repo_id, style["color"])
+        linestyle = "-" if solid_lines or result.attnres_type == "full" else "--"
+        label = (
+            result_display_name(result)
+            if representative_only
+            else f"{style['name']}: {result_display_name(result)}"
+        )
         ax.plot(
             xs[valid],
             y_float,
-            color=style["color"],
-            linewidth=1.8,
+            color=color,
+            linewidth=1.8 if representative_only or compact_selection else 1.45,
             linestyle=linestyle,
-            alpha=0.88,
-            label=result_display_name(result),
+            alpha=0.92 if representative_only or compact_selection else 0.82,
+            label=label,
         )
     style_axis(ax, "Residual Read Site", ylabel)
-    finish_legend(ax, loc="best")
+    if representative_only:
+        finish_legend(ax, loc="best")
+    elif compact_selection:
+        finish_legend(ax, loc="best")
+    else:
+        finish_outside_legend(ax)
     save_figure(fig, output_dir, basename)
 
 
@@ -1781,7 +1863,7 @@ def plot_query_energy_by_site(results: list[AnalysisResult], output_dir: Path) -
     save_figure(fig, output_dir, "query_energy_dims_by_site")
 
 
-def annotate_scatter_labels(ax, rows: list[tuple[AnalysisResult, float, float]]) -> None:
+def annotate_scatter_labels(ax, rows: list[tuple[AnalysisResult, float, float]], use_adjust_text: bool = True) -> None:
     fig = ax.figure
     fig.canvas.draw()
     point_to_px = fig.dpi / 72.0
@@ -1819,7 +1901,7 @@ def annotate_scatter_labels(ax, rows: list[tuple[AnalysisResult, float, float]])
             return text.replace("Full r=", "F r")
         return text.replace("n=", "n").replace(" r=", " r")
 
-    if adjust_text is not None:
+    if use_adjust_text and adjust_text is not None:
         texts = []
         target_x = []
         target_y = []
@@ -1993,6 +2075,7 @@ def annotate_scatter_labels(ax, rows: list[tuple[AnalysisResult, float, float]])
 def plot_metric_vs_validation(results: list[AnalysisResult], output_dir: Path) -> None:
     metric_keys = [
         ("normalized_entropy_mean", "Mean Normalized Attention Entropy", "metric_vs_loss_entropy"),
+        ("effective_sources_mean", "Mean Effective Number of Sources", "metric_vs_loss_effective_sources"),
         ("js_generalized", "Mean Input Dependence (Generalized JS)", "metric_vs_loss_input_dependence"),
         ("top1_mass_mean", "Mean Top-1 Source Mass", "metric_vs_loss_top1"),
     ]
@@ -2027,12 +2110,18 @@ def plot_metric_vs_validation(results: list[AnalysisResult], output_dir: Path) -
         style_axis(ax, xlabel, "Validation Loss")
         xs = np.array([row[1] for row in rows], dtype=float)
         ys = np.array([row[2] for row in rows], dtype=float)
-        x_pad = max((float(xs.max()) - float(xs.min())) * 0.24, 0.025)
-        y_pad = max((float(ys.max()) - float(ys.min())) * 0.24, 0.003)
-        ax.set_xlim(float(xs.min()) - x_pad, float(xs.max()) + x_pad)
+        if metric == "effective_sources_mean":
+            x_pad = max((float(xs.max()) - float(xs.min())) * 0.10, 0.70)
+            y_pad = max((float(ys.max()) - float(ys.min())) * 0.22, 0.004)
+            ax.set_xlim(max(0.0, float(xs.min()) - x_pad), float(xs.max()) + x_pad)
+        else:
+            x_pad = max((float(xs.max()) - float(xs.min())) * 0.24, 0.025)
+            y_pad = max((float(ys.max()) - float(ys.min())) * 0.24, 0.003)
+            ax.set_xlim(float(xs.min()) - x_pad, float(xs.max()) + x_pad)
         ax.set_ylim(float(ys.min()) - y_pad, float(ys.max()) + y_pad)
-        annotate_scatter_labels(ax, rows)
-        finish_outside_legend(ax, handles=legend_handles())
+        annotate_scatter_labels(ax, rows, use_adjust_text=(metric != "effective_sources_mean"))
+        groups = [group for group in LEGEND_ORDER if any(row[0].group == group for row in rows)]
+        finish_outside_legend(ax, handles=legend_handles(groups))
         save_figure(fig, output_dir, basename)
 
 
@@ -2148,7 +2237,16 @@ def generate_all_plots(results: list[AnalysisResult], output_dir: Path) -> None:
     plot_query_summary(results, output_dir)
     plot_query_energy_by_site(results, output_dir)
     plot_site_metric_lines(results, "normalized_entropy_mean", "Normalized Attention Entropy", "attention_entropy_by_site", output_dir)
-    plot_site_metric_lines(results, "effective_sources_mean", "Effective Number of Sources", "attention_effective_sources_by_site", output_dir)
+    plot_site_metric_lines(
+        results,
+        "effective_sources_mean",
+        "Effective Number of Sources",
+        "attention_effective_sources_by_site",
+        output_dir,
+        representative_only=False,
+        solid_lines=True,
+        selected_results=choose_effective_sources_comparison_models(results),
+    )
     plot_site_metric_lines(results, "top1_mass_mean", "Top-1 Source Mass", "attention_top1_mass_by_site", output_dir)
     plot_site_metric_lines(results, "js_generalized", "Generalized JS Input Dependence", "attention_input_dependence_by_site", output_dir)
     plot_site_metric_lines(results, "mean_weight_cv", "Mean Source-Weight CV", "attention_weight_cv_by_site", output_dir)

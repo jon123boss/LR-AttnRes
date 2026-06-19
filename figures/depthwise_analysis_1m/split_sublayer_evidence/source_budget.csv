@@ -1,0 +1,16 @@
+variant,attnres_num_blocks,split_sublayers,max_sources,completed_depth_sources,paper_val_loss,effective_sources,paper_added_flops,group,group_name
+non-split n=4,4,False,5,4,,,,,
+split n=4,4,True,9,8,,,,,
+non-split n=8,8,False,9,8,,,,,
+split n=8,8,True,17,16,,,,,
+non-split n=16,16,False,17,16,,,,,
+split n=16,16,True,33,32,,,,,
+Standard AttnRes n=4,4,False,5,4,2.9797,1.996830314922785,0.111607,standard_attnres,Standard AttnRes
+Standard AttnRes n=8,8,False,9,8,2.9778,3.0098543530355304,0.175383,standard_attnres,Standard AttnRes
+Standard AttnRes n=16,16,False,17,16,2.9673,5.152480764884936,0.302934,standard_attnres,Standard AttnRes
+Sliced LR-AttnRes n=4 r=64,4,False,5,4,2.9533,2.664063183777539,0.059291,sliced_lr_attnres,Sliced LR-AttnRes
+Sliced LR-AttnRes n=8 r=64,8,False,9,8,2.948,4.029968905820433,0.093172,sliced_lr_attnres,Sliced LR-AttnRes
+Sliced LR-AttnRes n=16 r=64,16,False,17,16,2.9494,7.009765331358284,0.160934,sliced_lr_attnres,Sliced LR-AttnRes
+Projected LR-AttnRes n=4 r=32,4,False,5,4,2.9488,2.422028277018852,1.024809,lr_attnres,Projected LR-AttnRes
+Projected LR-AttnRes n=8 r=32,8,False,9,8,2.9477,3.9570008026067485,1.057694,lr_attnres,Projected LR-AttnRes
+Projected LR-AttnRes n=16 r=32,16,False,17,16,2.9543,7.507141988411505,1.123462,lr_attnres,Projected LR-AttnRes

@@ -346,6 +346,90 @@ def test_attnres_block_split_sublayers_lrid_forward_and_fused_read_match(input_d
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_attnres_block_split_sublayers_lrid_uses_cached_training_path(monkeypatch):
+    cfg = ModelConfig(
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        mlp_hidden_dim=16,
+        vocab_size=32,
+        block_size=4,
+        use_attnres=True,
+        use_fused_attnres=True,
+        attnres_training_cache_phase1=True,
+        use_lrid=True,
+        lrid_rank=4,
+        lrid_num_heads=1,
+        lrid_key_from_output_tail=True,
+        attnres_type="block",
+        attnres_num_blocks=1,
+        attnres_block_split_sublayers=True,
+        flash_attention=False,
+        norm_pos="before",
+    )
+    model = OBPM(cfg).eval()
+    assert model._use_block_lrid_attnres_split_fused_training_path(None, False)
+    called = []
+    original = model._forward_block_lrid_attnres_split_fused_training
+
+    def wrapped(*args, **kwargs):
+        called.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_forward_block_lrid_attnres_split_fused_training", wrapped)
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    with torch.no_grad():
+        model(idx, return_hidden=True)
+
+    assert called
+
+
+def test_attnres_block_split_sublayers_lrid_cached_training_matches_fused_read_gradients():
+    torch.manual_seed(47)
+    common = dict(
+        n_layer=3,
+        n_head=2,
+        n_embd=16,
+        mlp_hidden_dim=32,
+        vocab_size=64,
+        block_size=8,
+        use_attnres=True,
+        use_fused_attnres=True,
+        use_lrid=True,
+        lrid_rank=4,
+        lrid_num_heads=1,
+        lrid_key_from_output_tail=True,
+        attnres_type="block",
+        attnres_num_blocks=4,
+        attnres_block_average=True,
+        attnres_block_count_prior=True,
+        attnres_block_split_sublayers=True,
+        attnres_key_norm=True,
+        flash_attention=False,
+        norm_pos="before",
+    )
+    ref = OBPM(ModelConfig(**common, attnres_training_cache_phase1=False)).train()
+    cached = OBPM(ModelConfig(**common, attnres_training_cache_phase1=True)).train()
+    cached.load_state_dict(ref.state_dict(), strict=True)
+    idx = torch.randint(0, common["vocab_size"], (2, common["block_size"]))
+
+    ref_output = ref(idx, return_hidden=True)
+    cached_output = cached(idx, return_hidden=True)
+    ref_loss = ref_output.float().square().mean()
+    cached_loss = cached_output.float().square().mean()
+    ref_loss.backward()
+    cached_loss.backward()
+
+    assert torch.allclose(cached_output, ref_output, atol=1e-5, rtol=1e-5)
+    for (ref_name, ref_param), (cached_name, cached_param) in zip(ref.named_parameters(), cached.named_parameters()):
+        assert ref_name == cached_name
+        if ref_param.grad is None and cached_param.grad is None:
+            continue
+        assert ref_param.grad is not None
+        assert cached_param.grad is not None
+        assert torch.allclose(cached_param.grad, ref_param.grad, atol=1e-5, rtol=1e-5), ref_name
+
+
 def test_attnres_block_alpha_fixed_scalar_and_per_block_values():
     cfg = ModelConfig(
         n_layer=2,
