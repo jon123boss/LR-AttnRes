@@ -4,3 +4,4 @@ __pycache__/
 out/
 wandb/
 finewebedu10B/
+ultrafineweb20B_gpt4/

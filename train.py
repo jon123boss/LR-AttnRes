@@ -441,6 +441,8 @@ def parse_args():
     parser.add_argument("--ckpt_file_name", "--ckpt-file-name", type=str, default=ckpt_file_name)
     parser.add_argument("--wandb_log", type=_str_to_bool, nargs="?", const=True, default=wandb_log)
     parser.add_argument("--no-wandb_log", dest="wandb_log", action="store_false")
+    parser.add_argument("--wandb_project", type=str, default=wandb_project)
+    parser.add_argument("--wandb_run_name", type=str, default=wandb_run_name)
     parser.add_argument("--ddp_preserve_global_batch", type=_str_to_bool, nargs="?", const=True, default=ddp_preserve_global_batch)
     parser.add_argument("--no-ddp_preserve_global_batch", dest="ddp_preserve_global_batch", action="store_false")
     parser.add_argument("--ddp_find_unused_parameters", type=_str_to_bool, nargs="?", const=True, default=ddp_find_unused_parameters)
@@ -574,6 +576,8 @@ eval_only = args.eval_only
 init_from = args.init_from
 ckpt_file_name = args.ckpt_file_name
 wandb_log = args.wandb_log
+wandb_project = args.wandb_project
+wandb_run_name = args.wandb_run_name
 ddp_preserve_global_batch = args.ddp_preserve_global_batch
 ddp_find_unused_parameters = args.ddp_find_unused_parameters
 torch_compile = args.torch_compile
