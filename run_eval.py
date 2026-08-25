@@ -93,7 +93,6 @@ EVAL_SEEDS = {
 }
 
 DEFAULT_TASKS = [
-    "mmlu",
     "arc_challenge",
     "arc_easy",
     "boolq",

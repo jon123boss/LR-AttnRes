@@ -216,6 +216,8 @@ class EvaluationProtocolTests(unittest.TestCase):
         self.assertEqual(run_eval.TASK_MAPPING["siqa"], "social_iqa")
         self.assertIn("social_iqa", run_eval.DEFAULT_TASKS)
         self.assertNotIn("siqa", run_eval.DEFAULT_TASKS)
+        self.assertNotIn("mmlu", run_eval.DEFAULT_TASKS)
+        self.assertEqual(run_eval.TASK_MAPPING["MMLU"], "mmlu")
 
     def test_task_output_declares_primary_metric_and_protocol(self):
         fake_manager = SimpleNamespace(all_tasks=["piqa"])

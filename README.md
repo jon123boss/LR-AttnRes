@@ -150,10 +150,12 @@ The default suite is strict: every checkpoint and task must exist and every
 task must return nonempty metrics. `--allow-skipped` is an explicit opt-in for
 partial dataset-script runs. `--limit 1 --tasks piqa` is useful for a clearly
 labelled one-example smoke test; it must not be reported as a full benchmark.
-The declared primary metrics are length-normalized accuracy for ARC-Challenge,
-ARC-Easy, HellaSwag, OpenBookQA and PIQA, and raw accuracy for MMLU, BoolQ,
-CommonsenseQA, Social-IQA and WinoGrande. MMLU's overall group aggregate is
-saved and displayed separately from its subject-level task metrics.
+The default suite omits MMLU for these small models. It can still be requested
+explicitly with `--tasks mmlu`. The declared primary metrics are
+length-normalized accuracy for ARC-Challenge, ARC-Easy, HellaSwag, OpenBookQA
+and PIQA, and raw accuracy for BoolQ, CommonsenseQA, Social-IQA and WinoGrande.
+When requested explicitly, MMLU's overall group aggregate is saved and
+displayed separately from its subject-level task metrics.
 
 For multi-GPU validation loss, launch with `torchrun`:
 
