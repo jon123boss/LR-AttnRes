@@ -11,6 +11,7 @@ import numpy as np
 
 import run_eval
 import utils
+from criterion import get_criterion
 from dataloader import (
     DataLoaderConfig,
     ResumableDistributedSampler,
@@ -43,6 +44,42 @@ class RunEvalScoringTests(unittest.TestCase):
             "The answer is Paris",
         )
 
+    def test_artificial_multiple_choice_selects_the_known_nonfirst_answer(self):
+        wrapper = self.make_wrapper_without_checkpoint(block_size=32)
+        wrapper.tokenizer = get_tiktoken_encoding("gpt-4")
+        wrapper.eot_token_id = wrapper.tokenizer.eot_token
+
+        _, paris_ids = wrapper._encode_pair("The answer is ", "Paris")
+        _, london_ids = wrapper._encode_pair("The answer is ", "London")
+        self.assertEqual(len(paris_ids), 1)
+        self.assertEqual(len(london_ids), 1)
+
+        paris_id = paris_ids[0]
+        london_id = london_ids[0]
+
+        class KnownChoiceModel(torch.nn.Module):
+            def forward(_self, input_ids):
+                logits = torch.full(
+                    (1, input_ids.size(1), wrapper.tokenizer.n_vocab),
+                    -8.0,
+                )
+                logits[:, :, paris_id] = 1.0
+                logits[:, :, london_id] = 5.0
+                return logits
+
+        wrapper.model = KnownChoiceModel()
+        requests = [
+            SimpleNamespace(args=("The answer is ", "Paris")),
+            SimpleNamespace(args=("The answer is ", "London")),
+        ]
+
+        scores = [score for score, _ in wrapper.loglikelihood(requests)]
+
+        # The old boundary bug returned [0.0, 0.0], so argmax selected Paris
+        # merely because it was first. The known model prefers London.
+        self.assertEqual(int(np.argmax(scores)), 1)
+        self.assertGreater(scores[1], scores[0])
+
     def test_scoring_window_matches_shifted_training_inputs_and_targets(self):
         wrapper = self.make_wrapper_without_checkpoint(block_size=4)
         input_ids, target_ids = wrapper._prepare_loglikelihood_tokens(
@@ -54,16 +91,13 @@ class RunEvalScoringTests(unittest.TestCase):
         self.assertEqual(target_ids, [20, 21])
         self.assertEqual(input_ids[-len(target_ids):], [12, 20])
 
-    def test_long_continuation_uses_full_model_context_without_target_leakage(self):
+    def test_long_continuation_is_rejected_instead_of_partially_scored(self):
         wrapper = self.make_wrapper_without_checkpoint(block_size=4)
-        input_ids, target_ids = wrapper._prepare_loglikelihood_tokens(
-            context_ids=[10, 11],
-            continuation_ids=[20, 21, 22, 23, 24, 25],
-        )
-
-        self.assertEqual(input_ids, [21, 22, 23, 24])
-        self.assertEqual(target_ids, [22, 23, 24, 25])
-        self.assertEqual(len(input_ids), wrapper.max_length)
+        with self.assertRaisesRegex(ValueError, "refusing to score only a suffix"):
+            wrapper._prepare_loglikelihood_tokens(
+                context_ids=[10, 11],
+                continuation_ids=[20, 21, 22, 23, 24, 25],
+            )
 
     def test_loglikelihood_matches_manual_shifted_float32_scoring(self):
         class RecordingModel(torch.nn.Module):
@@ -213,8 +247,18 @@ class SharedLoadingTests(unittest.TestCase):
             vocab_size=32,
             block_size=8,
             flash_attention=False,
+            use_attnres=True,
+            attnres_type="block",
+            attnres_num_blocks=1,
+            attnres_block_alpha_learned=True,
+            attnres_block_beta_learned=True,
         )
         source_model = OBPM(config).to_mixed_precision(dtype=torch.bfloat16)
+        # Simulate fp32 optimizer updates that are not exactly representable in
+        # bf16. A lossy post-load mixed-precision conversion changes these.
+        with torch.no_grad():
+            source_model.transformer.attnres_block_alphas.fill_(0.123456791)
+            source_model.transformer.attnres_block_betas.fill_(0.987654328)
         payload = {
             "step": 3,
             "model_args": asdict(config),
@@ -292,6 +336,117 @@ class SharedLoadingTests(unittest.TestCase):
             self.assertTrue(torch.equal(training_batch[0], standalone_batch[0]))
             self.assertTrue(torch.equal(training_batch[1], standalone_batch[1]))
 
+    def test_real_obpm_training_and_standalone_validation_metrics_are_identical(self):
+        model_config = ModelConfig(
+            n_layer=1,
+            n_head=1,
+            n_embd=16,
+            mlp_hidden_dim=32,
+            vocab_size=32,
+            block_size=4,
+            flash_attention=False,
+        )
+        torch.manual_seed(31415)
+        source_model = OBPM(model_config)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (np.arange(65, dtype=np.uint32) % 32).tofile(
+                os.path.join(temp_dir, "finewebedu_train_000.bin")
+            )
+            (np.arange(96, 161, dtype=np.uint32) % 32).tofile(
+                os.path.join(temp_dir, "finewebedu_val_000.bin")
+            )
+            checkpoint_config = {
+                "dataset_dir": temp_dir,
+                "batch_size": 3,
+                "block_size": 4,
+                "grad_accum_steps": 2,
+                "use_doc_masking": False,
+                "doc_separator_token": 31,
+                "num_workers": 0,
+                "pin_memory": False,
+                "persistent_workers": False,
+                "data_dtype": "uint32",
+                "rank": 0,
+                "world_size": 1,
+                "seed": 42,
+                "ignore_index": -100,
+                "reduction": "mean",
+                "z_loss": False,
+                "z_loss_weight": 0.0,
+                "ce_inplace_backward": False,
+                "lm_head_chunk_size": 0,
+                "flash_attention": False,
+                "tokenizer_model": "gpt-4",
+            }
+            checkpoint_path = os.path.join(temp_dir, "ckpt_step:1.pt")
+            utils.atomic_torch_save(
+                {
+                    "step": 1,
+                    "model_args": asdict(model_config),
+                    "model": source_model.state_dict(),
+                    "config": checkpoint_config,
+                },
+                checkpoint_path,
+            )
+
+            _, training_model, _ = utils.load_model_checkpoint(
+                checkpoint_path,
+                torch.device("cpu"),
+                verbose=False,
+            )
+            _, training_val_loader = utils.get_dataloader(checkpoint_config)
+            self.assertTrue(training_model.training)
+            training_metrics = utils.compute_validation_loss(
+                training_model,
+                get_criterion(checkpoint_config),
+                training_val_loader,
+                torch.device("cpu"),
+                model_config.vocab_size,
+                use_doc_masking=False,
+            )
+            self.assertTrue(training_model.training)
+
+            standalone_wrapper = run_eval.OBPMWrapper(
+                checkpoint_path,
+                device="cpu",
+                verbose=False,
+            )
+            self.assertFalse(standalone_wrapper.model.training)
+            standalone_metrics = run_eval.run_validation_loss(standalone_wrapper)
+            self.assertFalse(standalone_wrapper.model.training)
+
+        self.assertEqual(standalone_metrics, training_metrics)
+
+    def test_lr_attnres_forward_is_identical_in_train_and_validation_modes(self):
+        config = ModelConfig(
+            n_layer=2,
+            n_head=2,
+            n_embd=16,
+            mlp_hidden_dim=32,
+            vocab_size=32,
+            block_size=8,
+            flash_attention=False,
+            use_attnres=True,
+            use_fused_attnres=True,
+            attnres_type="block",
+            attnres_num_blocks=2,
+            use_lrid=True,
+            lrid_rank=4,
+        )
+        torch.manual_seed(2718)
+        model = OBPM(config)
+        sample = torch.randint(0, config.vocab_size, (2, config.block_size))
+
+        model.train()
+        with torch.no_grad():
+            training_logits = model(sample)
+        model.eval()
+        with torch.no_grad():
+            validation_logits = model(sample)
+
+        self.assertTrue(torch.equal(training_logits, validation_logits))
+
     def test_rng_state_round_trip_replays_the_next_random_values(self):
         random.seed(99)
         np.random.seed(99)
@@ -358,6 +513,28 @@ class SharedLoadingTests(unittest.TestCase):
         resumed_sampler.set_start_index(8)
 
         self.assertEqual(list(resumed_sampler), uninterrupted_indices[8:])
+
+    def test_exact_resume_rejects_changed_data_topology(self):
+        checkpoint = {
+            "train_batches_consumed": 2,
+            "config": {
+                "dataset_dir": "dataset",
+                "batch_size": 3,
+                "block_size": 8,
+                "grad_accum_steps": 2,
+                "world_size": 1,
+                "seed": 42,
+                "use_doc_masking": False,
+                "data_dtype": "uint32",
+                "doc_separator_token": 31,
+            },
+        }
+        changed_config = dict(checkpoint["config"], batch_size=4)
+
+        with self.assertRaisesRegex(ValueError, "batch_size"):
+            utils.validate_exact_resume_data_config(checkpoint, changed_config)
+
+        utils.validate_exact_resume_data_config(checkpoint, checkpoint["config"])
 
     def test_interrupted_training_resume_matches_uninterrupted_next_step(self):
         torch.manual_seed(2026)

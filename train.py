@@ -35,6 +35,7 @@ from utils import (
     loss_to_token_sum,
     capture_rng_state,
     restore_rng_state,
+    validate_exact_resume_data_config,
     atomic_torch_save,
     unwrap_model,
 )
@@ -766,6 +767,7 @@ tokens_processed = 0
 train_batches_consumed = 0
 tokens_per_step = batch_size * block_size * grad_accum_steps * world_size
 if checkpoint is not None:
+    validate_exact_resume_data_config(checkpoint, config)
     muon_optimizer.load_state_dict(checkpoint["muon_optimizer"])
     adamw_optimizer.load_state_dict(checkpoint["adamw_optimizer"])
     muon_scheduler.load_state_dict(checkpoint["muon_scheduler"])
@@ -829,8 +831,10 @@ def estimate_loss(current_step):
     model.eval()
     ignore_index = getattr(getattr(criterion, "config", None), "ignore_index", -100)
     reduction = getattr(getattr(criterion, "config", None), "reduction", "mean")
-
-    for split, loader in [("train", train_loader), ("val", val_loader)]:
+    try:
+        # Keep the training-loss diagnostic bounded, but compute validation via
+        # the same full-loader implementation used by eval-only and run_eval.py.
+        loader = train_loader
         total_loss = 0.0
         total_tokens = 0
         total_batches = 0
@@ -890,15 +894,23 @@ def estimate_loss(current_step):
             total_loss = float(stats[0].item())
             total_tokens = int(stats[1].item())
             total_batches = int(stats[2].item())
-            if total_tokens == 0:
-                raise RuntimeError(f"No batches available while estimating {split} loss.")
-            out[split] = total_loss / total_tokens
-        else:
-            if total_tokens == 0:
-                raise RuntimeError(f"No batches available while estimating {split} loss.")
-            out[split] = total_loss / total_tokens
-    model.train()
-    return out
+        if total_tokens == 0:
+            raise RuntimeError("No batches available while estimating train loss.")
+        out["train"] = total_loss / total_tokens
+
+        val_metrics = compute_validation_loss(
+            model,
+            criterion,
+            val_loader,
+            device,
+            vocab_size,
+            use_doc_masking=use_doc_masking,
+            distributed=distributed,
+        )
+        out["val"] = val_metrics["loss"]
+        return out
+    finally:
+        model.train()
 
 step = start_step
 

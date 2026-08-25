@@ -151,6 +151,10 @@ the exact number of consumed local training batches. Resuming restores model,
 optimizer, scheduler, random state, and the next shuffled batch. Older
 checkpoints still load, but cannot reproduce the exact uninterrupted trajectory
 because they did not store RNG or in-epoch dataloader state.
+Exact batch-position resume also requires unchanged dataset files, batch size,
+gradient accumulation, world size, sequence length, masking, dtype, and seed;
+the loader rejects recorded configuration mismatches instead of silently
+resuming from a different sample.
 
 ## LR AttnRes
 

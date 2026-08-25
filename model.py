@@ -815,11 +815,18 @@ class OBPM(nn.Module):
                 if isinstance(module, LRIDFusedProjection):
                     self._init_lrid_dynamic_query_projection(module, config.init_std, config.init_cutoff_factor)
     def to_mixed_precision(self, dtype=torch.bfloat16):
-        self.to(dtype=dtype)
+        # These learned block exponents intentionally remain fp32. Preserve
+        # their exact values instead of casting fp32 -> bf16 -> fp32 along with
+        # the rest of the module, which would silently perturb checkpoints on
+        # resume/evaluation.
+        preserved_fp32 = {}
         for name in ("attnres_block_alphas", "attnres_block_betas"):
             if hasattr(self.transformer, name):
-                param = getattr(self.transformer, name)
-                param.data = param.data.float()
+                preserved_fp32[name] = getattr(self.transformer, name).detach().clone()
+        self.to(dtype=dtype)
+        for name, value in preserved_fp32.items():
+            param = getattr(self.transformer, name)
+            param.data = value.to(device=param.device, dtype=torch.float32)
         return self
     
     def get_num_params(self):
