@@ -25,6 +25,7 @@ class DataLoaderConfig:
     dtype: np.dtype = np.uint32
     rank: int = 0
     world_size: int = 1
+    seed: int = 42
 
     def __post_init__(self):
         if self.batch_size < 1:
@@ -61,6 +62,30 @@ class DistributedSequentialSampler(Sampler[int]):
         if len(self.dataset) <= self.rank:
             return 0
         return (len(self.dataset) - 1 - self.rank) // self.world_size + 1
+
+
+class ResumableDistributedSampler(DistributedSampler):
+    """Epoch-deterministic sampler that can resume at an in-epoch index."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    def set_start_index(self, start_index: int):
+        start_index = int(start_index)
+        full_length = super().__len__()
+        if start_index < 0 or start_index > full_length:
+            raise ValueError(
+                f"start_index must satisfy 0 <= start_index <= {full_length}, got {start_index}"
+            )
+        self.start_index = start_index
+
+    def __iter__(self):
+        indices = list(super().__iter__())
+        return iter(indices[self.start_index:])
+
+    def __len__(self):
+        return max(0, super().__len__() - self.start_index)
 
 
 class DocumentPackingDataset(Dataset):
@@ -362,16 +387,13 @@ def create_dataloaders(config: DataLoaderConfig):
     if config.num_workers > 0:
         loader_kwargs["prefetch_factor"] = config.prefetch_factor
 
-    train_sampler = (
-        DistributedSampler(
-            train_dataset,
-            num_replicas=config.world_size,
-            rank=config.rank,
-            shuffle=True,
-            drop_last=True,
-        )
-        if config.distributed
-        else None
+    train_sampler = ResumableDistributedSampler(
+        train_dataset,
+        num_replicas=config.world_size,
+        rank=config.rank,
+        shuffle=True,
+        seed=config.seed,
+        drop_last=True,
     )
     val_sampler = (
         DistributedSequentialSampler(val_dataset, config.rank, config.world_size)
@@ -381,9 +403,10 @@ def create_dataloaders(config: DataLoaderConfig):
 
     train_loader = TorchDataLoader(
         train_dataset,
-        shuffle=(train_sampler is None),
+        shuffle=False,
         sampler=train_sampler,
         drop_last=True,
+        generator=torch.Generator().manual_seed(config.seed),
         **loader_kwargs,
     )
 
@@ -392,6 +415,7 @@ def create_dataloaders(config: DataLoaderConfig):
         shuffle=False,
         sampler=val_sampler,
         drop_last=False,
+        generator=torch.Generator().manual_seed(config.seed + 1),
         **loader_kwargs,
     )
 
@@ -446,6 +470,7 @@ def create_validation_dataloader(config: DataLoaderConfig):
         shuffle=False,
         sampler=val_sampler,
         drop_last=False,
+        generator=torch.Generator().manual_seed(config.seed + 1),
         **loader_kwargs,
     )
 

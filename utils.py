@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from contextlib import nullcontext
 import os
+import random
 import tempfile
 import numpy as np
 from model import OBPM, ModelConfig
@@ -38,6 +39,95 @@ def unwrap_model(model):
             continue
         return model
 
+
+def strip_compiled_prefix(state_dict, prefix="_orig_mod."):
+    """Return a state dict that can be loaded into an uncompiled model."""
+    if not any(key.startswith(prefix) for key in state_dict):
+        return state_dict
+    return {
+        key[len(prefix):] if key.startswith(prefix) else key: value
+        for key, value in state_dict.items()
+    }
+
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return False
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all([rng_state.cpu() for rng_state in state["torch_cuda"]])
+    return True
+
+
+def atomic_torch_save(payload, path):
+    """Write a torch checkpoint atomically so interruptions do not corrupt it."""
+    target_path = os.path.abspath(path)
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target_path)}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    os.close(file_descriptor)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, target_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def load_model_checkpoint(ckpt_path, device, verbose=True):
+    """Load a training checkpoint using the canonical training/eval path."""
+    if verbose:
+        print(f"Loading checkpoint from: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Expected a checkpoint dictionary, got {type(checkpoint)!r}")
+    if "model_args" not in checkpoint or "model" not in checkpoint:
+        raise KeyError("Checkpoint must contain both 'model_args' and 'model'.")
+
+    checkpoint_model_args = checkpoint["model_args"]
+    if isinstance(checkpoint_model_args, ModelConfig):
+        model_config = checkpoint_model_args
+    elif isinstance(checkpoint_model_args, dict):
+        model_config = ModelConfig(**checkpoint_model_args)
+    else:
+        raise TypeError(
+            "checkpoint['model_args'] must be a dict or ModelConfig, "
+            f"got {type(checkpoint_model_args)!r}"
+        )
+
+    model = OBPM(model_config)
+    model_state_dict = checkpoint["model"]
+    if not isinstance(model_state_dict, dict):
+        raise TypeError(
+            "checkpoint['model'] must be a state dict, "
+            f"got {type(model_state_dict)!r}"
+        )
+    had_compiled_prefix = any(key.startswith("_orig_mod.") for key in model_state_dict)
+    if had_compiled_prefix and verbose:
+        print("Detected compiled model checkpoint. Removing '_orig_mod.' prefix from state dict keys.")
+    model.load_state_dict(strip_compiled_prefix(model_state_dict), strict=True)
+    model.to(device)
+    return checkpoint, model, model_config
+
+
 def get_model(config, device):
     verbose = bool(config.get("master_process", True))
     start_step = 0
@@ -66,17 +156,11 @@ def get_model(config, device):
             ckpt_path = latest_checkpoint_path(config["out_dir"])
         if verbose:
             print(f"Resuming from {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-        ckpt_model_args = checkpoint["model_args"]
-        model_config = ModelConfig(**ckpt_model_args)
-        model = OBPM(model_config)
-        model_state_dict = checkpoint['model']
-        prefix = '_orig_mod.'
-        if any(k.startswith(prefix) for k in model_state_dict.keys()):
-            if verbose:
-                print(f"Detected compiled model checkpoint. Removing '{prefix}' prefix from state dict keys.")
-            model_state_dict = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in model_state_dict.items()}
-        model.load_state_dict(model_state_dict, strict=True)
+        checkpoint, model, model_config = load_model_checkpoint(
+            ckpt_path,
+            device,
+            verbose=verbose,
+        )
         start_step = checkpoint["step"]
     elif config["init_from"] == 'scratch':
         if verbose:
@@ -146,8 +230,8 @@ def get_model(config, device):
     return start_step, checkpoint, model, model_config
 
 
-def get_dataloader(config):
-    dataloader_config = DataLoaderConfig(
+def _get_dataloader_config(config):
+    return DataLoaderConfig(
         data_dir=config["dataset_dir"],
         batch_size=config["batch_size"],
         block_size=config["block_size"],
@@ -160,25 +244,17 @@ def get_dataloader(config):
         dtype=np.dtype(config.get("data_dtype", "uint32")),
         rank=int(config.get("rank", 0)),
         world_size=int(config.get("world_size", 1)),
+        seed=int(config.get("seed", 42)),
     )
+
+
+def get_dataloader(config):
+    dataloader_config = _get_dataloader_config(config)
     return create_dataloaders(dataloader_config)
 
 
 def get_validation_dataloader(config):
-    dataloader_config = DataLoaderConfig(
-        data_dir=config["dataset_dir"],
-        batch_size=config["batch_size"],
-        block_size=config["block_size"],
-        grad_accum_steps=config["grad_accum_steps"],
-        use_doc_masking=config["use_doc_masking"],
-        doc_separator_token=config["doc_separator_token"],
-        num_workers=config["num_workers"],
-        pin_memory=config["pin_memory"],
-        persistent_workers=config["persistent_workers"],
-        dtype=np.dtype(config.get("data_dtype", "uint32")),
-        rank=int(config.get("rank", 0)),
-        world_size=int(config.get("world_size", 1)),
-    )
+    dataloader_config = _get_dataloader_config(config)
     return create_validation_dataloader(dataloader_config)
 
 

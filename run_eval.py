@@ -9,7 +9,7 @@ import glob
 import os
 import re
 from importlib.metadata import PackageNotFoundError, version
-from typing import List, Tuple, Union
+from typing import List, Union
 
 _DEFAULT_TORCH_COMPILE_CACHE_DIR = (
     os.environ.get("TORCH_COMPILE_CACHE_DIR")
@@ -25,7 +25,6 @@ from tqdm import tqdm
 
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 
-import tiktoken
 from tokenizer_utils import GPT4_TOKENIZER_MODEL as _GPT4_TOKENIZER_MODEL, get_tiktoken_encoding
 import torch.distributed as dist
 
@@ -61,12 +60,16 @@ except ModuleNotFoundError as exc:
 else:
     _LM_EVAL_IMPORT_ERROR = None
 
-from model import OBPM, ModelConfig
 from criterion import get_criterion
 from dataloader import warmup_boundaries
-from utils import compute_validation_loss, get_validation_dataloader, unwrap_model
+from utils import (
+    compute_validation_loss,
+    get_validation_dataloader,
+    load_model_checkpoint,
+    unwrap_model,
+)
 
-OLMES_DEFAULT_SHOTS = 5
+DEFAULT_NUM_FEWSHOT = 5
 DEFAULT_CKPT_DIR = "out"
 CHECKPOINT_PATTERN = "ckpt_step:*.pt"
 DEFAULT_RESULTS_FILE = os.path.join(DEFAULT_CKPT_DIR, "eval_results.txt")
@@ -228,9 +231,10 @@ def run_downstream_tasks(lm_obj: "OBPMWrapper", valid_tasks: List[str], device: 
             task_output = simple_evaluate(
                 model=lm_obj,
                 tasks=[task],
-                num_fewshot=OLMES_DEFAULT_SHOTS,
+                num_fewshot=DEFAULT_NUM_FEWSHOT,
                 batch_size=1,
                 device=device,
+                log_samples=False,
             )
         except RuntimeError as exc:
             if DATASET_SCRIPT_ERROR not in str(exc):
@@ -250,26 +254,6 @@ def run_downstream_tasks(lm_obj: "OBPMWrapper", valid_tasks: List[str], device: 
         combined_output["skipped_tasks"] = skipped_tasks
 
     return combined_output
-
-
-def _find_split_token_index(enc: tiktoken.Encoding, full_ids: List[int], context: str) -> int:
-    target_len = len(context)
-
-    lo, hi = 0, len(full_ids)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        dec_len = len(enc.decode(full_ids[:mid]))
-        if dec_len < target_len:
-            lo = mid + 1
-        else:
-            hi = mid
-
-    k0 = lo
-    for k in range(max(0, k0 - 8), min(len(full_ids) + 1, k0 + 9)):
-        if enc.decode(full_ids[:k]) == context:
-            return k
-
-    return len(enc.encode(context))
 
 
 @register_model("obpm")
@@ -295,28 +279,12 @@ class OBPMWrapper(LM):
         self.torch_compile_cache_dir = torch_compile_cache_dir
         self.verbose = bool(verbose)
 
-        if self.verbose:
-            print(f"Loading checkpoint from: {model_path}")
-        checkpoint = torch.load(model_path, map_location=self._device, weights_only=False)
-
-        model_args = checkpoint.get("model_args", {})
-        if isinstance(model_args, dict):
-            config = ModelConfig(**model_args)
-        else:
-            config = model_args
+        checkpoint, self.model, config = load_model_checkpoint(
+            model_path,
+            self._device,
+            verbose=self.verbose,
+        )
         self.checkpoint_config = checkpoint.get("config", {})
-
-        self.model = OBPM(config)
-
-
-        state_dict = checkpoint["model"]
-        unwanted_prefix = "_orig_mod."
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-
-        self.model.load_state_dict(state_dict, strict=True)
-        self.model.to(self._device)
 
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
@@ -354,55 +322,56 @@ class OBPMWrapper(LM):
     def tokenizer_name(self):
         return f"tiktoken-{self.tokenizer.name}"
 
-    def _truncate_left(self, ids: List[int], split: int) -> Tuple[List[int], int]:
-        overflow = len(ids) - self.max_length
-        if overflow <= 0:
-            return ids, split
-
-        ids = ids[overflow:]
-        split = max(1, split - overflow) 
-        return ids, split
-
     def _encode_pair(self, context: str, continuation: str):
+        # Match lm-eval's causal-tokenizer contract. A trailing prompt space can
+        # merge with the first answer token, so it belongs to the continuation.
+        trailing_spaces = len(context) - len(context.rstrip())
+        if trailing_spaces:
+            continuation = context[-trailing_spaces:] + continuation
+            context = context[:-trailing_spaces]
 
-        full_text = context + continuation
-        full_ids = self.tokenizer.encode(full_text)
+        if context:
+            full_ids = self.tokenizer.encode(context + continuation)
+            context_ids = self.tokenizer.encode(context)
+            continuation_ids = full_ids[len(context_ids):]
+        else:
+            context_ids = [self.eot_token_id]
+            continuation_ids = self.tokenizer.encode(continuation)
 
-        split = _find_split_token_index(self.tokenizer, full_ids, context)
+        return context_ids, continuation_ids
 
-        if split == 0:
-            full_ids = [self.eot_token_id] + full_ids
-            split = 1
+    def _prepare_loglikelihood_tokens(self, context_ids, continuation_ids):
+        if not continuation_ids:
+            raise ValueError("Continuation encoded to zero tokens; refusing to report a false 0.0 score.")
 
-        full_ids, split = self._truncate_left(full_ids, split)
-
-        cont_ids = full_ids[split:]
-        return full_ids, split, cont_ids
+        # Keep one conditioning token plus at most max_length target tokens.
+        target_ids = continuation_ids[-self.max_length:]
+        combined = (context_ids + continuation_ids)[-(self.max_length + 1):]
+        input_ids = combined[:-1]
+        if not input_ids or len(target_ids) > len(input_ids):
+            raise RuntimeError("Invalid causal scoring window.")
+        return input_ids, target_ids
 
     def loglikelihood(self, requests):
         res = []
 
         for instance in tqdm(requests, desc="Evaluating (loglikelihood)", leave=False):
             context, continuation = instance.args
-            full_ids, ctx_len, cont_ids = self._encode_pair(context, continuation)
-            cont_len = len(cont_ids)
-
-            if cont_len == 0:
-                res.append((0.0, True))
-                continue
-
-            x = torch.tensor([full_ids], dtype=torch.long, device=self._device)
+            context_ids, continuation_ids = self._encode_pair(context, continuation)
+            input_ids, target_ids = self._prepare_loglikelihood_tokens(
+                context_ids,
+                continuation_ids,
+            )
+            continuation_length = len(target_ids)
+            x = torch.tensor([input_ids], dtype=torch.long, device=self._device)
 
             with torch.inference_mode():
                 logits = self.model(x)
-                log_probs = torch.log_softmax(logits, dim=-1)
+                # Training validation computes CE from float32 logits too.
+                log_probs = torch.log_softmax(logits.float(), dim=-1)
 
-            start_logit_idx = ctx_len - 1
-            end_logit_idx = ctx_len + cont_len - 1
-
-            target = torch.tensor(full_ids[ctx_len : ctx_len + cont_len], dtype=torch.long, device=self._device)
-
-            token_log_probs = log_probs[0, start_logit_idx:end_logit_idx, :]
+            target = torch.tensor(target_ids, dtype=torch.long, device=self._device)
+            token_log_probs = log_probs[0, -continuation_length:, :]
 
             greedy = token_log_probs.argmax(dim=-1)
             is_greedy = bool((greedy == target).all().item())
@@ -425,19 +394,21 @@ class OBPMWrapper(LM):
                 continue
 
             total = 0.0
-            scored_ids = [self.eot_token_id] + ids
-            for t in range(1, len(scored_ids)):
-                start = max(0, (t + 1) - self.max_length)
-                window = scored_ids[start : t + 1]
+            prefix = [self.eot_token_id]
+            for target_id in ids:
+                # Match training's next-token shift: the target itself is never
+                # included in the model input, and all max_length positions are
+                # available as conditioning context.
+                window = prefix[-self.max_length :]
                 x = torch.tensor([window], dtype=torch.long, device=self._device)
 
                 with torch.inference_mode():
                     logits = self.model(x)
-                    log_probs = torch.log_softmax(logits, dim=-1)
+                    log_probs = torch.log_softmax(logits.float(), dim=-1)
 
-                target_id = window[-1]
-                lp = log_probs[0, -2, target_id]
+                lp = log_probs[0, -1, target_id]
                 total += float(lp.item())
+                prefix.append(target_id)
 
             out.append(total)
 
@@ -781,7 +752,9 @@ def write_results_file(results: dict, results_file: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run OLMES evaluations on OBPM checkpoints.")
+    parser = argparse.ArgumentParser(
+        description="Run validation loss and lm-eval downstream tasks on OBPM checkpoints."
+    )
     parser.add_argument(
         "--ckpts",
         nargs="+",
@@ -848,6 +821,7 @@ if __name__ == "__main__":
         "mmlu",
         "arc_challenge",
         "arc_easy",
+        "boolq",
         "commonsense_qa",
         "hellaswag",
         "openbookqa",
