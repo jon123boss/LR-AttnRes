@@ -19,6 +19,18 @@ pip install hf_transfer
 pip install wandb  # Optional, for experiment tracking
 ```
 
+For reproducible downstream evaluation, use the tested, pinned environment
+instead of the unpinned commands above:
+
+```bash
+pip install -r requirements-eval.txt
+```
+
+`requirements-eval-lock-macos-py38.txt` records the exact transitive package
+set used for the verified macOS/Python 3.8 CPU smoke run. Use a separately
+generated platform lock for CUDA/Linux because PyTorch's platform dependencies
+differ.
+
 ## Data Preparation
 
 This repo now defaults to GPT-4-tokenized Ultra-FineWeb-en shards:
@@ -125,11 +137,23 @@ as generic lm-eval 5-shot results rather than OLMES results.
 python run_eval.py --ckpts out/ckpt_step:1000.pt
 ```
 
-Every `run_eval.py` invocation saves a text report by default:
+Every `run_eval.py` invocation atomically saves a human-readable text report,
+a complete structured JSON companion, and a status JSON. The default report
+name includes a UTC timestamp so a failed run cannot be confused with an older
+result:
 
 ```bash
 python run_eval.py --ckpts out/ckpt_step:1000.pt --results-file out/eval_results.txt
 ```
+
+The default suite is strict: every checkpoint and task must exist and every
+task must return nonempty metrics. `--allow-skipped` is an explicit opt-in for
+partial dataset-script runs. `--limit 1 --tasks piqa` is useful for a clearly
+labelled one-example smoke test; it must not be reported as a full benchmark.
+The declared primary metrics are length-normalized accuracy for ARC-Challenge,
+ARC-Easy, HellaSwag, OpenBookQA and PIQA, and raw accuracy for MMLU, BoolQ,
+CommonsenseQA, Social-IQA and WinoGrande. MMLU's overall group aggregate is
+saved and displayed separately from its subject-level task metrics.
 
 For multi-GPU validation loss, launch with `torchrun`:
 
@@ -146,15 +170,21 @@ the long task pass. Eval compile is opt-in:
 python run_eval.py --ckpts out/ckpt_step:1000.pt --torch-max-autotune
 ```
 
-New training checkpoints are written atomically and include the RNG state plus
+New training checkpoints are written atomically and include every DDP rank's
+RNG state plus
 the exact number of consumed local training batches. Resuming restores model,
 optimizer, scheduler, random state, and the next shuffled batch. Older
 checkpoints still load, but cannot reproduce the exact uninterrupted trajectory
 because they did not store RNG or in-epoch dataloader state.
-Exact batch-position resume also requires unchanged dataset files, batch size,
-gradient accumulation, world size, sequence length, masking, dtype, and seed;
-the loader rejects recorded configuration mismatches instead of silently
-resuming from a different sample.
+Trajectory-exact resume also requires the recorded ordered shard manifest,
+objective, optimizer, clipping and schedule settings to match. The shard
+manifest checks path, file identity, size and nanosecond modification time;
+the loader rejects mismatches instead of silently resuming from different data.
+Training and validation both compute the loss from float32 logits, including
+when model activations are bfloat16.
+New checkpoints also guard the PyTorch/CUDA/device/criterion runtime and every
+Attention-Residual kernel-selection environment variable. Bitwise trajectory
+claims still require the same deterministic hardware and software environment.
 
 ## LR AttnRes
 

@@ -3033,11 +3033,22 @@ class OBPM(nn.Module):
                 logits, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
                 start = end
 
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -1:] if idx.size(1) > 0 else idx
-            logits, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
-            logits = logits[:, -1, :]
-            next_token = self._sample_next_token(logits, temperature=temperature, top_k=top_k)
+        for generation_step in range(max_new_tokens):
+            if generation_step == 0 and T > 0:
+                # Prefill logits at the final prompt position already predict
+                # the first continuation token. Feeding the final prompt token
+                # into the populated cache again duplicates it and changes the
+                # prediction.
+                next_token_logits = logits[:, -1, :]
+            else:
+                idx_cond = idx[:, -1:] if idx.size(1) > 0 else idx
+                logits, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
+                next_token_logits = logits[:, -1, :]
+            next_token = self._sample_next_token(
+                next_token_logits,
+                temperature=temperature,
+                top_k=top_k,
+            )
             idx = torch.cat((idx, next_token), dim=1)
 
         return idx

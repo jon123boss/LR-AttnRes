@@ -30,14 +30,20 @@ from utils import (
     get_device,
     get_model,
     get_dataloader,
+    get_training_evaluation_dataloader,
     compute_validation_loss,
     compute_lm_loss,
     loss_to_token_sum,
+    build_dataset_manifest,
     capture_rng_state,
+    checkpoint_rng_state_for_rank,
+    capture_training_runtime,
     restore_rng_state,
     validate_exact_resume_data_config,
+    validate_training_runtime,
     atomic_torch_save,
     unwrap_model,
+    model_for_validation,
 )
 from criterion import get_criterion
 from wandb_logger import get_logger
@@ -426,13 +432,14 @@ def run_full_run_eval(ckpt_path: str, current_step: int):
 
 
 def release_training_state_for_full_run_eval():
-    global model, criterion, optimizers, schedulers, train_loader, val_loader
+    global model, criterion, optimizers, schedulers, train_loader, train_eval_loader, val_loader
 
     del model
     del criterion
     del optimizers
     del schedulers
     del train_loader
+    del train_eval_loader
     del val_loader
     gc.collect()
     if torch.cuda.is_available():
@@ -683,7 +690,7 @@ global_grad_accum_steps = grad_accum_steps * world_size
 total_batch_size = batch_size * block_size * global_grad_accum_steps
 
 wandb_log = wandb_log and master_process
-save_checkpoint = save_checkpoint and master_process
+checkpointing_enabled = save_checkpoint
 interactive_after_train = interactive_after_train and master_process
 
 config = get_config(sys.modules[__name__].__dict__)
@@ -751,11 +758,14 @@ def get_muon_momentum(step):
     return momentum
 
 criterion = get_criterion(config)
+training_runtime = capture_training_runtime(criterion, device)
 optimizers = get_optimizers(config, model)
 muon_optimizer, adamw_optimizer = optimizers
 schedulers = get_schedulers(config, muon_optimizer, adamw_optimizer)
 muon_scheduler, adamw_scheduler = schedulers
 train_loader, val_loader = get_dataloader(config)
+train_eval_loader = get_training_evaluation_dataloader(config, train_loader.dataset)
+train_data_manifest = build_dataset_manifest(train_loader.dataset)
 
 if use_doc_masking:
     print0("Warming up document boundary cache...")
@@ -767,7 +777,12 @@ tokens_processed = 0
 train_batches_consumed = 0
 tokens_per_step = batch_size * block_size * grad_accum_steps * world_size
 if checkpoint is not None:
-    validate_exact_resume_data_config(checkpoint, config)
+    validate_exact_resume_data_config(
+        checkpoint,
+        config,
+        current_data_manifest=train_data_manifest,
+    )
+    validate_training_runtime(checkpoint, training_runtime)
     muon_optimizer.load_state_dict(checkpoint["muon_optimizer"])
     adamw_optimizer.load_state_dict(checkpoint["adamw_optimizer"])
     muon_scheduler.load_state_dict(checkpoint["muon_scheduler"])
@@ -776,7 +791,7 @@ if checkpoint is not None:
     train_batches_consumed = int(
         checkpoint.get("train_batches_consumed", start_step * grad_accum_steps)
     )
-    if restore_rng_state(checkpoint.get("rng_state")):
+    if restore_rng_state(checkpoint_rng_state_for_rank(checkpoint, rank)):
         print0("Restored Python, NumPy, PyTorch, and CUDA RNG state from checkpoint.")
     else:
         print0("Checkpoint has no RNG state; resume is weight-exact but not trajectory-exact.")
@@ -785,13 +800,16 @@ print0(f"Tokens per step: {tokens_per_step:,}")
 print0(f"Starting from step {start_step}, tokens seen: {tokens_processed:,}")
 
 
-def build_checkpoint(current_step: int):
+def build_checkpoint(current_step: int, rng_states_by_rank):
     raw_model = unwrap_model(model)
     return {
         "step": current_step,
         "tokens_processed": tokens_processed,
         "train_batches_consumed": train_batches_consumed,
-        "rng_state": capture_rng_state(),
+        "rng_state": rng_states_by_rank[0],
+        "rng_states_by_rank": rng_states_by_rank,
+        "train_data_manifest": train_data_manifest,
+        "training_runtime": training_runtime,
         "model": raw_model.state_dict(),
         "muon_optimizer": muon_optimizer.state_dict(),
         "adamw_optimizer": adamw_optimizer.state_dict(),
@@ -803,7 +821,15 @@ def build_checkpoint(current_step: int):
 
 
 def save_training_checkpoint(current_step: int, ckpt_path: str):
-    checkpoint_payload = build_checkpoint(current_step)
+    local_rng_state = capture_rng_state()
+    if distributed:
+        rng_states_by_rank = [None] * world_size if master_process else None
+        dist.gather_object(local_rng_state, rng_states_by_rank, dst=0)
+    else:
+        rng_states_by_rank = [local_rng_state]
+    if not master_process:
+        return None
+    checkpoint_payload = build_checkpoint(current_step, rng_states_by_rank)
     atomic_torch_save(checkpoint_payload, ckpt_path)
     print0(f"Saved checkpoint: {ckpt_path}")
     return ckpt_path
@@ -834,7 +860,7 @@ def estimate_loss(current_step):
     try:
         # Keep the training-loss diagnostic bounded, but compute validation via
         # the same full-loader implementation used by eval-only and run_eval.py.
-        loader = train_loader
+        loader = train_eval_loader
         total_loss = 0.0
         total_tokens = 0
         total_batches = 0
@@ -871,7 +897,7 @@ def estimate_loss(current_step):
                 continue
 
             loss = compute_lm_loss(
-                model,
+                model_for_validation(model),
                 criterion,
                 x,
                 y,
@@ -973,12 +999,12 @@ while tokens_processed < max_tokens and step < max_steps:
                 muon_scheduler.get_last_lr()[0],
                 tokens_processed,
             )
-    if save_checkpoint and step > 0:
+    if checkpointing_enabled and step > 0:
         should_save = (step % ckpt_interval == 0)
         if should_save:
             ckpt_path = os.path.join(out_dir, f"ckpt_step:{step}.pt")
             save_training_checkpoint(step, ckpt_path)
-            if wandb_log:
+            if wandb_log and master_process:
                 logger.log_checkpoint(step, ckpt_path, config=config)
 
     model.train()
@@ -1022,7 +1048,7 @@ while tokens_processed < max_tokens and step < max_steps:
                 y,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                cast_logits_to_float=False,
+                cast_logits_to_float=True,
             )
             loss = loss / grad_accum_steps
 
@@ -1122,10 +1148,10 @@ print0("Training complete!")
 print0("=" * 80)
 
 final_ckpt_path = None
-if master_process and (full_run or (save_checkpoint and save_ckpt_at_end)):
+if full_run or (checkpointing_enabled and save_ckpt_at_end):
     final_ckpt_path = os.path.join(out_dir, f"ckpt_step:{step}.pt")
     save_training_checkpoint(step, final_ckpt_path)
-    if wandb_log:
+    if wandb_log and master_process:
         logger.log_checkpoint(step, final_ckpt_path, config=config)
 
 if distributed and dist.is_initialized():

@@ -436,6 +436,55 @@ def create_dataloaders(config: DataLoaderConfig):
     return train_loader, val_loader
 
 
+def create_training_evaluation_dataloader(
+    config: DataLoaderConfig,
+    train_dataset: Optional[Dataset] = None,
+):
+    """Build an independent loader for the bounded training-loss diagnostic.
+
+    It may share the immutable memmapped dataset, but never the sampler or
+    DataLoader iterator whose cursor drives optimization.
+    """
+    if train_dataset is None:
+        train_dataset = DocumentPackingDataset(
+            data_dir=config.data_dir,
+            split="train",
+            block_size=config.block_size,
+            use_doc_masking=config.use_doc_masking,
+            doc_separator_token=config.doc_separator_token,
+            dtype=config.dtype,
+            verbose=(config.rank == 0),
+        )
+
+    collate_fn = collate_with_doc_masking if config.use_doc_masking else collate_simple
+    loader_kwargs = dict(
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        persistent_workers=(config.persistent_workers and config.num_workers > 0),
+        collate_fn=collate_fn,
+    )
+    if config.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = config.prefetch_factor
+
+    sampler = ResumableDistributedSampler(
+        train_dataset,
+        num_replicas=config.world_size,
+        rank=config.rank,
+        shuffle=True,
+        seed=config.seed,
+        drop_last=True,
+    )
+    return TorchDataLoader(
+        train_dataset,
+        shuffle=False,
+        sampler=sampler,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(config.seed + 2),
+        **loader_kwargs,
+    )
+
+
 def create_validation_dataloader(config: DataLoaderConfig):
     val_dataset = DocumentPackingDataset(
         data_dir=config.data_dir,

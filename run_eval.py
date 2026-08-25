@@ -6,8 +6,16 @@
 
 import argparse
 import glob
+import hashlib
+import json
 import os
+import platform
 import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from typing import List, Union
 
@@ -32,11 +40,13 @@ try:
     from lm_eval import simple_evaluate
     from lm_eval.api.model import LM
     from lm_eval.api.registry import register_model
+    from lm_eval.tasks import TaskManager
 except ModuleNotFoundError as exc:
     if exc.name != "lm_eval":
         raise
 
     simple_evaluate = None
+    TaskManager = None
     _LM_EVAL_IMPORT_ERROR = exc
 
     class LM:
@@ -63,6 +73,7 @@ else:
 from criterion import get_criterion
 from dataloader import warmup_boundaries
 from utils import (
+    capture_attnres_kernel_environment,
     compute_validation_loss,
     get_validation_dataloader,
     load_model_checkpoint,
@@ -72,9 +83,43 @@ from utils import (
 DEFAULT_NUM_FEWSHOT = 5
 DEFAULT_CKPT_DIR = "out"
 CHECKPOINT_PATTERN = "ckpt_step:*.pt"
-DEFAULT_RESULTS_FILE = os.path.join(DEFAULT_CKPT_DIR, "eval_results.txt")
 DATASET_SCRIPT_ERROR = "Dataset scripts are no longer supported"
-DATASET_SCRIPT_TASKS = {"siqa", "social_iqa"}
+EVAL_PROTOCOL_VERSION = "lr-attnres-lm-eval-5shot-v1"
+EVAL_SEEDS = {
+    "random_seed": 0,
+    "numpy_random_seed": 1234,
+    "torch_random_seed": 1234,
+    "fewshot_random_seed": 1234,
+}
+
+DEFAULT_TASKS = [
+    "mmlu",
+    "arc_challenge",
+    "arc_easy",
+    "boolq",
+    "commonsense_qa",
+    "hellaswag",
+    "openbookqa",
+    "piqa",
+    "social_iqa",
+    "winogrande",
+]
+
+# One declared paper-facing metric per task. Several harness tasks emit both
+# raw and length-normalized accuracy; silently choosing between them can reverse
+# an individual prediction and materially change a reported result.
+PRIMARY_METRICS = {
+    "mmlu": "acc",
+    "arc_challenge": "acc_norm",
+    "arc_easy": "acc_norm",
+    "boolq": "acc",
+    "commonsense_qa": "acc",
+    "hellaswag": "acc_norm",
+    "openbookqa": "acc_norm",
+    "piqa": "acc_norm",
+    "social_iqa": "acc",
+    "winogrande": "acc",
+}
 
 TASK_MAPPING = {
     "mmlu": "mmlu",
@@ -94,8 +139,9 @@ TASK_MAPPING = {
     "openbookqa": "openbookqa",
     "PIQA": "piqa",
     "piqa": "piqa",
-    "SIQA": "siqa",
-    "siqa": "siqa",
+    "SIQA": "social_iqa",
+    "siqa": "social_iqa",
+    "social_iqa": "social_iqa",
     "Winogrande": "winogrande",
     "winogrande": "winogrande",
 }
@@ -187,16 +233,6 @@ def discover_checkpoints(ckpt_dir: str) -> List[str]:
     return sorted(checkpoints, key=_checkpoint_sort_key)
 
 
-def _datasets_disables_scripts() -> bool:
-    try:
-        datasets_version = version("datasets")
-    except PackageNotFoundError:
-        return False
-
-    major = datasets_version.split(".", 1)[0]
-    return major.isdigit() and int(major) >= 4
-
-
 def _merge_eval_outputs(combined_output: dict, task_output: dict):
     for key, value in task_output.items():
         if isinstance(value, dict):
@@ -205,27 +241,82 @@ def _merge_eval_outputs(combined_output: dict, task_output: dict):
             combined_output[key] = value
 
 
-def run_downstream_tasks(lm_obj: "OBPMWrapper", valid_tasks: List[str], device: str):
+def _preflight_tasks(valid_tasks: List[str]):
+    if TaskManager is None:
+        raise RuntimeError("lm_eval TaskManager is unavailable.")
+    task_manager = TaskManager()
+    missing = sorted(set(valid_tasks) - set(task_manager.all_tasks))
+    if missing:
+        raise ValueError(
+            "Unknown lm-eval task name(s): " + ", ".join(missing)
+        )
+    return task_manager
+
+
+def _metric_from_container(metrics: dict, metric_name: str):
+    for key in (f"{metric_name},none", metric_name):
+        if key in metrics:
+            return key, metrics[key]
+    return None, None
+
+
+def _collect_primary_metrics(combined_output: dict, valid_tasks: List[str]):
+    results = combined_output.get("results", {})
+    groups = combined_output.get("groups", {})
+    primary = {}
+    for task in valid_tasks:
+        metric_name = PRIMARY_METRICS.get(task)
+        if metric_name is None:
+            continue
+        metrics = results.get(task) or groups.get(task)
+        if not isinstance(metrics, dict):
+            raise RuntimeError(
+                f"Task {task!r} completed without an aggregate result needed for "
+                f"its declared primary metric {metric_name!r}."
+            )
+        output_key, value = _metric_from_container(metrics, metric_name)
+        if output_key is None:
+            raise RuntimeError(
+                f"Task {task!r} did not return declared primary metric {metric_name!r}."
+            )
+        primary[task] = {
+            "metric": metric_name,
+            "output_key": output_key,
+            "value": value,
+        }
+    return primary
+
+
+def _effective_sample_counts(n_samples):
+    counts = []
+    if isinstance(n_samples, dict):
+        if "effective" in n_samples:
+            counts.append(n_samples["effective"])
+        else:
+            for value in n_samples.values():
+                counts.extend(_effective_sample_counts(value))
+    return counts
+
+
+def run_downstream_tasks(
+    lm_obj: "OBPMWrapper",
+    valid_tasks: List[str],
+    device: str,
+    allow_skipped: bool = False,
+    limit=None,
+):
     if simple_evaluate is None:
         raise RuntimeError(
             "run_eval.py requires lm_eval. Install it with `pip install lm_eval` "
             "before running downstream evaluations."
         ) from _LM_EVAL_IMPORT_ERROR
 
+    task_manager = _preflight_tasks(valid_tasks)
     combined_output = {"results": {}}
     skipped_tasks = {}
-    datasets_disables_scripts = _datasets_disables_scripts()
+    completed_tasks = []
 
     for task in valid_tasks:
-        if datasets_disables_scripts and task in DATASET_SCRIPT_TASKS:
-            reason = (
-                "installed datasets package no longer supports dataset scripts; "
-                "install datasets<4 or omit this task"
-            )
-            print(f"Skipping task {task}: {reason}.")
-            skipped_tasks[task] = reason
-            continue
-
         print(f"Running task: {task}")
         try:
             task_output = simple_evaluate(
@@ -235,9 +326,12 @@ def run_downstream_tasks(lm_obj: "OBPMWrapper", valid_tasks: List[str], device: 
                 batch_size=1,
                 device=device,
                 log_samples=False,
+                limit=limit,
+                task_manager=task_manager,
+                **EVAL_SEEDS,
             )
         except RuntimeError as exc:
-            if DATASET_SCRIPT_ERROR not in str(exc):
+            if DATASET_SCRIPT_ERROR not in str(exc) or not allow_skipped:
                 raise
 
             reason = (
@@ -248,10 +342,33 @@ def run_downstream_tasks(lm_obj: "OBPMWrapper", valid_tasks: List[str], device: 
             skipped_tasks[task] = reason
             continue
 
+        if not isinstance(task_output, dict):
+            raise RuntimeError(f"Task {task!r} returned no structured lm-eval output.")
+        if not task_output.get("results") and not task_output.get("groups"):
+            raise RuntimeError(f"Task {task!r} returned no result metrics.")
+        sample_counts = _effective_sample_counts(task_output.get("n-samples", {}))
+        if sample_counts and not any(float(count) > 0 for count in sample_counts):
+            raise RuntimeError(f"Task {task!r} evaluated zero effective samples.")
+
         _merge_eval_outputs(combined_output, task_output)
+        completed_tasks.append(task)
 
     if skipped_tasks:
         combined_output["skipped_tasks"] = skipped_tasks
+    combined_output["protocol"] = {
+        "version": EVAL_PROTOCOL_VERSION,
+        "requested_tasks": list(valid_tasks),
+        "completed_tasks": completed_tasks,
+        "num_fewshot_override": DEFAULT_NUM_FEWSHOT,
+        "batch_size": 1,
+        "limit": limit,
+        "allow_skipped": allow_skipped,
+        "seeds": dict(EVAL_SEEDS),
+    }
+    combined_output["primary_metrics"] = _collect_primary_metrics(
+        combined_output,
+        completed_tasks,
+    )
 
     return combined_output
 
@@ -283,8 +400,11 @@ class OBPMWrapper(LM):
             model_path,
             self._device,
             verbose=self.verbose,
+            load_training_state=False,
         )
         self.checkpoint_config = checkpoint.get("config", {})
+        self.checkpoint_step = checkpoint.get("step")
+        self.checkpoint_tokens_processed = checkpoint.get("tokens_processed")
 
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
@@ -425,7 +545,20 @@ class OBPMWrapper(LM):
             context, gen_kwargs = instance.args
 
             until = gen_kwargs.get("until", [])
-            max_gen_toks = int(gen_kwargs.get("max_gen_toks", 64))
+            if isinstance(until, str):
+                until = [until]
+            elif until is None:
+                until = []
+            else:
+                until = list(until)
+            max_gen_toks = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks))
+            do_sample = bool(gen_kwargs.get("do_sample", False))
+            temperature = float(gen_kwargs.get("temperature", 1.0 if do_sample else 0.0))
+            if not do_sample:
+                temperature = 0.0
+            top_k = gen_kwargs.get("top_k")
+            if top_k is not None:
+                top_k = int(top_k)
 
             tokens = self.tokenizer.encode(context)
             if len(tokens) == 0:
@@ -437,16 +570,22 @@ class OBPMWrapper(LM):
             x = torch.tensor([tokens], dtype=torch.long, device=self._device)
 
             with torch.inference_mode():
-                out_idx = unwrap_model(self.model).generate(x, max_new_tokens=max_gen_toks, temperature=0.0)
+                out_idx = unwrap_model(self.model).generate(
+                    x,
+                    max_new_tokens=max_gen_toks,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
 
             out = out_idx[0].tolist()
             new_tokens = out[len(x[0]) :]
+            if self.eot_token_id in new_tokens:
+                new_tokens = new_tokens[: new_tokens.index(self.eot_token_id)]
             text = self.tokenizer.decode(new_tokens)
 
-            for term in until:
-                if term and term in text:
-                    text = text.split(term)[0]
-                    break
+            stop_positions = [text.find(term) for term in until if term and term in text]
+            if stop_positions:
+                text = text[: min(stop_positions)]
 
             res.append(text)
         return res
@@ -501,6 +640,138 @@ def run_validation_loss(
     return val_metrics
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _package_version(package_name: str):
+    try:
+        return version(package_name)
+    except PackageNotFoundError:
+        return None
+
+
+def _git_commit():
+    try:
+        process = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return process.stdout.strip() or None
+
+
+def _git_dirty():
+    try:
+        process = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(process.stdout.strip())
+
+
+def _evaluation_source_sha256():
+    digest = hashlib.sha256()
+    source_root = os.path.dirname(os.path.abspath(__file__))
+    source_files = (
+        "attnres_ops.py",
+        "criterion.py",
+        "dataloader.py",
+        "model.py",
+        "run_eval.py",
+        "tokenizer_utils.py",
+        "utils.py",
+    )
+    for relative_path in source_files:
+        path = os.path.join(source_root, relative_path)
+        digest.update(relative_path.encode("utf-8") + b"\0")
+        with open(path, "rb") as source_file:
+            for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _attach_provenance(
+    output: dict,
+    checkpoint_path: str,
+    lm_obj: OBPMWrapper,
+    valid_tasks: List[str],
+    include_validation: bool,
+    include_tasks: bool,
+    limit,
+):
+    output.setdefault("protocol", {})
+    output["protocol"].update(
+        {
+            "version": EVAL_PROTOCOL_VERSION,
+            "requested_tasks": list(valid_tasks),
+            "include_validation": include_validation,
+            "include_tasks": include_tasks,
+            "num_fewshot_override": DEFAULT_NUM_FEWSHOT if include_tasks else None,
+            "limit": limit if include_tasks else None,
+            "seeds": dict(EVAL_SEEDS),
+        }
+    )
+    output["provenance"] = {
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "checkpoint_sha256": _sha256_file(checkpoint_path),
+        "checkpoint_step": lm_obj.checkpoint_step,
+        "checkpoint_tokens_processed": lm_obj.checkpoint_tokens_processed,
+        "tokenizer": lm_obj.tokenizer_name,
+        "tokenizer_model": lm_obj.tokenizer_model,
+        "git_commit": _git_commit(),
+        "git_dirty": _git_dirty(),
+        "evaluation_source_sha256": _evaluation_source_sha256(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": {
+            "torch": torch.__version__,
+            "lm_eval": _package_version("lm_eval"),
+            "datasets": _package_version("datasets"),
+            "tiktoken": _package_version("tiktoken"),
+        },
+        "device": str(lm_obj._device),
+        "cuda_available": torch.cuda.is_available(),
+        "attnres_kernel_environment": capture_attnres_kernel_environment(),
+    }
+
+
+def _print_metric_sections(output: dict):
+    for section_label, section_key in (("Task", "results"), ("Group", "groups")):
+        for name, metrics in output.get(section_key, {}).items():
+            print(f"  {section_label}: {name}")
+            if "acc_norm,none" in metrics:
+                print(f"    acc_norm: {metrics['acc_norm,none']:.4f}")
+            elif "acc_norm" in metrics:
+                print(f"    acc_norm: {metrics['acc_norm']:.4f}")
+            if "acc,none" in metrics:
+                print(f"    acc:      {metrics['acc,none']:.4f}")
+            elif "acc" in metrics:
+                print(f"    acc:      {metrics['acc']:.4f}")
+    for task_name, metric in output.get("primary_metrics", {}).items():
+        print(
+            f"  Primary: {task_name} {metric['metric']}="
+            f"{_format_metric_value(metric['value'])}"
+        )
+    for task_name, reason in output.get("skipped_tasks", {}).items():
+        print(f"  Skipped task: {task_name}")
+        print(f"    reason: {reason}")
+
+
 def evaluate_checkpoints(
     checkpoints: List[str],
     tasks_list: List[str],
@@ -513,6 +784,8 @@ def evaluate_checkpoints(
     rank: int = 0,
     world_size: int = 1,
     local_rank: int = 0,
+    allow_skipped: bool = False,
+    limit=None,
 ):
     if not include_validation and not include_tasks:
         raise ValueError("At least one evaluation mode must be enabled.")
@@ -532,6 +805,14 @@ def evaluate_checkpoints(
     )
 
     valid_tasks = [TASK_MAPPING.get(t, t) for t in tasks_list] if include_tasks else []
+    missing_checkpoints = [path for path in checkpoints if not os.path.isfile(path)]
+    if missing_checkpoints:
+        raise FileNotFoundError(
+            "Missing checkpoint(s): " + ", ".join(missing_checkpoints)
+        )
+    if include_tasks:
+        # Fail before loading a large checkpoint or running earlier tasks.
+        _preflight_tasks(valid_tasks)
 
     if include_validation and include_tasks:
         print0(master_process, "Evaluation mode: validation loss + downstream tasks")
@@ -555,10 +836,6 @@ def evaluate_checkpoints(
                 "Running distributed validation first; non-rank0 processes will exit before downstream tasks.",
             )
             for ckpt in checkpoints:
-                if not os.path.exists(ckpt):
-                    print0(master_process, f"Skipping missing checkpoint: {ckpt}")
-                    continue
-
                 print0(master_process, f"\nEvaluating validation for checkpoint: {ckpt}")
                 print0(master_process, "=" * 80)
 
@@ -596,10 +873,6 @@ def evaluate_checkpoints(
         print0(master_process, "Running downstream tasks on rank 0 with no active process group.")
         print0(master_process, "-" * 80)
         for ckpt in checkpoints:
-            if not os.path.exists(ckpt):
-                print0(master_process, f"Skipping missing checkpoint: {ckpt}")
-                continue
-
             print0(master_process, f"\nEvaluating downstream tasks for checkpoint: {ckpt}")
             print0(master_process, "=" * 80)
 
@@ -613,29 +886,30 @@ def evaluate_checkpoints(
                 verbose=True,
             )
             eval_output = results.get(ckpt, {})
-            task_output = run_downstream_tasks(lm_obj, valid_tasks, device)
+            task_output = run_downstream_tasks(
+                lm_obj,
+                valid_tasks,
+                device,
+                allow_skipped=allow_skipped,
+                limit=limit,
+            )
             task_output.update(eval_output)
+            _attach_provenance(
+                task_output,
+                ckpt,
+                lm_obj,
+                valid_tasks,
+                include_validation,
+                include_tasks,
+                limit,
+            )
             results[ckpt] = task_output
 
             print("\nResults:")
             if include_validation and "validation_loss" in eval_output:
                 val_metrics = eval_output["validation_loss"]
                 print(f"  validation_loss: {val_metrics['loss']:.4f}")
-            res_dict = task_output.get("results", {})
-            for task_name, metrics in res_dict.items():
-                print(f"  Task: {task_name}")
-                if "acc_norm,none" in metrics:
-                    print(f"    acc_norm: {metrics['acc_norm,none']:.4f}")
-                elif "acc_norm" in metrics:
-                    print(f"    acc_norm: {metrics['acc_norm']:.4f}")
-                if "acc,none" in metrics:
-                    print(f"    acc:      {metrics['acc,none']:.4f}")
-                elif "acc" in metrics:
-                    print(f"    acc:      {metrics['acc']:.4f}")
-            skipped_tasks = task_output.get("skipped_tasks", {})
-            for task_name, reason in skipped_tasks.items():
-                print(f"  Skipped task: {task_name}")
-                print(f"    reason: {reason}")
+            _print_metric_sections(task_output)
 
             print("-" * 80)
             del lm_obj
@@ -645,10 +919,6 @@ def evaluate_checkpoints(
         return results
 
     for ckpt in checkpoints:
-        if not os.path.exists(ckpt):
-            print0(master_process, f"Skipping missing checkpoint: {ckpt}")
-            continue
-
         print0(master_process, f"\nEvaluating Checkpoint: {ckpt}")
         print0(master_process, "=" * 80)
 
@@ -674,11 +944,26 @@ def evaluate_checkpoints(
             eval_output["validation_loss"] = val_metrics
 
         if include_tasks and master_process:
-            task_output = run_downstream_tasks(lm_obj, valid_tasks, device)
+            task_output = run_downstream_tasks(
+                lm_obj,
+                valid_tasks,
+                device,
+                allow_skipped=allow_skipped,
+                limit=limit,
+            )
             task_output.update(eval_output)
             eval_output = task_output
 
         if master_process:
+            _attach_provenance(
+                eval_output,
+                ckpt,
+                lm_obj,
+                valid_tasks,
+                include_validation,
+                include_tasks,
+                limit,
+            )
             results[ckpt] = eval_output
 
         print0(master_process, "\nResults:")
@@ -686,21 +971,7 @@ def evaluate_checkpoints(
             val_metrics = eval_output["validation_loss"]
             print(f"  validation_loss: {val_metrics['loss']:.4f}")
         if include_tasks and master_process:
-            res_dict = eval_output.get("results", {})
-            for task_name, metrics in res_dict.items():
-                print(f"  Task: {task_name}")
-                if "acc_norm,none" in metrics:
-                    print(f"    acc_norm: {metrics['acc_norm,none']:.4f}")
-                elif "acc_norm" in metrics:
-                    print(f"    acc_norm: {metrics['acc_norm']:.4f}")
-                if "acc,none" in metrics:
-                    print(f"    acc:      {metrics['acc,none']:.4f}")
-                elif "acc" in metrics:
-                    print(f"    acc:      {metrics['acc']:.4f}")
-            skipped_tasks = eval_output.get("skipped_tasks", {})
-            for task_name, reason in skipped_tasks.items():
-                print(f"  Skipped task: {task_name}")
-                print(f"    reason: {reason}")
+            _print_metric_sections(eval_output)
 
         print0(master_process, "-" * 80)
         del lm_obj
@@ -714,6 +985,12 @@ def _format_metric_value(value):
     if isinstance(value, float):
         return f"{value:.6f}"
     return str(value)
+
+
+def _default_results_file():
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = uuid.uuid4().hex[:8]
+    return os.path.join(DEFAULT_CKPT_DIR, f"eval_results_{timestamp}_{run_id}.txt")
 
 
 def format_results_text(results: dict) -> str:
@@ -732,12 +1009,46 @@ def format_results_text(results: dict) -> str:
             lines.append(f"validation_tokens: {val_metrics.get('tokens')}")
             lines.append(f"validation_batches: {val_metrics.get('batches')}")
 
-        task_results = output.get("results", {})
-        for task_name, metrics in task_results.items():
-            lines.append(f"Task: {task_name}")
-            for metric_name, metric_value in sorted(metrics.items()):
-                if isinstance(metric_value, (int, float, str, bool)):
-                    lines.append(f"  {metric_name}: {_format_metric_value(metric_value)}")
+        protocol = output.get("protocol", {})
+        if protocol:
+            lines.append(f"protocol_version: {protocol.get('version')}")
+            lines.append(f"requested_tasks: {protocol.get('requested_tasks')}")
+            lines.append(f"completed_tasks: {protocol.get('completed_tasks')}")
+            lines.append(f"num_fewshot_override: {protocol.get('num_fewshot_override')}")
+            lines.append(f"limit: {protocol.get('limit')}")
+            lines.append(f"seeds: {protocol.get('seeds')}")
+
+        provenance = output.get("provenance", {})
+        if provenance:
+            for key in (
+                "completed_at_utc",
+                "checkpoint_sha256",
+                "checkpoint_step",
+                "checkpoint_tokens_processed",
+                "tokenizer",
+                "tokenizer_model",
+                "git_commit",
+                "git_dirty",
+                "evaluation_source_sha256",
+                "python",
+                "platform",
+                "device",
+            ):
+                lines.append(f"{key}: {provenance.get(key)}")
+            lines.append(f"packages: {provenance.get('packages')}")
+
+        for task_name, metric in output.get("primary_metrics", {}).items():
+            lines.append(f"Primary metric: {task_name}")
+            lines.append(f"  metric: {metric.get('metric')}")
+            lines.append(f"  output_key: {metric.get('output_key')}")
+            lines.append(f"  value: {_format_metric_value(metric.get('value'))}")
+
+        for section_label, section_key in (("Task", "results"), ("Group", "groups")):
+            for name, metrics in output.get(section_key, {}).items():
+                lines.append(f"{section_label}: {name}")
+                for metric_name, metric_value in sorted(metrics.items()):
+                    if isinstance(metric_value, (int, float, str, bool)):
+                        lines.append(f"  {metric_name}: {_format_metric_value(metric_value)}")
 
         skipped_tasks = output.get("skipped_tasks", {})
         for task_name, reason in skipped_tasks.items():
@@ -749,11 +1060,108 @@ def format_results_text(results: dict) -> str:
     return "\n".join(lines)
 
 
+def _json_default(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    return repr(value)
+
+
+def _atomic_write_text(path: str, contents: str):
+    target_path = os.path.abspath(path)
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target_path)}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as output_file:
+            output_file.write(contents)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_path, target_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
 def write_results_file(results: dict, results_file: str):
-    os.makedirs(os.path.dirname(results_file) or ".", exist_ok=True)
-    with open(results_file, "w", encoding="utf-8") as f:
-        f.write(format_results_text(results))
+    results_json_file = os.path.splitext(results_file)[0] + ".json"
+    if os.path.abspath(results_json_file) == os.path.abspath(results_file):
+        results_json_file = results_file + ".structured.json"
+    _atomic_write_text(results_file, format_results_text(results))
+    structured_output = {
+        "schema_version": 1,
+        "complete": results_suite_complete(results),
+        "checkpoint_results": results,
+    }
+    _atomic_write_text(
+        results_json_file,
+        json.dumps(structured_output, indent=2, sort_keys=True, default=_json_default) + "\n",
+    )
     print(f"Saved evaluation results to: {results_file}")
+    print(f"Saved structured evaluation results to: {results_json_file}")
+    return results_json_file
+
+
+def results_suite_complete(results: dict) -> bool:
+    if not results:
+        return False
+    for output in results.values():
+        if output.get("skipped_tasks"):
+            return False
+        protocol = output.get("protocol", {})
+        if protocol.get("limit") is not None:
+            return False
+        requested = protocol.get("requested_tasks")
+        completed = protocol.get("completed_tasks")
+        if requested is not None and completed is not None and requested != completed:
+            return False
+    return True
+
+
+def results_run_status(results: dict) -> str:
+    if any(
+        output.get("protocol", {}).get("limit") is not None
+        for output in results.values()
+    ):
+        return "limited"
+    return "complete" if results_suite_complete(results) else "partial"
+
+
+def write_run_status(results_file: str, status: str, **details):
+    status_file = results_file + ".status.json"
+    payload = {
+        "status": status,
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        **details,
+    }
+    _atomic_write_text(
+        status_file,
+        json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n",
+    )
+    return status_file
+
+
+def _parse_limit(value: str):
+    try:
+        parsed = int(value)
+    except ValueError:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("limit must be a positive integer or fraction") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("limit must be positive")
+    return parsed
 
 
 if __name__ == "__main__":
@@ -772,8 +1180,25 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--results-file",
-        default=DEFAULT_RESULTS_FILE,
-        help=f"Text file where evaluation results are saved (default: {DEFAULT_RESULTS_FILE})",
+        default=None,
+        help="Text result path. Default: a unique UTC-timestamped file under out/.",
+    )
+    parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=DEFAULT_TASKS,
+        help="lm-eval tasks to run (aliases such as SIQA and ARC-E are accepted).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=_parse_limit,
+        default=None,
+        help="Evaluate only N samples, or a fractional subset below 1. Intended for smoke tests.",
+    )
+    parser.add_argument(
+        "--allow-skipped",
+        action="store_true",
+        help="Explicitly permit incompatible dataset-script tasks to be skipped.",
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -821,22 +1246,21 @@ if __name__ == "__main__":
         args.torch_compile = True
 
     distributed, rank, world_size, local_rank = setup_distributed()
-
-    downstream_eval_tasks = [
-        "mmlu",
-        "arc_challenge",
-        "arc_easy",
-        "boolq",
-        "commonsense_qa",
-        "hellaswag",
-        "openbookqa",
-        "piqa",
-        "siqa",
-        "winogrande",
-    ]
+    args.results_file = args.results_file or _default_results_file()
+    downstream_eval_tasks = args.tasks
 
     checkpoints = args.ckpts if args.ckpts is not None else discover_checkpoints(args.ckpt_dir)
     if not checkpoints:
+        if rank == 0:
+            write_run_status(
+                args.results_file,
+                "failed",
+                error_type="NoCheckpointsFound",
+                error=(
+                    f"No checkpoints found in {args.ckpt_dir!r}; expected "
+                    f"{os.path.join(args.ckpt_dir, CHECKPOINT_PATTERN)!r}."
+                ),
+            )
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
         raise SystemExit(
@@ -844,20 +1268,46 @@ if __name__ == "__main__":
             f"Expected files matching {os.path.join(args.ckpt_dir, CHECKPOINT_PATTERN)!r}."
         )
 
-    results = evaluate_checkpoints(
-        checkpoints,
-        downstream_eval_tasks,
-        include_validation=not args.tasks_only,
-        include_tasks=not args.validation_only,
-        torch_compile=args.torch_compile,
-        torch_compile_max_autotune=args.torch_compile_max_autotune,
-        torch_compile_cache_dir=args.torch_compile_cache_dir,
-        distributed=distributed,
-        rank=rank,
-        world_size=world_size,
-        local_rank=local_rank,
-    )
     if rank == 0:
-        write_results_file(results, args.results_file)
-    if distributed and dist.is_initialized():
-        dist.destroy_process_group()
+        write_run_status(
+            args.results_file,
+            "running",
+            checkpoints=[os.path.abspath(path) for path in checkpoints],
+            requested_tasks=downstream_eval_tasks,
+        )
+    try:
+        results = evaluate_checkpoints(
+            checkpoints,
+            downstream_eval_tasks,
+            include_validation=not args.tasks_only,
+            include_tasks=not args.validation_only,
+            torch_compile=args.torch_compile,
+            torch_compile_max_autotune=args.torch_compile_max_autotune,
+            torch_compile_cache_dir=args.torch_compile_cache_dir,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            allow_skipped=args.allow_skipped,
+            limit=args.limit,
+        )
+        if rank == 0:
+            results_json_file = write_results_file(results, args.results_file)
+            write_run_status(
+                args.results_file,
+                results_run_status(results),
+                text_results_file=os.path.abspath(args.results_file),
+                results_json_file=os.path.abspath(results_json_file),
+            )
+    except BaseException as exc:
+        if rank == 0:
+            write_run_status(
+                args.results_file,
+                "failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        raise
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()

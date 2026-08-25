@@ -7,7 +7,23 @@ import random
 import tempfile
 import numpy as np
 from model import OBPM, ModelConfig
-from dataloader import DataLoaderConfig, create_dataloaders, create_validation_dataloader
+from dataloader import (
+    DataLoaderConfig,
+    create_dataloaders,
+    create_training_evaluation_dataloader,
+    create_validation_dataloader,
+)
+
+
+_ATTNRES_KERNEL_ENV_DEFAULTS = {
+    "ATTNRES_TRAIN_KERNEL": "auto",
+    "ATTNRES_PHASE2_FUSED_QUERY": "1",
+    "ATTNRES_PHASE1_QSPLIT": "0",
+    "ATTNRES_PHASE1_TILED": "0",
+    "ATTNRES_BLOCK_PHASE1_LIST": "0",
+    "ATTNRES_PHASE1_LOGITS_LIST": "0",
+    "ATTNRES_SAVE_AUX": "0",
+}
 
 
 def get_config(module_globals=None):
@@ -72,6 +88,70 @@ def restore_rng_state(state):
     return True
 
 
+def checkpoint_rng_state_for_rank(checkpoint, rank=0):
+    """Return this rank's RNG state, with compatibility for old checkpoints."""
+    states = checkpoint.get("rng_states_by_rank")
+    if states is None:
+        return checkpoint.get("rng_state")
+    if rank < 0 or rank >= len(states):
+        raise ValueError(
+            f"Checkpoint has {len(states)} RNG states but rank {rank} was requested."
+        )
+    return states[rank]
+
+
+def capture_attnres_kernel_environment():
+    return {
+        name: os.environ.get(name, default)
+        for name, default in _ATTNRES_KERNEL_ENV_DEFAULTS.items()
+    }
+
+
+def capture_training_runtime(criterion, device):
+    runtime = {
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "device_type": device.type,
+        "criterion_backend": (
+            "flash_attn" if getattr(criterion, "flash_attention", False) else "torch"
+        ),
+        "attnres_kernel_environment": capture_attnres_kernel_environment(),
+    }
+    if device.type == "cuda":
+        runtime["cuda_device_name"] = torch.cuda.get_device_name(device)
+        runtime["cuda_device_capability"] = list(torch.cuda.get_device_capability(device))
+    return runtime
+
+
+def validate_training_runtime(checkpoint, current_runtime):
+    saved_runtime = checkpoint.get("training_runtime")
+    if saved_runtime is not None and saved_runtime != current_runtime:
+        raise ValueError(
+            "Trajectory-exact checkpoint resume requires the same recorded software, "
+            "device, criterion, and Attention-Residual kernel environment. "
+            f"saved={saved_runtime!r}, current={current_runtime!r}"
+        )
+
+
+def build_dataset_manifest(dataset):
+    """Capture the ordered file identity of a packing dataset's shards."""
+    shard_paths = getattr(dataset, "_shard_paths", None)
+    if shard_paths is None:
+        raise TypeError("Dataset does not expose its ordered shard paths.")
+    manifest = []
+    for path in shard_paths:
+        stat = os.stat(path)
+        manifest.append(
+            {
+                "path": os.path.abspath(path),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "inode": stat.st_ino,
+            }
+        )
+    return manifest
+
+
 _EXACT_RESUME_DATA_KEYS = (
     "dataset_dir",
     "data_dtype",
@@ -85,8 +165,44 @@ _EXACT_RESUME_DATA_KEYS = (
 )
 
 
-def validate_exact_resume_data_config(checkpoint, current_config):
-    """Reject data-topology changes that invalidate the saved batch cursor."""
+_EXACT_RESUME_TRAINING_KEYS = (
+    # Loss/objective.
+    "ignore_index",
+    "reduction",
+    "z_loss",
+    "z_loss_weight",
+    "ce_inplace_backward",
+    "lm_head_chunk_size",
+    # Optimizers and clipping.
+    "muon_lr",
+    "adamw_lr",
+    "muon_weight_decay",
+    "adamw_weight_decay",
+    "cautious",
+    "beta1",
+    "beta2",
+    "grad_clip",
+    # Step-dependent momentum and learning-rate schedules.
+    "max_steps",
+    "max_tokens",
+    "muon_momentum",
+    "muon_momentum_warmup_steps",
+    "muon_momentum_cooldown_steps",
+    "muon_momentum_min",
+    "muon_momentum_max",
+    "warmup_steps",
+    "warmdown_steps",
+    "sched_mode",
+    # Kernel/backend choices can change floating-point results and gradients.
+    "flash_attention",
+    "torch_compile",
+    "torch_compile_max_autotune",
+    "torch_compile_cudagraphs",
+)
+
+
+def validate_exact_resume_data_config(checkpoint, current_config, current_data_manifest=None):
+    """Reject configuration changes that invalidate trajectory-exact resume."""
     if "train_batches_consumed" not in checkpoint:
         return
     saved_config = checkpoint.get("config")
@@ -96,7 +212,7 @@ def validate_exact_resume_data_config(checkpoint, current_config):
         )
 
     mismatches = []
-    for key in _EXACT_RESUME_DATA_KEYS:
+    for key in _EXACT_RESUME_DATA_KEYS + _EXACT_RESUME_TRAINING_KEYS:
         if key in saved_config and key in current_config:
             saved_value = saved_config[key]
             current_value = current_config[key]
@@ -105,8 +221,20 @@ def validate_exact_resume_data_config(checkpoint, current_config):
     if mismatches:
         details = "; ".join(mismatches)
         raise ValueError(
-            "Exact checkpoint resume requires unchanged data topology; " + details
+            "Trajectory-exact checkpoint resume requires unchanged data and training configuration; "
+            + details
         )
+    saved_manifest = checkpoint.get("train_data_manifest")
+    if saved_manifest is not None:
+        if current_data_manifest is None:
+            raise ValueError(
+                "Checkpoint records a training shard manifest but the current manifest was not provided."
+            )
+        if saved_manifest != current_data_manifest:
+            raise ValueError(
+                "Trajectory-exact checkpoint resume requires the same ordered training shards "
+                "with unchanged file identity, size, and modification time."
+            )
 
 
 def atomic_torch_save(payload, path):
@@ -128,12 +256,22 @@ def atomic_torch_save(payload, path):
             os.remove(temporary_path)
 
 
-def load_model_checkpoint(ckpt_path, device, verbose=True):
+def load_model_checkpoint(ckpt_path, device, verbose=True, load_training_state=True):
     """Load a training checkpoint using the canonical training/eval path."""
     if verbose:
         print(f"Loading checkpoint from: {ckpt_path}")
 
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    load_kwargs = {
+        "map_location": "cpu",
+        "weights_only": False,
+    }
+    try:
+        checkpoint = torch.load(ckpt_path, mmap=True, **load_kwargs)
+    except (TypeError, RuntimeError):
+        # mmap is unavailable on older PyTorch releases and legacy checkpoint
+        # formats. CPU loading still prevents unused optimizer state from
+        # occupying accelerator memory during evaluation.
+        checkpoint = torch.load(ckpt_path, **load_kwargs)
     if not isinstance(checkpoint, dict):
         raise TypeError(f"Expected a checkpoint dictionary, got {type(checkpoint)!r}")
     if "model_args" not in checkpoint or "model" not in checkpoint:
@@ -161,6 +299,18 @@ def load_model_checkpoint(ckpt_path, device, verbose=True):
     if had_compiled_prefix and verbose:
         print("Detected compiled model checkpoint. Removing '_orig_mod.' prefix from state dict keys.")
     model.load_state_dict(strip_compiled_prefix(model_state_dict), strict=True)
+    if not load_training_state:
+        retained_keys = {
+            "step",
+            "tokens_processed",
+            "train_batches_consumed",
+            "model_args",
+            "model",
+            "config",
+        }
+        checkpoint = {
+            key: value for key, value in checkpoint.items() if key in retained_keys
+        }
     model.to(device)
     return checkpoint, model, model_config
 
@@ -278,6 +428,7 @@ def _get_dataloader_config(config):
         num_workers=config["num_workers"],
         pin_memory=config["pin_memory"],
         persistent_workers=config["persistent_workers"],
+        prefetch_factor=int(config.get("prefetch_factor", 2)),
         dtype=np.dtype(config.get("data_dtype", "uint32")),
         rank=int(config.get("rank", 0)),
         world_size=int(config.get("world_size", 1)),
@@ -293,6 +444,20 @@ def get_dataloader(config):
 def get_validation_dataloader(config):
     dataloader_config = _get_dataloader_config(config)
     return create_validation_dataloader(dataloader_config)
+
+
+def get_training_evaluation_dataloader(config, train_dataset=None):
+    dataloader_config = _get_dataloader_config(config)
+    return create_training_evaluation_dataloader(dataloader_config, train_dataset)
+
+
+def model_for_validation(model):
+    """Remove DDP collectives while preserving a torch.compile wrapper."""
+    return (
+        model.module
+        if isinstance(model, nn.parallel.DistributedDataParallel)
+        else model
+    )
 
 
 def get_lm_head_for_loss(model):
@@ -394,6 +559,9 @@ def compute_validation_loss(
     from tqdm import tqdm
 
     was_training = model.training
+    # Remove only DDP. Keep torch.compile's OptimizedModule so training and
+    # validation execute the same compiled forward implementation.
+    forward_model = model_for_validation(model)
     model.eval()
 
     ignore_index = getattr(getattr(criterion, "config", None), "ignore_index", -100)
@@ -430,7 +598,7 @@ def compute_validation_loss(
             x, y = x.to(device), y.to(device)
 
             loss = compute_lm_loss(
-                model,
+                forward_model,
                 criterion,
                 x,
                 y,
