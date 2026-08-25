@@ -24,7 +24,6 @@ except Exception:
     _TRITON_AVAILABLE = False
 
 __all__ = [
-    "attention_residual_average_read",
     "attention_residual_phase1",
     "attention_residual_phase1_from_logits",
     "attention_residual_phase2",
@@ -744,41 +743,6 @@ if _TRITON_AVAILABLE:
             sem="relaxed",
             mask=key_mask,
         )
-
-
-    @triton.jit
-    def _attnres_list_average_kernel(
-        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
-        output,
-        n_tokens,
-        n_sources,
-        D: tl.constexpr,
-        S_BLOCK: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-        OUTPUT_NORM: tl.constexpr,
-        NORM_EPS: tl.constexpr,
-    ):
-        token = tl.program_id(0)
-        d_offsets = tl.arange(0, BLOCK_D)
-        d_mask = d_offsets < D
-
-        acc = tl.zeros((BLOCK_D,), tl.float32)
-        for s in tl.static_range(0, S_BLOCK):
-            valid_source = s < n_sources
-            v_base = _select_ptr16(s, v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15)
-            v = tl.load(
-                v_base + token * D + d_offsets,
-                mask=d_mask & valid_source,
-                other=0.0,
-            ).to(tl.float32)
-            acc += v
-        acc = acc / n_sources
-
-        if OUTPUT_NORM:
-            sumsq = tl.sum(acc * acc, axis=0)
-            acc = acc * tl.rsqrt(sumsq / D + NORM_EPS)
-
-        tl.store(output + token * D + d_offsets, acc, mask=d_mask)
 
 
     @triton.jit
@@ -2563,58 +2527,6 @@ def attention_residual_read(
         raise RuntimeError("Triton fused AttnRes path is not available for these tensors")
     output = _attnres_read_torch_stacked(values, query, key_norm, source_counts, source_logit_biases)
     return _norm(output) if normalize_output else output
-
-
-def attention_residual_average_read(
-    values,
-    normalize_output: bool = False,
-    force_triton: bool = False,
-) -> Tensor:
-    values = _as_stacked(values) if isinstance(values, Tensor) else values
-    if isinstance(values, Tensor):
-        if values.size(0) == 1:
-            output = values[0]
-            return _norm(output) if normalize_output else output
-        output = values.mean(dim=0)
-        return _norm(output) if normalize_output else output
-
-    if len(values) == 1:
-        output = values[0]
-        return _norm(output) if normalize_output else output
-    if len(values) > 16:
-        if force_triton:
-            raise RuntimeError("Triton average AttnRes path supports at most 16 sources")
-        output = torch.stack(values, dim=0).mean(dim=0)
-        return _norm(output) if normalize_output else output
-
-    first = values[0]
-    if not _can_use_triton(*values):
-        if force_triton:
-            raise RuntimeError("Triton average AttnRes path is not available for these tensors")
-        output = torch.stack(values, dim=0).mean(dim=0)
-        return _norm(output) if normalize_output else output
-
-    B, T, D = first.shape
-    n_tokens = B * T
-    if D > 4096:
-        raise RuntimeError("Fused average AttnRes only supports n_embd <= 4096")
-    output = torch.empty((B, T, D), device=first.device, dtype=first.dtype)
-    s_block = _next_power_of_2(len(values))
-    padded_values = list(values) + [values[0]] * (16 - len(values))
-    block_d = _next_power_of_2(D)
-    _attnres_list_average_kernel[(n_tokens,)](
-        *padded_values,
-        output,
-        n_tokens,
-        len(values),
-        D,
-        s_block,
-        block_d,
-        normalize_output,
-        torch.finfo(first.dtype).eps,
-        num_warps=8 if block_d >= 2048 else 4,
-    )
-    return output
 
 
 def _attnres_phase1_read_torch(values: Tensor, queries: Tensor, key_norm: bool):
@@ -4889,82 +4801,42 @@ def lrid_attention_residual_read(
     )
     direct_triton_ok = list_layout_ok and _lrid_list_dims_within_triton_limits(values, keys, num_heads)
     if list_layout_ok:
-        if torch.is_grad_enabled():
-            training_kernel_mode = _training_kernel_mode()
-            if training_kernel_mode in {"auto", "triton_op"} and _lrid_read_list_library_op is not None and query.dim() != 4:
-                output, _, _, _ = _lrid_read_list_library_op(
-                    list(values),
-                    list(keys),
-                    query,
-                    int(num_heads),
-                    float(logit_scale),
-                    bool(key_norm),
-                    bool(use_fused_output_norm),
-                    os.environ.get("ATTNRES_SAVE_AUX", "0") == "1",
-                )
-                return output if use_fused_output_norm or not normalize_output else _norm(output)
-            if training_kernel_mode == "triton" and query.dim() != 4 and direct_triton_ok:
-                return _TritonLRIDListAttentionResidualRead.apply(
-                    query,
-                    int(num_heads),
-                    float(logit_scale),
-                    bool(key_norm),
-                    bool(use_fused_output_norm),
-                    *values,
-                    *keys,
-                )
-            if training_kernel_mode == "triton" and force_triton:
-                raise RuntimeError("Triton fused LRID AttnRes path is not available for these tensors")
-            else:
-                output = _lrid_read_torch_list(
-                    values,
-                    keys,
-                    query,
-                    num_heads,
-                    logit_scale,
-                    key_norm,
-                    source_counts,
-                    source_logit_biases,
-                )
-            return _norm(output) if normalize_output else output
-        if not torch.is_grad_enabled():
-            # Old tail-r512 training used the torch.library Triton op for static-query list reads.
-            # Keep eval on the same path even when the direct wrapper's conservative limits reject it.
-            if _lrid_read_list_library_op is not None and query.dim() != 4:
-                output, _, _, _ = _lrid_read_list_library_op(
-                    list(values),
-                    list(keys),
-                    query,
-                    int(num_heads),
-                    float(logit_scale),
-                    bool(key_norm),
-                    bool(use_fused_output_norm),
-                    False,
-                )
-            elif direct_triton_ok:
-                output = _lrid_read_list_triton(
-                    values,
-                    keys,
-                    query,
-                    num_heads,
-                    logit_scale,
-                    key_norm,
-                    use_fused_output_norm,
-                )
-            elif force_triton:
-                raise RuntimeError("Triton fused LRID AttnRes path is not available for these tensors")
-            else:
-                output = _lrid_read_torch_list(
-                    values,
-                    keys,
-                    query,
-                    num_heads,
-                    logit_scale,
-                    key_norm,
-                    source_counts,
-                    source_logit_biases,
-                )
+        kernel_mode = _training_kernel_mode()
+        if kernel_mode in {"auto", "triton_op"} and _lrid_read_list_library_op is not None and query.dim() != 4:
+            output, _, _, _ = _lrid_read_list_library_op(
+                list(values),
+                list(keys),
+                query,
+                int(num_heads),
+                float(logit_scale),
+                bool(key_norm),
+                bool(use_fused_output_norm),
+                torch.is_grad_enabled() and os.environ.get("ATTNRES_SAVE_AUX", "0") == "1",
+            )
             return output if use_fused_output_norm or not normalize_output else _norm(output)
+        if kernel_mode == "triton" and query.dim() != 4 and direct_triton_ok:
+            return _TritonLRIDListAttentionResidualRead.apply(
+                query,
+                int(num_heads),
+                float(logit_scale),
+                bool(key_norm),
+                bool(use_fused_output_norm),
+                *values,
+                *keys,
+            )
+        if kernel_mode == "triton" and force_triton:
+            raise RuntimeError("Triton fused LRID AttnRes path is not available for these tensors")
+        output = _lrid_read_torch_list(
+            values,
+            keys,
+            query,
+            num_heads,
+            logit_scale,
+            key_norm,
+            source_counts,
+            source_logit_biases,
+        )
+        return _norm(output) if normalize_output else output
 
     if not isinstance(values, Tensor) and not isinstance(keys, Tensor):
         if len(values) == 1:

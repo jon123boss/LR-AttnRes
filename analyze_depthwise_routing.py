@@ -911,11 +911,10 @@ class RoutingRecorder:
         residual_idx: int,
         sources: list[torch.Tensor],
         normalize_output: bool = False,
-        average_read: bool = False,
         source_counts=None,
         source_logit_biases=None,
     ) -> Optional[torch.Tensor]:
-        if average_read or len(sources) < 2:
+        if len(sources) < 2:
             return None
         values = torch.stack(sources, dim=0)
         residual = self.model.transformer.attn_residuals[self.model._attnres_query_idx(residual_idx)]
@@ -943,11 +942,10 @@ class RoutingRecorder:
         sources: list[Any],
         query_override: Optional[torch.Tensor] = None,
         normalize_output: bool = False,
-        average_read: bool = False,
         source_counts=None,
         source_logit_biases=None,
     ) -> Optional[torch.Tensor]:
-        if average_read or len(sources) < 2:
+        if len(sources) < 2:
             return None
 
         value_sources = [source[0] for source in sources]

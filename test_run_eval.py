@@ -649,9 +649,17 @@ class SharedLoadingTests(unittest.TestCase):
             vocab_size=32,
             block_size=4,
             flash_attention=False,
+            use_attnres=True,
+            use_fused_attnres=True,
+            attnres_type="full",
+            use_lrid=True,
+            lrid_rank=4,
+            lrid_key_from_output_tail=True,
+            attn_res_query_init="normal",
         )
         torch.manual_seed(31415)
         source_model = OBPM(model_config)
+        self.assertTrue(all(torch.count_nonzero(query) > 0 for query in source_model.transformer.lrid_queries))
 
         with tempfile.TemporaryDirectory() as temp_dir:
             (np.arange(65, dtype=np.uint32) % 32).tofile(
@@ -737,9 +745,11 @@ class SharedLoadingTests(unittest.TestCase):
             attnres_num_blocks=2,
             use_lrid=True,
             lrid_rank=4,
+            attn_res_query_init="normal",
         )
         torch.manual_seed(2718)
         model = OBPM(config)
+        self.assertTrue(all(torch.count_nonzero(query) > 0 for query in model.transformer.lrid_queries))
         sample = torch.randint(0, config.vocab_size, (2, config.block_size))
 
         model.train()
@@ -766,9 +776,11 @@ class SharedLoadingTests(unittest.TestCase):
             attnres_num_blocks=2,
             use_lrid=True,
             lrid_rank=4,
+            attn_res_query_init="normal",
         )
         torch.manual_seed(1729)
         model = OBPM(config)
+        self.assertTrue(all(torch.count_nonzero(query) > 0 for query in model.transformer.lrid_queries))
         sample = torch.randint(0, config.vocab_size, (2, config.block_size))
 
         model.train()
@@ -780,6 +792,47 @@ class SharedLoadingTests(unittest.TestCase):
             validation_logits = model(sample)
 
         torch.testing.assert_close(training_logits.detach(), validation_logits, rtol=0, atol=0)
+
+    def test_output_tail_periodic_validation_uses_learned_nonzero_queries(self):
+        config = ModelConfig(
+            n_layer=2,
+            n_head=2,
+            n_embd=16,
+            mlp_hidden_dim=32,
+            vocab_size=32,
+            block_size=8,
+            flash_attention=False,
+            use_attnres=True,
+            use_fused_attnres=True,
+            attnres_type="full",
+            use_lrid=True,
+            lrid_rank=4,
+            lrid_key_from_output_tail=True,
+            attn_res_query_init="normal",
+        )
+        torch.manual_seed(31415)
+        model = OBPM(config)
+        sample = torch.randint(0, config.vocab_size, (2, config.block_size))
+
+        with torch.no_grad():
+            pattern = torch.linspace(-1.0, 1.0, config.lrid_rank)
+            for query_idx, query in enumerate(model.transformer.lrid_queries):
+                query.copy_(pattern.reshape_as(query) * (query_idx + 1))
+
+        model.train()
+        training_logits = model(sample)
+        model.eval()
+        with torch.no_grad():
+            validation_logits = model(sample)
+
+        torch.testing.assert_close(training_logits.detach(), validation_logits, rtol=0, atol=0)
+
+        with torch.no_grad():
+            for query in model.transformer.lrid_queries:
+                query.zero_()
+            zero_query_logits = model(sample)
+
+        self.assertGreater((validation_logits - zero_query_logits).abs().max().item(), 1e-6)
 
     def test_rng_state_round_trip_replays_the_next_random_values(self):
         random.seed(99)

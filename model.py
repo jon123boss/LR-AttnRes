@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from functools import partial
 import math
 from attnres_ops import (
-    attention_residual_average_read,
     attention_residual_phase1_from_logits,
     attention_residual_phase2,
     attention_residual_phase2_torch,
@@ -1311,14 +1310,11 @@ class OBPM(nn.Module):
         residual_idx,
         sources,
         normalize_output=False,
-        average_read=False,
         source_counts=None,
         source_logit_biases=None,
     ):
         if len(sources) == 1:
             return norm(sources[0]) if normalize_output else sources[0]
-        if average_read:
-            return attention_residual_average_read(sources, normalize_output=normalize_output)
         residual = self.transformer.attn_residuals[self._attnres_query_idx(residual_idx)]
         if self.config.use_fused_attnres:
             query = residual._query(sources[0].dtype)
@@ -1405,7 +1401,6 @@ class OBPM(nn.Module):
                 residual_idx,
                 sources,
                 normalize_output=fused_read_norm,
-                average_read=False,
                 source_logit_biases=source_logit_biases,
             )
 
@@ -1522,7 +1517,6 @@ class OBPM(nn.Module):
                 sources,
                 query_override=query_override,
                 normalize_output=fused_read_norm,
-                average_read=False,
                 source_logit_biases=source_logit_biases,
             )
 
@@ -2407,7 +2401,6 @@ class OBPM(nn.Module):
         sources,
         query_override=None,
         normalize_output=False,
-        average_read=False,
         source_counts=None,
         source_logit_biases=None,
     ):
@@ -2416,8 +2409,6 @@ class OBPM(nn.Module):
             return norm(output) if normalize_output else output
 
         value_sources = [source[0] for source in sources]
-        if average_read:
-            return attention_residual_average_read(value_sources, normalize_output=normalize_output)
         key_sources = [source[1] for source in sources]
         num_heads = self.config.lrid_num_heads
         key_head_dim = self.config.lrid_rank // num_heads
@@ -2654,7 +2645,6 @@ class OBPM(nn.Module):
                             2 * layer_idx,
                             residual_sources,
                             normalize_output=fused_read_norm,
-                            average_read=False,
                         )
                     else:
                         attn_res_idx = 2 * layer_idx
@@ -2672,7 +2662,6 @@ class OBPM(nn.Module):
                             attn_res_idx,
                             sources,
                             normalize_output=fused_read_norm,
-                            average_read=False,
                             source_logit_biases=source_logit_biases,
                         )
 
@@ -2704,7 +2693,6 @@ class OBPM(nn.Module):
                             2 * layer_idx + 1,
                             residual_sources,
                             normalize_output=fused_read_norm,
-                            average_read=False,
                         )
                     else:
                         after_attn_idx = 2 * layer_idx + 1
@@ -2755,7 +2743,6 @@ class OBPM(nn.Module):
                             sources,
                             query_override=partial_query if self.config.lrid_input_dependent_query else None,
                             normalize_output=fused_read_norm,
-                            average_read=False,
                             source_logit_biases=source_logit_biases,
                         )
 
@@ -2820,7 +2807,6 @@ class OBPM(nn.Module):
                         2 * layer_idx,
                         residual_sources,
                         normalize_output=fused_read_norm,
-                        average_read=False,
                     )
                 else:
                     attn_res_idx = 2 * layer_idx
@@ -2836,7 +2822,6 @@ class OBPM(nn.Module):
                         2 * layer_idx,
                         sources,
                         normalize_output=fused_read_norm,
-                        average_read=False,
                         source_logit_biases=source_logit_biases,
                     )
 
@@ -2856,7 +2841,6 @@ class OBPM(nn.Module):
                         2 * layer_idx + 1,
                         residual_sources,
                         normalize_output=fused_read_norm,
-                        average_read=False,
                     )
                 else:
                     after_attn_idx = 2 * layer_idx + 1
@@ -2885,7 +2869,6 @@ class OBPM(nn.Module):
                         after_attn_idx,
                         sources,
                         normalize_output=fused_read_norm,
-                        average_read=False,
                         source_logit_biases=source_logit_biases,
                     )
 
@@ -2932,7 +2915,6 @@ class OBPM(nn.Module):
                         2 * self.config.n_layer,
                         residual_sources,
                         normalize_output=fused_read_norm,
-                        average_read=False,
                     )
                 else:
                     sources = completed_blocks if partial_block is None else completed_blocks + [
@@ -2949,7 +2931,6 @@ class OBPM(nn.Module):
                         2 * self.config.n_layer,
                         sources,
                         normalize_output=fused_read_norm,
-                        average_read=False,
                         source_logit_biases=source_logit_biases,
                     )
             elif self.attnres_type == "full":
@@ -2957,7 +2938,6 @@ class OBPM(nn.Module):
                     2 * self.config.n_layer,
                     residual_sources,
                     normalize_output=fused_read_norm,
-                    average_read=False,
                 )
             else:
                 sources = completed_blocks if partial_block is None else completed_blocks + [self._attnres_block_summary(partial_block, partial_count, 2 * self.config.n_layer)]
@@ -2972,7 +2952,6 @@ class OBPM(nn.Module):
                     2 * self.config.n_layer,
                     sources,
                     normalize_output=fused_read_norm,
-                    average_read=False,
                     source_logit_biases=source_logit_biases,
                 )
         

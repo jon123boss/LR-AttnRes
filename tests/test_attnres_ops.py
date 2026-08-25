@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+import attnres_ops as ops_module
 import model as model_module
 from attnres_ops import (
     _lrid_list_dims_within_triton_limits,
@@ -1013,6 +1014,34 @@ def test_fused_lrid_r512_single_head_eval_matches_torch():
         actual = lrid_attention_residual_read(sources, keys, query, num_heads, 1.0, True)
     torch.cuda.synchronize()
     _assert_close(actual, expected, dtype)
+
+
+def test_lrid_static_query_dispatch_is_identical_with_and_without_grad(monkeypatch):
+    values = [torch.ones(1, 2, 8), torch.full((1, 2, 8), 3.0)]
+    keys = [torch.ones(1, 2, 4), -torch.ones(1, 2, 4)]
+    query = torch.tensor([[0.5, -0.25, 1.0, 0.75]], requires_grad=True)
+    seen_queries = []
+
+    def fake_library_op(values, keys, query, *args):
+        seen_queries.append(query.detach().clone())
+        output = values[0] * query.float().sum().to(values[0].dtype)
+        placeholder = torch.empty(1)
+        return output, placeholder, placeholder, placeholder
+
+    monkeypatch.setenv("ATTNRES_TRAIN_KERNEL", "triton_op")
+    monkeypatch.setattr(ops_module, "_can_use_triton_lrid_list", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ops_module, "_lrid_list_dims_within_triton_limits", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ops_module, "_lrid_read_list_library_op", fake_library_op)
+
+    training_output = lrid_attention_residual_read(values, keys, query, 1, 1.0, False)
+    with torch.no_grad():
+        validation_output = lrid_attention_residual_read(values, keys, query, 1, 1.0, False)
+
+    assert len(seen_queries) == 2
+    assert torch.equal(seen_queries[0], query.detach())
+    assert torch.equal(seen_queries[1], query.detach())
+    assert torch.count_nonzero(seen_queries[1]) > 0
+    assert torch.equal(training_output, validation_output)
 
 
 def test_fused_lrid_output_tail_keys_match_torch():
