@@ -1050,7 +1050,9 @@ while tokens_processed < max_tokens and step < max_steps:
                 y,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                cast_logits_to_float=True,
+                # Preserve the historical training objective used by the
+                # existing runs; evaluation still uses float32 logits.
+                cast_logits_to_float=False,
             )
             loss = loss / grad_accum_steps
 

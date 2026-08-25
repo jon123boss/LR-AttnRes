@@ -182,8 +182,8 @@ Trajectory-exact resume also requires the recorded ordered shard manifest,
 objective, optimizer, clipping and schedule settings to match. The shard
 manifest checks path, file identity, size and nanosecond modification time;
 the loader rejects mismatches instead of silently resuming from different data.
-Training and validation both compute the loss from float32 logits, including
-when model activations are bfloat16.
+Training preserves the historical loss path and computes cross-entropy directly
+from bfloat16 logits. Validation casts logits to float32 for stable reporting.
 New checkpoints also guard the PyTorch/CUDA/device/criterion runtime and every
 Attention-Residual kernel-selection environment variable. Bitwise trajectory
 claims still require the same deterministic hardware and software environment.
