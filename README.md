@@ -116,6 +116,11 @@ torchrun --standalone --nproc_per_node=2 train.py --init_from resume --ckpt_file
 `run_eval.py` can load checkpoints produced by DDP training because checkpoints
 save the unwrapped model state on rank 0. A normal eval run is single-process:
 
+The downstream suite uses `lm-evaluation-harness` task definitions with a
+5-shot override. It is not the official OLMES protocol (which uses its own
+curated prompts, scoring variants, and aggregation), so label reported numbers
+as generic lm-eval 5-shot results rather than OLMES results.
+
 ```bash
 python run_eval.py --ckpts out/ckpt_step:1000.pt
 ```
@@ -140,6 +145,12 @@ the long task pass. Eval compile is opt-in:
 ```bash
 python run_eval.py --ckpts out/ckpt_step:1000.pt --torch-max-autotune
 ```
+
+New training checkpoints are written atomically and include the RNG state plus
+the exact number of consumed local training batches. Resuming restores model,
+optimizer, scheduler, random state, and the next shuffled batch. Older
+checkpoints still load, but cannot reproduce the exact uninterrupted trajectory
+because they did not store RNG or in-epoch dataloader state.
 
 ## LR AttnRes
 

@@ -22,6 +22,7 @@ import copy
 import argparse
 import subprocess
 import gc
+import random
 import numpy as np
 from contextlib import nullcontext
 from utils import (
@@ -32,6 +33,9 @@ from utils import (
     compute_validation_loss,
     compute_lm_loss,
     loss_to_token_sum,
+    capture_rng_state,
+    restore_rng_state,
+    atomic_torch_save,
     unwrap_model,
 )
 from criterion import get_criterion
@@ -110,6 +114,7 @@ def reduce_float(value, op=None):
 seed = 42
 os.environ["PYTHONHASHSEED"] = str(seed)
 np.random.seed(seed)
+random.seed(seed)
 torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
@@ -758,6 +763,7 @@ if use_doc_masking:
     print0("Boundary warmup complete.")
 
 tokens_processed = 0
+train_batches_consumed = 0
 tokens_per_step = batch_size * block_size * grad_accum_steps * world_size
 if checkpoint is not None:
     muon_optimizer.load_state_dict(checkpoint["muon_optimizer"])
@@ -765,6 +771,13 @@ if checkpoint is not None:
     muon_scheduler.load_state_dict(checkpoint["muon_scheduler"])
     adamw_scheduler.load_state_dict(checkpoint["adamw_scheduler"])
     tokens_processed = int(checkpoint["tokens_processed"])
+    train_batches_consumed = int(
+        checkpoint.get("train_batches_consumed", start_step * grad_accum_steps)
+    )
+    if restore_rng_state(checkpoint.get("rng_state")):
+        print0("Restored Python, NumPy, PyTorch, and CUDA RNG state from checkpoint.")
+    else:
+        print0("Checkpoint has no RNG state; resume is weight-exact but not trajectory-exact.")
 
 print0(f"Tokens per step: {tokens_per_step:,}")
 print0(f"Starting from step {start_step}, tokens seen: {tokens_processed:,}")
@@ -775,6 +788,8 @@ def build_checkpoint(current_step: int):
     return {
         "step": current_step,
         "tokens_processed": tokens_processed,
+        "train_batches_consumed": train_batches_consumed,
+        "rng_state": capture_rng_state(),
         "model": raw_model.state_dict(),
         "muon_optimizer": muon_optimizer.state_dict(),
         "adamw_optimizer": adamw_optimizer.state_dict(),
@@ -787,19 +802,24 @@ def build_checkpoint(current_step: int):
 
 def save_training_checkpoint(current_step: int, ckpt_path: str):
     checkpoint_payload = build_checkpoint(current_step)
-    torch.save(checkpoint_payload, ckpt_path)
+    atomic_torch_save(checkpoint_payload, ckpt_path)
     print0(f"Saved checkpoint: {ckpt_path}")
     return ckpt_path
 
 
-def infinite_dataloader(dataloader, start_epoch=0):
+def infinite_dataloader(dataloader, start_epoch=0, start_batch=0):
     epoch = start_epoch
     while True:
         sampler = getattr(dataloader, "sampler", None)
         if hasattr(sampler, "set_epoch"):
             sampler.set_epoch(epoch)
+        if hasattr(sampler, "set_start_index"):
+            sampler.set_start_index(start_batch * dataloader.batch_size)
         for batch in dataloader:
             yield batch
+        if hasattr(sampler, "set_start_index"):
+            sampler.set_start_index(0)
+        start_batch = 0
         epoch += 1
 
 
@@ -817,6 +837,8 @@ def estimate_loss(current_step):
         sampler = getattr(loader, "sampler", None)
         if hasattr(sampler, "set_epoch"):
             sampler.set_epoch(current_step)
+        if hasattr(sampler, "set_start_index"):
+            sampler.set_start_index(0)
         eval_iter = iter(loader)
 
         for k in range(eval_steps):
@@ -913,10 +935,17 @@ print0("Starting training...")
 print0("=" * 80)
 
 loader_batches_per_epoch = max(1, len(train_loader))
+resume_epoch, resume_batch = divmod(train_batches_consumed, loader_batches_per_epoch)
 train_iter = infinite_dataloader(
     train_loader,
-    start_epoch=(start_step * grad_accum_steps) // loader_batches_per_epoch,
+    start_epoch=resume_epoch,
+    start_batch=resume_batch,
 )
+if train_batches_consumed:
+    print0(
+        f"Resuming training data at epoch {resume_epoch}, batch {resume_batch} "
+        f"({train_batches_consumed:,} local batches consumed)."
+    )
 
 while tokens_processed < max_tokens and step < max_steps:
     muon_optimizer.param_groups[0]['momentum'] = get_muon_momentum(step)
@@ -950,6 +979,7 @@ while tokens_processed < max_tokens and step < max_steps:
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         batch = next(train_iter)
+        train_batches_consumed += 1
 
         if use_doc_masking:
             x, y, cu_seqlens, max_seqlen = batch
