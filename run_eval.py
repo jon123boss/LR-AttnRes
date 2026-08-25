@@ -343,9 +343,14 @@ class OBPMWrapper(LM):
     def _prepare_loglikelihood_tokens(self, context_ids, continuation_ids):
         if not continuation_ids:
             raise ValueError("Continuation encoded to zero tokens; refusing to report a false 0.0 score.")
+        if len(continuation_ids) > self.max_length:
+            raise ValueError(
+                f"Continuation has {len(continuation_ids)} tokens, exceeding the "
+                f"model context limit of {self.max_length}; refusing to score only a suffix."
+            )
 
         # Keep one conditioning token plus at most max_length target tokens.
-        target_ids = continuation_ids[-self.max_length:]
+        target_ids = continuation_ids
         combined = (context_ids + continuation_ids)[-(self.max_length + 1):]
         input_ids = combined[:-1]
         if not input_ids or len(target_ids) > len(input_ids):

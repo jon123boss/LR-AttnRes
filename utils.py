@@ -72,6 +72,43 @@ def restore_rng_state(state):
     return True
 
 
+_EXACT_RESUME_DATA_KEYS = (
+    "dataset_dir",
+    "data_dtype",
+    "batch_size",
+    "block_size",
+    "grad_accum_steps",
+    "world_size",
+    "seed",
+    "use_doc_masking",
+    "doc_separator_token",
+)
+
+
+def validate_exact_resume_data_config(checkpoint, current_config):
+    """Reject data-topology changes that invalidate the saved batch cursor."""
+    if "train_batches_consumed" not in checkpoint:
+        return
+    saved_config = checkpoint.get("config")
+    if not isinstance(saved_config, dict):
+        raise ValueError(
+            "Checkpoint has an exact-resume batch cursor but no saved training config."
+        )
+
+    mismatches = []
+    for key in _EXACT_RESUME_DATA_KEYS:
+        if key in saved_config and key in current_config:
+            saved_value = saved_config[key]
+            current_value = current_config[key]
+            if saved_value != current_value:
+                mismatches.append(f"{key}: saved={saved_value!r}, current={current_value!r}")
+    if mismatches:
+        details = "; ".join(mismatches)
+        raise ValueError(
+            "Exact checkpoint resume requires unchanged data topology; " + details
+        )
+
+
 def atomic_torch_save(payload, path):
     """Write a torch checkpoint atomically so interruptions do not corrupt it."""
     target_path = os.path.abspath(path)
