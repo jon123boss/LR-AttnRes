@@ -369,6 +369,33 @@ class SharedLoadingTests(unittest.TestCase):
             return
         self.assertEqual(actual, expected)
 
+    def test_periodic_validation_can_be_bounded_to_old_eval_steps_subset(self):
+        vocab_size = 8
+
+        class ConstantModel(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return torch.zeros(*input_ids.shape, vocab_size)
+
+        model = ConstantModel().train()
+        batch = (
+            torch.tensor([[1, 2, 3]], dtype=torch.long),
+            torch.tensor([[2, 3, 4]], dtype=torch.long),
+        )
+        val_loader = [batch for _ in range(5)]
+        metrics = utils.compute_validation_loss(
+            model,
+            torch.nn.CrossEntropyLoss(),
+            val_loader,
+            torch.device("cpu"),
+            vocab_size,
+            use_doc_masking=False,
+            max_batches=2,
+        )
+
+        self.assertEqual(metrics["batches"], 2)
+        self.assertEqual(metrics["tokens"], 6)
+        self.assertTrue(model.training)
+
     def test_compiled_checkpoint_loads_through_shared_training_eval_path(self):
         config = ModelConfig(
             n_layer=1,

@@ -555,8 +555,15 @@ def compute_validation_loss(
     use_doc_masking=True,
     desc="Validation loss",
     distributed=False,
+    max_batches=None,
 ):
+    from itertools import islice
     from tqdm import tqdm
+
+    if max_batches is not None:
+        max_batches = int(max_batches)
+        if max_batches < 1:
+            raise ValueError("max_batches must be >= 1 when provided")
 
     was_training = model.training
     # Remove only DDP. Keep torch.compile's OptimizedModule so training and
@@ -576,8 +583,19 @@ def compute_validation_loss(
         if dist.is_available() and dist.is_initialized():
             disable_tqdm = dist.get_rank() != 0
 
+    validation_batches = val_loader if max_batches is None else islice(val_loader, max_batches)
+    progress_total = None
+    if max_batches is not None and hasattr(val_loader, "__len__"):
+        progress_total = min(len(val_loader), max_batches)
+
     try:
-        for batch in tqdm(val_loader, desc=desc, leave=False, disable=disable_tqdm):
+        for batch in tqdm(
+            validation_batches,
+            total=progress_total,
+            desc=desc,
+            leave=False,
+            disable=disable_tqdm,
+        ):
             if use_doc_masking:
                 x, y, cu_seqlens, max_seqlen = batch
                 cu_seqlens = cu_seqlens.to(device)

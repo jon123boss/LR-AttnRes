@@ -858,8 +858,8 @@ def estimate_loss(current_step):
     ignore_index = getattr(getattr(criterion, "config", None), "ignore_index", -100)
     reduction = getattr(getattr(criterion, "config", None), "reduction", "mean")
     try:
-        # Keep the training-loss diagnostic bounded, but compute validation via
-        # the same full-loader implementation used by eval-only and run_eval.py.
+        # Keep both periodic diagnostics bounded. Full-shard validation remains
+        # available through --eval_only and run_eval.py.
         loader = train_eval_loader
         total_loss = 0.0
         total_tokens = 0
@@ -932,6 +932,8 @@ def estimate_loss(current_step):
             vocab_size,
             use_doc_masking=use_doc_masking,
             distributed=distributed,
+            desc="Periodic validation",
+            max_batches=eval_steps,
         )
         out["val"] = val_metrics["loss"]
         return out
