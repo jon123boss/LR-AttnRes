@@ -252,13 +252,36 @@ def load_fast_attnres() -> Any:
 
 def fast_attnres_package_provenance() -> dict[str, Any]:
     function = load_fast_attnres()
-    path = inspect.getsourcefile(function)
+    distribution = importlib.metadata.distribution(FAST_ATTNRES_DISTRIBUTION)
     hashes = {}
-    if path and Path(path).is_file():
-        resolved = Path(path).resolve()
-        hashes[str(resolved)] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    installed_sources = set()
+    combined = hashlib.sha256()
+    for relative in distribution.files or ():
+        relative_path = Path(str(relative))
+        if not relative_path.parts or relative_path.parts[0] != "attnres":
+            continue
+        if relative_path.suffix not in {".py", ".pyi"}:
+            continue
+        installed_path = Path(distribution.locate_file(relative)).resolve()
+        if not installed_path.is_file():
+            continue
+        contents = installed_path.read_bytes()
+        installed_sources.add(installed_path)
+        name = relative_path.as_posix()
+        hashes[name] = hashlib.sha256(contents).hexdigest()
+        combined.update(name.encode())
+        combined.update(b"\0")
+        combined.update(contents)
+        combined.update(b"\0")
+
+    public_api_path = inspect.getsourcefile(function)
+    if not public_api_path or Path(public_api_path).resolve() not in installed_sources:
+        raise FastAttnResPackageError(
+            "The imported Fast-AttnRes public API does not belong to the installed distribution"
+        )
     return {
-        "version": importlib.metadata.version(FAST_ATTNRES_DISTRIBUTION),
+        "version": distribution.version,
+        "distribution_source_sha256": combined.hexdigest(),
         "source_hashes": hashes,
     }
 
@@ -348,9 +371,6 @@ def fast_attnres_config_decision(
     lrid_static_embedding_key: bool = False,
     lrid_add_static_embedding_key: bool = False,
     lrid_add_static_source_key: bool = False,
-    attnres_block_count_prior: bool = False,
-    attnres_block_beta: Any = "legacy",
-    attnres_block_beta_learned: bool = False,
     n_layer: int = 1,
 ) -> FastAttnResDecision:
     """Check model-level semantics independent of runtime input shapes.
@@ -409,62 +429,6 @@ def fast_attnres_config_decision(
     return _fast()
 
 
-def fast_attnres_startup_decision(
-    *,
-    model_config: Any,
-    parameter_dtype: torch.dtype,
-    device: torch.device,
-) -> FastAttnResDecision:
-    """Return the static startup decision used by rank-zero banners.
-
-    This deliberately does not import the optional package.  It answers only
-    whether the model *can* reach a Fast read once input tensors are present;
-    callers that want to validate installation can call :func:`load_fast_attnres`
-    after this returns ``path='fast'``.
-    """
-
-    if str(getattr(model_config, "attnres_backend", "legacy")).lower() != "fast":
-        return _legacy("backend_legacy", "attnres_backend is set to legacy")
-
-    decision = fast_attnres_config_decision(
-        use_attnres=bool(getattr(model_config, "use_attnres", False)),
-        use_lrid=bool(getattr(model_config, "use_lrid", False)),
-        attnres_type=str(getattr(model_config, "attnres_type", "block")),
-        key_norm=bool(getattr(model_config, "attnres_key_norm", True)),
-        lrid_rank=int(getattr(model_config, "lrid_rank", getattr(model_config, "n_embd", 0))),
-        n_embd=int(getattr(model_config, "n_embd", 0)),
-        lrid_num_heads=int(getattr(model_config, "lrid_num_heads", 1)),
-        lrid_input_dependent_query=bool(getattr(model_config, "lrid_input_dependent_query", False)),
-        lrid_key_from_output_tail=bool(getattr(model_config, "lrid_key_from_output_tail", False)),
-        lrid_key_from_value=bool(getattr(model_config, "lrid_key_from_value", False)),
-        lrid_key_from_value_shared=bool(getattr(model_config, "lrid_key_from_value_shared", False)),
-        lrid_query_from_value=bool(getattr(model_config, "lrid_query_from_value", False)),
-        lrid_query_from_value_shared=bool(getattr(model_config, "lrid_query_from_value_shared", False)),
-        lrid_static_embedding_key=bool(getattr(model_config, "lrid_static_embedding_key", False)),
-        lrid_add_static_embedding_key=bool(getattr(model_config, "lrid_add_static_embedding_key", False)),
-        lrid_add_static_source_key=bool(getattr(model_config, "lrid_add_static_source_key", False)),
-        attnres_block_count_prior=bool(getattr(model_config, "attnres_block_count_prior", True)),
-        attnres_block_beta=getattr(model_config, "attnres_block_beta", "legacy"),
-        attnres_block_beta_learned=bool(getattr(model_config, "attnres_block_beta_learned", False)),
-        n_layer=int(getattr(model_config, "n_layer", 0)),
-    )
-    if not decision.eligible:
-        return decision
-    if parameter_dtype not in FAST_ATTNRES_DTYPES:
-        return _legacy("unsupported_dtype", "model parameters are not BF16 or FP32")
-    if device.type not in {"cpu", "cuda"}:
-        return _legacy("unsupported_device", "Fast-AttnRes supports CPU and CUDA only")
-    max_sources = 2 * int(getattr(model_config, "n_layer", 0)) + 1
-    if max_sources > FAST_ATTNRES_MAX_SOURCES:
-        return _legacy(
-            "unsupported_source_count",
-            f"model may expose {max_sources} sources (limit {FAST_ATTNRES_MAX_SOURCES})",
-        )
-    if int(getattr(model_config, "n_embd", 0)) > FAST_ATTNRES_MAX_WIDTH:
-        return _legacy("unsupported_value_width", "model value width exceeds Fast-AttnRes limit")
-    return decision
-
-
 __all__ = [
     "FAST_ATTNRES_VERSION",
     "FAST_ATTNRES_DISTRIBUTION",
@@ -479,6 +443,5 @@ __all__ = [
     "fast_attnres_package_provenance",
     "format_fast_attnres_banner",
     "print_fast_attnres_banner",
-    "fast_attnres_startup_decision",
     "load_fast_attnres",
 ]

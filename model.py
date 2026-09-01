@@ -912,6 +912,8 @@ class OBPM(nn.Module):
         return {
             **decision.as_dict(),
             "backend": self.config.attnres_backend,
+            "requested_backend": self.config.attnres_backend,
+            "resolved_backend": "fast-attnres" if active_reads else "legacy",
             "active_reads": active_reads,
             "total_reads": total_reads,
             "legacy_fallback_reads": total_reads - active_reads,
@@ -938,7 +940,10 @@ class OBPM(nn.Module):
 
     @staticmethod
     def _fast_attnres_eps(dtype: torch.dtype, *, lrid: bool = False) -> float:
-        return float(torch.finfo(torch.float32 if lrid else dtype).eps)
+        # Public-main normalizes both standard and LRID keys through
+        # ``F.rms_norm(..., eps=None)``. In the qualified Torch runtime that
+        # uses the FP32 accumulation epsilon, including for BF16 inputs.
+        return float(torch.finfo(torch.float32).eps)
 
     def _fast_attnres_config_decision(self):
         config = self.config
@@ -959,9 +964,6 @@ class OBPM(nn.Module):
             lrid_static_embedding_key=config.lrid_static_embedding_key,
             lrid_add_static_embedding_key=config.lrid_add_static_embedding_key,
             lrid_add_static_source_key=config.lrid_add_static_source_key,
-            attnres_block_count_prior=config.attnres_block_count_prior,
-            attnres_block_beta=config.attnres_block_beta,
-            attnres_block_beta_learned=config.attnres_block_beta_learned,
             n_layer=config.n_layer,
         )
 

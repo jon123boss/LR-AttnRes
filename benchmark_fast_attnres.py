@@ -192,10 +192,10 @@ def _fast_cuda_graph_gate() -> dict:
     values = [torch.randn(2, 32, 128, device="cuda", dtype=torch.bfloat16) for _ in range(5)]
     query = torch.randn(128, device="cuda", dtype=torch.bfloat16)
     for _ in range(3):
-        op(values, query, eps=float(torch.finfo(torch.bfloat16).eps), scale=1.0)
+        op(values, query, eps=float(torch.finfo(torch.float32).eps), scale=1.0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = op(values, query, eps=float(torch.finfo(torch.bfloat16).eps), scale=1.0)
+        captured = op(values, query, eps=float(torch.finfo(torch.float32).eps), scale=1.0)
     torch.cuda.synchronize()
     before = captured.clone()
     values[0].add_(0.125)
@@ -339,6 +339,8 @@ def _report(samples: list[dict], profiles: tuple[str, ...], replicates: int, see
         key = (row["profile"], row["seed"], row["pair_index"])
         paired.setdefault(key, []).append(row)
     for key, rows in paired.items():
+        if len(rows) != len(ARMS):
+            raise RuntimeError(f"duplicate or missing paired samples for {key}")
         if {row["arm"] for row in rows} != set(ARMS):
             raise RuntimeError(f"incomplete paired arms for {key}")
         if len({row["input_sha256"] for row in rows}) != 1:

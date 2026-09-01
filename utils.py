@@ -125,11 +125,24 @@ def capture_training_runtime(criterion, device):
 
 def validate_training_runtime(checkpoint, current_runtime):
     saved_runtime = checkpoint.get("training_runtime")
-    if saved_runtime is not None and saved_runtime != current_runtime:
+    if saved_runtime is None:
+        return
+
+    comparable_runtime = current_runtime
+    fast_keys = ("attnres_backend", "fast_attnres")
+    is_pre_fast_checkpoint = all(key not in saved_runtime for key in fast_keys)
+    if is_pre_fast_checkpoint and current_runtime.get("attnres_backend", "legacy") == "legacy":
+        # Public-main checkpoints predate Fast-AttnRes provenance. Their
+        # missing fields mean the legacy route, not a runtime mismatch.
+        comparable_runtime = {
+            key: value for key, value in current_runtime.items() if key not in fast_keys
+        }
+
+    if saved_runtime != comparable_runtime:
         raise ValueError(
             "Trajectory-exact checkpoint resume requires the same recorded software, "
             "device, criterion, and Attention-Residual kernel environment. "
-            f"saved={saved_runtime!r}, current={current_runtime!r}"
+            f"saved={saved_runtime!r}, current={comparable_runtime!r}"
         )
 
 

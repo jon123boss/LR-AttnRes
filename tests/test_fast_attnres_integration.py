@@ -102,14 +102,40 @@ def test_exact_resume_rejects_fast_backend_drift():
         )
 
 
+def test_pre_fast_runtime_provenance_resumes_only_on_legacy():
+    saved = {
+        "torch_version": torch.__version__,
+        "device_type": "cpu",
+        "criterion_backend": "torch",
+    }
+    legacy = {
+        **saved,
+        "attnres_backend": "legacy",
+        "fast_attnres": {"active_reads": 0},
+    }
+    utils.validate_training_runtime({"training_runtime": saved}, legacy)
+
+    with pytest.raises(ValueError, match="same recorded software"):
+        utils.validate_training_runtime(
+            {"training_runtime": saved},
+            {**legacy, "attnres_backend": "fast", "fast_attnres": {"active_reads": 2}},
+        )
+
+
 def test_banner_only_formats_for_active_fast_route():
     active = OBPM(_config("fast")).fast_attnres_startup_report(validate_package=True)
+    assert active["requested_backend"] == "fast"
+    assert active["resolved_backend"] == "fast-attnres"
+    assert active["distribution_source_sha256"]
+    assert "attnres/_kernels/fixed_tail.py" in active["source_hashes"]
     line = format_fast_attnres_banner(active)
     assert line == (
         "[Fast-AttnRes] backend=fast-attnres version=1.0.0 "
         "active_reads=2/2 legacy_fallback_reads=0"
     )
     inactive = OBPM(_config("legacy")).fast_attnres_startup_report(validate_package=False)
+    assert inactive["requested_backend"] == "legacy"
+    assert inactive["resolved_backend"] == "legacy"
     assert format_fast_attnres_banner(inactive) is None
     printed = []
 

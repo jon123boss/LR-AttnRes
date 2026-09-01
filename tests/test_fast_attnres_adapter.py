@@ -317,6 +317,6 @@ def test_fast_output_tail_matches_all_parameter_gradients_and_adamw_update(
 
 
 def test_fast_model_uses_the_legacy_normalization_epsilons():
-    assert OBPM._fast_attnres_eps(torch.bfloat16) == torch.finfo(torch.bfloat16).eps
+    assert OBPM._fast_attnres_eps(torch.bfloat16) == torch.finfo(torch.float32).eps
     assert OBPM._fast_attnres_eps(torch.float32) == torch.finfo(torch.float32).eps
     assert OBPM._fast_attnres_eps(torch.bfloat16, lrid=True) == torch.finfo(torch.float32).eps
