@@ -52,6 +52,7 @@ from schedulers import get_schedulers
 from dataloader import create_dataloaders, DataLoaderConfig, warmup_boundaries
 from typing import Optional, List, Dict, Any
 from model import OBPM
+from fast_attnres import print_fast_attnres_banner
 import torch.nn.functional as F
 from tokenizer_utils import (
     GPT4_EOT_TOKEN as _GPT4_EOT_TOKEN,
@@ -186,6 +187,7 @@ mlp_hidden_dim = 2816
 mlp_ratio = None
 weight_tying = False
 flash_attention = True
+attnres_backend = "legacy"
 init_std = 0.02
 init_cutoff_factor = None
 # Attention Residuals
@@ -504,6 +506,12 @@ def parse_args():
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--use_fused_attnres", type=_str_to_bool, nargs="?", const=True, default=use_fused_attnres)
     parser.add_argument("--no-use_fused_attnres", dest="use_fused_attnres", action="store_false")
+    parser.add_argument(
+        "--attnres_backend",
+        choices=("legacy", "fast"),
+        default=None,
+        help="Attention-Residual implementation; omitted resumes use the checkpoint value.",
+    )
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
     parser.add_argument("--attnres_block_average", type=_str_to_bool, nargs="?", const=True, default=attnres_block_average)
@@ -604,6 +612,7 @@ full_run_eval_torch_max_autotune = args.full_run_eval_torch_max_autotune
 use_doc_masking = args.use_doc_masking
 use_attnres = args.use_attnres
 use_fused_attnres = args.use_fused_attnres
+attnres_backend = args.attnres_backend or "legacy"
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
@@ -695,8 +704,21 @@ interactive_after_train = interactive_after_train and master_process
 
 config = get_config(sys.modules[__name__].__dict__)
 start_step, checkpoint, model, model_config = get_model(config, device)
+if checkpoint is not None:
+    checkpoint_backend = model_config.attnres_backend
+    if args.attnres_backend is not None and args.attnres_backend != checkpoint_backend:
+        raise ValueError(
+            "Checkpoint model uses "
+            f"attnres_backend={checkpoint_backend!r}, but the current request is "
+            f"{args.attnres_backend!r}."
+        )
+    attnres_backend = checkpoint_backend
+    config["attnres_backend"] = checkpoint_backend
 if device.type == "cuda":
     model.to_mixed_precision(dtype=torch.bfloat16)
+fast_attnres_report = model.fast_attnres_startup_report(validate_package=True)
+model._fast_attnres_enabled = bool(fast_attnres_report["active_reads"])
+print_fast_attnres_banner(fast_attnres_report, is_rank_zero=master_process)
 if distributed:
     for param in model.parameters():
         dist.broadcast(param.detach(), src=0)
@@ -759,6 +781,8 @@ def get_muon_momentum(step):
 
 criterion = get_criterion(config)
 training_runtime = capture_training_runtime(criterion, device)
+training_runtime["attnres_backend"] = model_config.attnres_backend
+training_runtime["fast_attnres"] = fast_attnres_report
 optimizers = get_optimizers(config, model)
 muon_optimizer, adamw_optimizer = optimizers
 schedulers = get_schedulers(config, muon_optimizer, adamw_optimizer)

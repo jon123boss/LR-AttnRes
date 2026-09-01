@@ -6,6 +6,15 @@ from torch.nn import functional as F
 from dataclasses import dataclass
 from functools import partial
 import math
+from fast_attnres import (
+    FAST_ATTNRES_DTYPES,
+    FAST_ATTNRES_MAX_SOURCES,
+    FAST_ATTNRES_MAX_WIDTH,
+    FastAttnResDecision,
+    fast_attnres_config_decision,
+    fast_attnres_package_provenance,
+    load_fast_attnres,
+)
 from attnres_ops import (
     attention_residual_phase1_from_logits,
     attention_residual_phase2,
@@ -103,8 +112,13 @@ class ModelConfig:
     lrid_query_from_value_shared: bool = False
     lrid_use_logit_scale: bool = True
     lrid_logit_scale: float = None
+    # Appended so old positional configs and checkpoints retain legacy behavior.
+    attnres_backend: str = "legacy"
 
     def __post_init__(self):
+        self.attnres_backend = str(self.attnres_backend or "legacy").lower()
+        if self.attnres_backend not in {"legacy", "fast"}:
+            raise ValueError("attnres_backend must be one of: legacy, fast")
         self.attnres_type = (self.attnres_type or "block")
         self.attnres_type = self.attnres_type.lower()
         self.attnres_block_average_mode = (self.attnres_block_average_mode or "count").lower()
@@ -813,6 +827,10 @@ class OBPM(nn.Module):
             for module in self.modules():
                 if isinstance(module, LRIDFusedProjection):
                     self._init_lrid_dynamic_query_projection(module, config.init_std, config.init_cutoff_factor)
+        self._fast_attnres_op = None
+        self._fast_attnres_enabled = bool(
+            self.fast_attnres_startup_report(validate_package=False)["active_reads"]
+        )
     def to_mixed_precision(self, dtype=torch.bfloat16):
         # These learned block exponents intentionally remain fp32. Preserve
         # their exact values instead of casting fp32 -> bf16 -> fp32 along with
@@ -830,6 +848,136 @@ class OBPM(nn.Module):
     
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+    def fast_attnres_startup_report(self, validate_package: bool = False):
+        """Describe the statically selected Fast route without mutable counters."""
+        decision = (
+            self._fast_attnres_config_decision()
+            if self.config.attnres_backend == "fast"
+            else FastAttnResDecision("legacy", "backend_legacy", "attnres_backend is legacy")
+        )
+        total_reads = 2 * self.config.n_layer if self.use_attnres else 0
+        parameter = next(self.parameters(), None)
+        operator_width = self.config.n_embd + (
+            self.config.lrid_rank if self._fast_lrid_requires_key_payload() else 0
+        )
+        max_sources = (
+            2 * self.config.n_layer + 1
+            if self.attnres_type == "full"
+            else min(2 * self.config.n_layer, self.config.attnres_num_blocks) + 1
+        )
+
+        if decision.eligible and (
+            parameter is None
+            or parameter.dtype not in FAST_ATTNRES_DTYPES
+            or parameter.device.type not in {"cpu", "cuda"}
+            or operator_width > FAST_ATTNRES_MAX_WIDTH
+            or max_sources > FAST_ATTNRES_MAX_SOURCES
+        ):
+            decision = FastAttnResDecision(
+                "legacy",
+                "unsupported_runtime_envelope",
+                "model dtype, device, width, or source count is outside Fast-AttnRes v1.0.0",
+            )
+
+        if decision.eligible and self.attnres_type == "block":
+            cached = (
+                self._use_block_lrid_attnres_fused_training_path(None, False)
+                if self.use_lrid
+                else self._use_block_attnres_fused_training_path(None, False)
+            )
+            if cached:
+                decision = FastAttnResDecision(
+                    "legacy",
+                    "cached_block_phase_path",
+                    "cached Block phase1/phase2 remains on the legacy backend",
+                )
+            elif self._use_attnres_block_count_prior():
+                decision = FastAttnResDecision(
+                    "legacy",
+                    "source_count_prior",
+                    "Fast-AttnRes v1.0.0 has no source-logit-prior API",
+                )
+
+        active_reads = total_reads if decision.eligible else 0
+        package = {"version": None, "source_hashes": {}}
+        if validate_package and active_reads:
+            self._fast_attnres_op = load_fast_attnres()
+            package = fast_attnres_package_provenance()
+        reasons = (
+            {}
+            if active_reads
+            else ({decision.reason or "unspecified": total_reads} if total_reads else {})
+        )
+        return {
+            **decision.as_dict(),
+            "backend": self.config.attnres_backend,
+            "active_reads": active_reads,
+            "total_reads": total_reads,
+            "legacy_fallback_reads": total_reads - active_reads,
+            "fast_reads": active_reads,
+            "legacy_reads": total_reads - active_reads,
+            "fallback_reasons": reasons,
+            "value_width": self.config.n_embd,
+            "operator_width": operator_width,
+            "uses_exact_key_payload": self._fast_lrid_requires_key_payload(),
+            **package,
+        }
+
+    def fast_attnres_route_report(self):
+        report = self.fast_attnres_startup_report(validate_package=False)
+        report["will_execute"] = bool(report["active_reads"])
+        return report
+
+    get_fast_attnres_route_report = fast_attnres_route_report
+
+    def _ensure_fast_attnres_op(self):
+        if self._fast_attnres_op is None:
+            self._fast_attnres_op = load_fast_attnres()
+        return self._fast_attnres_op
+
+    @staticmethod
+    def _fast_attnres_eps(dtype: torch.dtype, *, lrid: bool = False) -> float:
+        return float(torch.finfo(torch.float32 if lrid else dtype).eps)
+
+    def _fast_attnres_config_decision(self):
+        config = self.config
+        return fast_attnres_config_decision(
+            use_attnres=self.use_attnres,
+            use_lrid=self.use_lrid,
+            attnres_type=self.attnres_type,
+            key_norm=config.attnres_key_norm,
+            lrid_rank=config.lrid_rank,
+            n_embd=config.n_embd,
+            lrid_num_heads=config.lrid_num_heads,
+            lrid_input_dependent_query=config.lrid_input_dependent_query,
+            lrid_key_from_output_tail=config.lrid_key_from_output_tail,
+            lrid_key_from_value=config.lrid_key_from_value,
+            lrid_key_from_value_shared=config.lrid_key_from_value_shared,
+            lrid_query_from_value=config.lrid_query_from_value,
+            lrid_query_from_value_shared=config.lrid_query_from_value_shared,
+            lrid_static_embedding_key=config.lrid_static_embedding_key,
+            lrid_add_static_embedding_key=config.lrid_add_static_embedding_key,
+            lrid_add_static_source_key=config.lrid_add_static_source_key,
+            attnres_block_count_prior=config.attnres_block_count_prior,
+            attnres_block_beta=config.attnres_block_beta,
+            attnres_block_beta_learned=config.attnres_block_beta_learned,
+            n_layer=config.n_layer,
+        )
+
+    def _fast_lrid_requires_key_payload(self):
+        if not self.use_lrid:
+            return False
+        if self.config.norm_pos != "before":
+            return True
+        if self.attnres_type != "block":
+            return False
+        return (
+            self.config.attnres_block_value_norm
+            or self.config.attnres_block_learned_scale
+            or self.config.attnres_block_alpha_learned
+            or any(value != 0.0 for value in self._attnres_block_power_value_list("alpha"))
+        )
 
     def _make_attnres_block_ends(self):
         if not self.use_attnres or self.attnres_type != "block":
@@ -1316,6 +1464,22 @@ class OBPM(nn.Module):
         if len(sources) == 1:
             return norm(sources[0]) if normalize_output else sources[0]
         residual = self.transformer.attn_residuals[self._attnres_query_idx(residual_idx)]
+        if (
+            self._fast_attnres_enabled
+            and residual.use_key_norm
+            and source_counts is None
+            and source_logit_biases is None
+            and sources[0].device.type in {"cpu", "cuda"}
+            and sources[0].dtype in FAST_ATTNRES_DTYPES
+        ):
+            query = residual._query(sources[0].dtype)
+            output = self._ensure_fast_attnres_op()(
+                sources,
+                query,
+                eps=self._fast_attnres_eps(sources[0].dtype),
+                scale=1.0,
+            )
+            return norm(output) if normalize_output else output
         if self.config.use_fused_attnres:
             query = residual._query(sources[0].dtype)
             return attention_residual_read(
@@ -2428,6 +2592,29 @@ class OBPM(nn.Module):
 
         if self.config.attn_res_query_norm:
             query = norm(query.float())
+
+        if (
+            self._fast_attnres_enabled
+            and source_counts is None
+            and source_logit_biases is None
+            and value_sources[0].device.type in {"cpu", "cuda"}
+            and value_sources[0].dtype in FAST_ATTNRES_DTYPES
+        ):
+            fast_query = query.reshape(-1).to(value_sources[0].dtype)
+            fast_values = value_sources
+            if self._fast_lrid_requires_key_payload():
+                fast_values = [
+                    torch.cat((value, key.reshape(*value.shape[:-1], -1)), dim=-1)
+                    for value, key in zip(value_sources, key_sources)
+                ]
+            output = self._ensure_fast_attnres_op()(
+                fast_values,
+                fast_query,
+                eps=self._fast_attnres_eps(value_sources[0].dtype, lrid=True),
+                scale=self.config.lrid_logit_scale,
+            )
+            output = output[..., :self.config.n_embd]
+            return norm(output) if normalize_output else output
 
         if self.config.use_fused_attnres:
             return lrid_attention_residual_read(

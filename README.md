@@ -19,6 +19,29 @@ pip install hf_transfer
 pip install wandb  # Optional, for experiment tracking
 ```
 
+Fast-AttnRes is an optional, strict dependency for compatible residual reads:
+
+```bash
+pip install -r requirements-fast-attnres-cu13.txt
+python train.py --use_attnres --attnres_type full --attnres_backend fast
+```
+
+`--attnres_backend legacy` remains the default. Fast-AttnRes v1.0.0 is used
+only when its public implicit-tail equation exactly matches the configured
+read: standard `R=D`, or single-head static output-tail LRID. Projected or
+dynamic keys, multi-head LRID, source priors, and cached Block phase paths keep
+the existing implementation. Rank zero prints `[Fast-AttnRes] ...` before
+training or evaluation only when Fast will actually execute.
+
+The reproducible H100 comparison (legacy, Fast, and pre-norm-only) is:
+
+```bash
+uvx --from modal==1.5.4 modal run modal_fast_attnres_benchmark.py
+```
+
+It fixes public main's existing SDPA fallback across all arms and uses
+`torch.compile(fullgraph=True, dynamic=False)` without max-autotune.
+
 For reproducible downstream evaluation, use the tested, pinned environment
 instead of the unpinned commands above:
 

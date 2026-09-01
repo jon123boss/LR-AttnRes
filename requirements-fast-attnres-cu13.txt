@@ -1,0 +1,5 @@
+# Qualified Fast-AttnRes environment (Python >=3.10, CUDA 13).
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.13.0
+triton==3.7.1
+fast-attnres==1.0.0

@@ -195,6 +195,7 @@ _EXACT_RESUME_TRAINING_KEYS = (
     "sched_mode",
     # Kernel/backend choices can change floating-point results and gradients.
     "flash_attention",
+    "attnres_backend",
     "torch_compile",
     "torch_compile_max_autotune",
     "torch_compile_cudagraphs",
@@ -370,6 +371,7 @@ def get_model(config, device):
             init_cutoff_factor=config["init_cutoff_factor"],
             use_attnres = config["use_attnres"],
             use_fused_attnres = config.get("use_fused_attnres", False),
+            attnres_backend = config.get("attnres_backend", "legacy"),
             attnres_type = config["attnres_type"],
             attnres_num_blocks = config["attnres_num_blocks"],
             attnres_block_average = config.get("attnres_block_average", True),

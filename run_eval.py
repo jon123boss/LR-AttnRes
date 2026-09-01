@@ -71,6 +71,7 @@ else:
     _LM_EVAL_IMPORT_ERROR = None
 
 from criterion import get_criterion
+from fast_attnres import print_fast_attnres_banner
 from dataloader import warmup_boundaries
 from utils import (
     capture_attnres_kernel_environment,
@@ -402,11 +403,18 @@ class OBPMWrapper(LM):
             load_training_state=False,
         )
         self.checkpoint_config = checkpoint.get("config", {})
+        self.attnres_backend = config.attnres_backend
         self.checkpoint_step = checkpoint.get("step")
         self.checkpoint_tokens_processed = checkpoint.get("tokens_processed")
 
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
+        self.fast_attnres_report = self.model.fast_attnres_startup_report(validate_package=True)
+        self.model._fast_attnres_enabled = bool(self.fast_attnres_report["active_reads"])
+        print_fast_attnres_banner(
+            self.fast_attnres_report,
+            is_rank_zero=self.verbose,
+        )
         if self.torch_compile:
             self.torch_compile_cache_dir = configure_torch_compile_cache(self.torch_compile_cache_dir)
             if self.verbose:
@@ -687,6 +695,7 @@ def _evaluation_source_sha256():
     source_root = os.path.dirname(os.path.abspath(__file__))
     source_files = (
         "attnres_ops.py",
+        "fast_attnres.py",
         "criterion.py",
         "dataloader.py",
         "model.py",
@@ -742,10 +751,13 @@ def _attach_provenance(
             "lm_eval": _package_version("lm_eval"),
             "datasets": _package_version("datasets"),
             "tiktoken": _package_version("tiktoken"),
+            "fast-attnres": _package_version("fast-attnres"),
         },
         "device": str(lm_obj._device),
         "cuda_available": torch.cuda.is_available(),
         "attnres_kernel_environment": capture_attnres_kernel_environment(),
+        "attnres_backend": lm_obj.attnres_backend,
+        "fast_attnres": lm_obj.fast_attnres_report,
     }
 
 
