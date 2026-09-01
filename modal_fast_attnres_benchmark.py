@@ -106,6 +106,52 @@ def benchmark_remote(
     )
 
 
+@app.function(image=image, timeout=30 * 60)
+def aggregate_remote(
+    parts: list[dict],
+    profiles: tuple[str, ...],
+    seeds: tuple[int, ...],
+    warmups: int,
+    rounds: int,
+    bootstrap_replicates: int,
+):
+    os.chdir("/root/LR-AttnRes")
+    from benchmark_fast_attnres import _report
+
+    failed = [part for part in parts if not part["ok"]]
+    if failed:
+        return {
+            "ok": False,
+            "failure": {
+                "type": "ProfileSeedBenchmarkFailure",
+                "message": "one or more profile/seed workers failed",
+                "workers": [part.get("failure") for part in failed],
+            },
+        }
+    samples = [row for part in parts for row in part["samples"]]
+    manifest = dict(parts[0]["manifest"])
+    manifest.update(
+        {
+            "profiles": list(profiles),
+            "seeds": list(seeds),
+            "warmups": warmups,
+            "rounds": rounds,
+            "bootstrap_replicates": bootstrap_replicates,
+            "expected_timed_samples": len(profiles) * len(seeds) * rounds * 3,
+        }
+    )
+    return {
+        "ok": True,
+        "manifest": manifest,
+        "provenance": {
+            "parallel_profile_seed_workers": True,
+            "workers": [part["provenance"] for part in parts],
+        },
+        "report": _report(samples, profiles, bootstrap_replicates, 20260901),
+        "samples": samples,
+    }
+
+
 @app.local_entrypoint()
 def main(
     profile: str = "all",
@@ -121,54 +167,24 @@ def main(
     calls = [
         benchmark_remote.spawn(
             (selected_profile,),
-            selected_seeds,
+            (selected_seed,),
             warmups,
             rounds,
             bootstrap_replicates,
             smoke,
         )
         for selected_profile in selected_profiles
+        for selected_seed in selected_seeds
     ]
     parts = [call.get() for call in calls]
-    failed = [part for part in parts if not part["ok"]]
-    if failed:
-        result = {
-            "ok": False,
-            "failure": {
-                "type": "ProfileBenchmarkFailure",
-                "message": "one or more profile workers failed",
-                "profiles": [part.get("failure") for part in failed],
-            },
-        }
-    else:
-        samples = [row for part in parts for row in part["samples"]]
-        manifest = dict(parts[0]["manifest"])
-        manifest["profiles"] = list(selected_profiles)
-        manifest["expected_timed_samples"] = (
-            len(selected_profiles) * len(selected_seeds) * rounds * 3
-        )
-        result = {
-            "ok": True,
-            "manifest": manifest,
-            "provenance": {
-                "parallel_profile_workers": True,
-                "profiles": {
-                    selected_profile: part["provenance"]
-                    for selected_profile, part in zip(selected_profiles, parts)
-                },
-            },
-            "report": {
-                "bootstrap": {
-                    **parts[0]["report"]["bootstrap"],
-                    "simultaneous_scope": "three contrasts within each profile",
-                },
-                "profiles": {
-                    selected_profile: part["report"]["profiles"][selected_profile]
-                    for selected_profile, part in zip(selected_profiles, parts)
-                },
-            },
-            "samples": samples,
-        }
+    result = aggregate_remote.remote(
+        parts,
+        selected_profiles,
+        selected_seeds,
+        warmups,
+        rounds,
+        bootstrap_replicates,
+    )
     run_dir = _write_artifacts(result, REPO_ROOT / artifact_root)
     summary = {
         "ok": result["ok"],
