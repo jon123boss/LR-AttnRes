@@ -8,6 +8,10 @@ from fast_attnres import format_fast_attnres_banner, print_fast_attnres_banner
 from model import ModelConfig, OBPM
 import utils
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Fast-AttnRes v2 requires CUDA"
+)
+
 
 def _config(backend="fast"):
     return ModelConfig(
@@ -57,12 +61,13 @@ def test_old_checkpoint_without_backend_loads_legacy(tmp_path):
 def test_fast_checkpoint_resume_restores_optimizer_and_next_update(tmp_path):
     torch.manual_seed(802)
     config = _config("fast")
-    reference = OBPM(config).train()
+    reference = OBPM(config).to("cuda").to_mixed_precision(torch.bfloat16).train()
+    reference.require_fast_attnres(validate_package=True)
     optimizer = torch.optim.AdamW(reference.parameters(), lr=1e-3)
-    first_tokens = torch.tensor([[0, 1, 2, 3]])
-    first_labels = torch.tensor([[1, 2, 3, 4]])
-    second_tokens = torch.tensor([[4, 3, 2, 1]])
-    second_labels = torch.tensor([[3, 2, 1, 0]])
+    first_tokens = torch.tensor([[0, 1, 2, 3]], device="cuda")
+    first_labels = torch.tensor([[1, 2, 3, 4]], device="cuda")
+    second_tokens = torch.tensor([[4, 3, 2, 1]], device="cuda")
+    second_labels = torch.tensor([[3, 2, 1, 0]], device="cuda")
     _step(reference, optimizer, first_tokens, first_labels)
 
     path = tmp_path / "fast.pt"
@@ -77,9 +82,11 @@ def test_fast_checkpoint_resume_restores_optimizer_and_next_update(tmp_path):
         path,
     )
     checkpoint, resumed, resumed_config = utils.load_model_checkpoint(
-        path, torch.device("cpu"), verbose=False
+        path, torch.device("cuda"), verbose=False
     )
     assert resumed_config.attnres_backend == "fast"
+    resumed.to_mixed_precision(torch.bfloat16)
+    resumed.require_fast_attnres(validate_package=True)
     resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-3)
     resumed_optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -123,14 +130,15 @@ def test_pre_fast_runtime_provenance_resumes_only_on_legacy():
 
 
 def test_banner_only_formats_for_active_fast_route():
-    active = OBPM(_config("fast")).fast_attnres_startup_report(validate_package=True)
+    model = OBPM(_config("fast")).to("cuda").to_mixed_precision(torch.bfloat16)
+    active = model.require_fast_attnres(validate_package=True)
     assert active["requested_backend"] == "fast"
     assert active["resolved_backend"] == "fast-attnres"
     assert active["distribution_source_sha256"]
     assert "attnres/_kernels/fixed_tail.py" in active["source_hashes"]
     line = format_fast_attnres_banner(active)
     assert line == (
-        "[Fast-AttnRes] backend=fast-attnres version=1.0.0 "
+        "[Fast-AttnRes] backend=fast-attnres version=2.0.1 "
         "active_reads=2/2 legacy_fallback_reads=0"
     )
     inactive = OBPM(_config("legacy")).fast_attnres_startup_report(validate_package=False)
@@ -150,11 +158,11 @@ def test_banner_only_formats_for_active_fast_route():
 @pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile is unavailable")
 def test_fast_fullgraph_changed_input_execution():
     torch.manual_seed(803)
-    model = OBPM(_config("fast")).eval()
-    model.fast_attnres_startup_report(validate_package=True)
+    model = OBPM(_config("fast")).to("cuda").to_mixed_precision(torch.bfloat16).eval()
+    model.require_fast_attnres(validate_package=True)
     compiled = torch.compile(model, backend="eager", fullgraph=True, dynamic=False)
-    first = torch.tensor([[0, 1, 2, 3]])
-    second = torch.tensor([[3, 2, 1, 0]])
+    first = torch.tensor([[0, 1, 2, 3]], device="cuda")
+    second = torch.tensor([[3, 2, 1, 0]], device="cuda")
     with torch.no_grad():
         torch.testing.assert_close(compiled(first), model(first))
         torch.testing.assert_close(compiled(second), model(second))

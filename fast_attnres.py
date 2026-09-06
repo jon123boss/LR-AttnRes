@@ -1,12 +1,12 @@
-"""Optional adapter for the public Fast-AttnRes v1.0.0 API.
+"""Strict adapter for the public Fast-AttnRes v2.0.1 API.
 
 The repository's model supports more AttnRes variants than the small public
 ``fast-attnres`` package.  This module deliberately keeps the supported
-surface narrow: callers pass the full-width source values and a *prepared*
-one-dimensional query to ``attnres.attnres``.  Unsupported model semantics or
-the package's documented shape/dtype envelope return a structured legacy
-fallback decision.  A missing/wrong package and an error raised by an actual
-runtime kernel are hard failures.
+surface narrow: callers pass full-width source values and a *prepared*
+one-dimensional query to ``attnres.attnres``. Unsupported semantics or inputs
+produce a structured decision so startup can explain exactly why a required
+Fast route refuses to run. Missing/wrong packages and runtime kernel errors
+are hard failures.
 
 Only the public import ``from attnres import attnres`` is used.  In
 particular, this adapter does not reach into the package's reference or kernel
@@ -27,11 +27,18 @@ import torch
 from torch import Tensor
 
 
-FAST_ATTNRES_VERSION = "1.0.0"
+FAST_ATTNRES_VERSION = "2.0.1"
 FAST_ATTNRES_DISTRIBUTION = "fast-attnres"
+FAST_ATTNRES_RELEASE_COMMIT = "658dc1bd5e1d3ad6db0da1d415b9871aaf2374f6"
+FAST_ATTNRES_WHEEL_SHA256 = "d413bf7f089465f403c98f3177e00e32faacb771150cb8981e4c90bb6460f9d1"
+FAST_ATTNRES_SOURCE_SHA256 = "100ab9fb951965ce5bed57428dd16f777fcf2988d39d1f431d73f3cd08c66882"
+FAST_ATTNRES_WHEEL_URL = (
+    "https://github.com/jon123boss/fast-attnres/releases/download/v2.0.1/"
+    "fast_attnres-2.0.1-py3-none-any.whl"
+)
 FAST_ATTNRES_MAX_SOURCES = 129
 FAST_ATTNRES_MAX_WIDTH = 8192
-FAST_ATTNRES_DTYPES = (torch.bfloat16, torch.float32)
+FAST_ATTNRES_DTYPES = (torch.bfloat16,)
 
 
 class FastAttnResPackageError(RuntimeError):
@@ -109,7 +116,7 @@ def assess_fast_attnres_inputs(
     incompatible model can cleanly use its legacy implementation even on a
     machine without the optional dependency.  ``source_counts`` and
     ``source_logit_biases`` are accepted only to make the incompatibility
-    explicit: v1.0.0 has no bias/prior arguments.
+    explicit: v2.0.1 has no bias/prior arguments.
     """
 
     if not key_norm:
@@ -120,7 +127,7 @@ def assess_fast_attnres_inputs(
     if source_counts is not None or source_logit_biases is not None:
         return _legacy(
             "source_counts_or_logit_biases",
-            "Fast-AttnRes v1.0.0 has no source-count or source-logit-bias API",
+            "Fast-AttnRes v2.0.1 has no source-count or source-logit-bias API",
         )
 
     if not isinstance(query, Tensor):
@@ -158,19 +165,19 @@ def assess_fast_attnres_inputs(
     if first.dtype not in FAST_ATTNRES_DTYPES:
         return _legacy(
             "unsupported_dtype",
-            "Fast-AttnRes values must use BF16 or FP32 storage",
+            "Fast-AttnRes v2 values must use BF16 storage",
         )
     if device_type is None:
         device_type = first.device.type
-    if device_type not in {"cpu", "cuda"}:
+    if device_type != "cuda":
         return _legacy(
             "unsupported_device",
-            "Fast-AttnRes v1.0.0 supports CPU reference and CUDA kernels",
+            "Fast-AttnRes v2 executes only on CUDA",
         )
     if query.dtype not in FAST_ATTNRES_DTYPES:
         return _legacy(
             "unsupported_query_dtype",
-            "Fast-AttnRes query must use BF16 or FP32 storage",
+            "Fast-AttnRes v2 query must use BF16 storage",
         )
     if query.device != first.device:
         return _legacy("query_device_mismatch", "query and values must share a device")
@@ -198,52 +205,52 @@ def _validate_public_api(function: Any) -> None:
 
     if not callable(function):
         raise FastAttnResPackageError(
-            "fast-attnres v1.0.0 is required, but attnres.attnres is not callable"
+            "fast-attnres v2.0.1 is required, but attnres.attnres is not callable"
         )
     try:
         signature = inspect.signature(function)
     except (TypeError, ValueError) as exc:
         raise FastAttnResPackageError(
-            "fast-attnres v1.0.0 is required, but its public attnres signature is unavailable"
+            "fast-attnres v2.0.1 is required, but its public attnres signature is unavailable"
         ) from exc
     parameters = signature.parameters
     required = {"values", "query", "eps", "scale"}
     if not required.issubset(parameters):
         raise FastAttnResPackageError(
-            "fast-attnres v1.0.0 is required; expected public "
+            "fast-attnres v2.0.1 is required; expected public "
             "attnres(values, query, *, eps=..., scale=...)"
         )
     # ``eps`` and ``scale`` must be accepted by keyword.  A positional-only
-    # function with these names is not the v1.0.0 public API.
+    # function with these names is not the v2.0.1 public API.
     for name in ("eps", "scale"):
         if parameters[name].kind is inspect.Parameter.POSITIONAL_ONLY:
             raise FastAttnResPackageError(
-                "fast-attnres v1.0.0 is required; eps and scale must be keyword arguments"
+                "fast-attnres v2.0.1 is required; eps and scale must be keyword arguments"
             )
 
 
 @lru_cache(maxsize=1)
 def load_fast_attnres() -> Any:
-    """Load and validate exactly Fast-AttnRes v1.0.0's public function."""
+    """Load and validate exactly Fast-AttnRes v2.0.1's public function."""
 
     try:
         from attnres import attnres
     except Exception as exc:
         raise FastAttnResPackageError(
-            "attnres_backend='fast' requires fast-attnres==1.0.0; "
-            "install it with `python -m pip install fast-attnres==1.0.0`"
+            "attnres_backend='fast' requires the pinned Fast-AttnRes 2.0.1 wheel: "
+            f"{FAST_ATTNRES_WHEEL_URL}#sha256={FAST_ATTNRES_WHEEL_SHA256}"
         ) from exc
 
     try:
         installed_version = importlib.metadata.version(FAST_ATTNRES_DISTRIBUTION)
     except importlib.metadata.PackageNotFoundError as exc:
         raise FastAttnResPackageError(
-            "attnres_backend='fast' requires the fast-attnres==1.0.0 distribution; "
+            "attnres_backend='fast' requires the fast-attnres==2.0.1 distribution; "
             "the imported attnres module has no matching distribution metadata"
         ) from exc
     if installed_version != FAST_ATTNRES_VERSION:
         raise FastAttnResPackageError(
-            "attnres_backend='fast' requires fast-attnres==1.0.0, "
+            "attnres_backend='fast' requires fast-attnres==2.0.1, "
             f"but found {installed_version!r}"
         )
     _validate_public_api(attnres)
@@ -281,6 +288,8 @@ def fast_attnres_package_provenance() -> dict[str, Any]:
         )
     return {
         "version": distribution.version,
+        "release_commit": FAST_ATTNRES_RELEASE_COMMIT,
+        "wheel_sha256": FAST_ATTNRES_WHEEL_SHA256,
         "distribution_source_sha256": combined.hexdigest(),
         "source_hashes": hashes,
     }
@@ -377,9 +386,9 @@ def fast_attnres_config_decision(
 
     The public operator has implicit tail keys and one static query.  All
     explicit/projected keys, dynamic queries, multi-head LRID, and source
-    priors therefore remain on the legacy path.  Block value summaries are
+    priors therefore remain unsupported. Block value summaries are
     allowed because the caller has already materialized the exact summary;
-    nonzero count/logit priors are not representable by v1.0.0.
+    nonzero count/logit priors are not representable by v2.0.1.
     """
 
     if not use_attnres:
@@ -401,12 +410,12 @@ def fast_attnres_config_decision(
         if not lrid_key_from_output_tail:
             return _legacy(
                 "projected_or_non_tail_lrid_key",
-                "Fast-AttnRes v1.0.0 only has implicit output-tail keys",
+                "Fast-AttnRes v2.0.1 only has implicit output-tail keys",
             )
-        if int(lrid_rank) >= int(n_embd):
+        if not 1 <= int(lrid_rank) <= int(n_embd):
             return _legacy(
-                "lrid_rank_not_less_than_width",
-                "the supported LR adapter requires R < D",
+                "unsupported_lrid_rank",
+                "the Fast adapter requires 1 <= R <= D",
             )
         if int(lrid_num_heads) != 1:
             return _legacy("multi_head_lrid", "the Fast LR adapter supports one routing head")
@@ -432,6 +441,10 @@ def fast_attnres_config_decision(
 __all__ = [
     "FAST_ATTNRES_VERSION",
     "FAST_ATTNRES_DISTRIBUTION",
+    "FAST_ATTNRES_RELEASE_COMMIT",
+    "FAST_ATTNRES_WHEEL_SHA256",
+    "FAST_ATTNRES_SOURCE_SHA256",
+    "FAST_ATTNRES_WHEEL_URL",
     "FAST_ATTNRES_MAX_SOURCES",
     "FAST_ATTNRES_MAX_WIDTH",
     "FastAttnResDecision",

@@ -187,7 +187,7 @@ mlp_hidden_dim = 2816
 mlp_ratio = None
 weight_tying = False
 flash_attention = True
-attnres_backend = "legacy"
+attnres_backend = "auto"
 init_std = 0.02
 init_cutoff_factor = None
 # Attention Residuals
@@ -508,9 +508,12 @@ def parse_args():
     parser.add_argument("--no-use_fused_attnres", dest="use_fused_attnres", action="store_false")
     parser.add_argument(
         "--attnres_backend",
-        choices=("legacy", "fast"),
+        choices=("auto", "legacy", "fast"),
         default=None,
-        help="Attention-Residual implementation; omitted resumes use the checkpoint value.",
+        help=(
+            "auto (default) requires Fast for standard R=D and sliced output-tail R<=D; "
+            "projected LRID resolves to legacy. Omitted resumes use the checkpoint value."
+        ),
     )
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
     parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
@@ -612,7 +615,7 @@ full_run_eval_torch_max_autotune = args.full_run_eval_torch_max_autotune
 use_doc_masking = args.use_doc_masking
 use_attnres = args.use_attnres
 use_fused_attnres = args.use_fused_attnres
-attnres_backend = args.attnres_backend or "legacy"
+attnres_backend = args.attnres_backend or "auto"
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
 attnres_block_average = args.attnres_block_average
@@ -704,20 +707,26 @@ interactive_after_train = interactive_after_train and master_process
 
 config = get_config(sys.modules[__name__].__dict__)
 start_step, checkpoint, model, model_config = get_model(config, device)
+attnres_backend = model_config.attnres_backend
+config["attnres_backend"] = model_config.attnres_backend
 if checkpoint is not None:
     checkpoint_backend = model_config.attnres_backend
-    if args.attnres_backend is not None and args.attnres_backend != checkpoint_backend:
+    if (
+        args.attnres_backend is not None
+        and args.attnres_backend != "auto"
+        and args.attnres_backend != checkpoint_backend
+    ):
         raise ValueError(
             "Checkpoint model uses "
             f"attnres_backend={checkpoint_backend!r}, but the current request is "
             f"{args.attnres_backend!r}."
         )
-    attnres_backend = checkpoint_backend
-    config["attnres_backend"] = checkpoint_backend
 if device.type == "cuda":
     model.to_mixed_precision(dtype=torch.bfloat16)
-fast_attnres_report = model.fast_attnres_startup_report(validate_package=True)
-model._fast_attnres_enabled = bool(fast_attnres_report["active_reads"])
+if model_config.attnres_backend == "fast":
+    fast_attnres_report = model.require_fast_attnres(validate_package=True)
+else:
+    fast_attnres_report = model.fast_attnres_startup_report(validate_package=False)
 print_fast_attnres_banner(fast_attnres_report, is_rank_zero=master_process)
 if distributed:
     for param in model.parameters():

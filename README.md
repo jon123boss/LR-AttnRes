@@ -19,19 +19,46 @@ pip install hf_transfer
 pip install wandb  # Optional, for experiment tracking
 ```
 
-Fast-AttnRes is an optional, strict dependency for compatible residual reads:
+Provision the end-to-end qualified H100 stack with a complete managed Python
+3.12 runtime (including `Python.h`):
 
 ```bash
-pip install -r requirements-fast-attnres-cu13.txt
-python train.py --use_attnres --attnres_type full --attnres_backend fast
+python scripts/bootstrap_fast_attnres.py
+source .venv/bin/activate
 ```
 
-`--attnres_backend legacy` remains the default. Fast-AttnRes v1.0.0 is used
-only when its public implicit-tail equation exactly matches the configured
-read: standard `R=D`, or single-head static output-tail LRID. Projected or
-dynamic keys, multi-head LRID, source priors, and cached Block phase paths keep
-the existing implementation. Rank zero prints `[Fast-AttnRes] ...` before
-training or evaluation only when Fast will actually execute.
+The pinned combination is Python 3.12, PyTorch 2.10.0+cu130, Triton 3.6.0,
+FlashAttention 2.8.3's official CUDA-13/Torch-2.10 wheel, and the SHA-256-pinned
+Fast-AttnRes 2.0.1 wheel. Using the wheels avoids local FlashAttention builds;
+managed Python supplies the header Triton's runtime launcher needs.
+
+`train.py` defaults to `--attnres_backend auto`. Standard AttnRes (`R=D`) and
+single-head static sliced/output-tail LR-AttnRes (`1<=R<=D`) resolve to Fast.
+Startup then requires the exact package/provenance and proves every
+multi-source read is Fast before arming the model; every read checks that
+contract again. A package, CUDA/BF16, shape, or semantic mismatch is a hard
+error, never a silent legacy fallback. The first embedding-only read is an
+identity and does not invoke any routing operator.
+
+Fast-AttnRes v2.0.1 has no source-prior API, and the qualified compiled sliced
+path uses neutral scale 1.0. Therefore Block runs must disable count priors and
+sliced runs must disable LR logit scaling:
+
+```bash
+# Standard Full, R=D: automatically Fast.
+python train.py --use_attnres --attnres_type full
+
+# Sliced Block, R=64<D: automatically Fast or fails before training.
+python train.py --use_lrid --lrid_key_from_output_tail \
+  --lrid_rank 64 --attnres_type block \
+  --no-attnres_block_count_prior --no-lrid_logit_scale
+```
+
+Projected keys, dynamic queries, multi-head LRID, and arbitrary source priors
+are different equations and resolve to legacy under `auto`. Explicit
+`--attnres_backend fast` makes them fail with the exact incompatibility;
+explicit `legacy` remains available only for controlled reference comparisons.
+Rank zero prints `[Fast-AttnRes] ...` only after the strict route is armed.
 
 The reproducible H100 comparison (legacy, Fast, and pre-norm-only) is:
 

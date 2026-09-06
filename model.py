@@ -10,6 +10,10 @@ from fast_attnres import (
     FAST_ATTNRES_DTYPES,
     FAST_ATTNRES_MAX_SOURCES,
     FAST_ATTNRES_MAX_WIDTH,
+    FAST_ATTNRES_RELEASE_COMMIT,
+    FAST_ATTNRES_SOURCE_SHA256,
+    FAST_ATTNRES_VERSION,
+    FAST_ATTNRES_WHEEL_SHA256,
     FastAttnResDecision,
     fast_attnres_config_decision,
     fast_attnres_package_provenance,
@@ -112,13 +116,16 @@ class ModelConfig:
     lrid_query_from_value_shared: bool = False
     lrid_use_logit_scale: bool = True
     lrid_logit_scale: float = None
-    # Appended so old positional configs and checkpoints retain legacy behavior.
+    # ``auto`` selects Fast for standard (R=D) and sliced output-tail LRID
+    # (R<=D), while leaving projected/experimental LRID on the legacy path.
+    # Keep the dataclass default legacy for old direct-library callers and
+    # checkpoints; train.py opts into auto by default.
     attnres_backend: str = "legacy"
 
     def __post_init__(self):
-        self.attnres_backend = str(self.attnres_backend or "legacy").lower()
-        if self.attnres_backend not in {"legacy", "fast"}:
-            raise ValueError("attnres_backend must be one of: legacy, fast")
+        requested_attnres_backend = str(self.attnres_backend or "legacy").lower()
+        if requested_attnres_backend not in {"auto", "legacy", "fast"}:
+            raise ValueError("attnres_backend must be one of: auto, legacy, fast")
         self.attnres_type = (self.attnres_type or "block")
         self.attnres_type = self.attnres_type.lower()
         self.attnres_block_average_mode = (self.attnres_block_average_mode or "count").lower()
@@ -218,6 +225,15 @@ class ModelConfig:
             raise ValueError("lrid_logit_scale must be positive")
         if self.use_lrid:
             self.use_attnres = True
+        self._attnres_backend_requested = requested_attnres_backend
+        if requested_attnres_backend == "auto":
+            self.attnres_backend = (
+                "fast"
+                if self.use_attnres and (not self.use_lrid or self.lrid_key_from_output_tail)
+                else "legacy"
+            )
+        else:
+            self.attnres_backend = requested_attnres_backend
 
     @staticmethod
     def _normalize_block_scale_init(value):
@@ -828,9 +844,10 @@ class OBPM(nn.Module):
                 if isinstance(module, LRIDFusedProjection):
                     self._init_lrid_dynamic_query_projection(module, config.init_std, config.init_cutoff_factor)
         self._fast_attnres_op = None
-        self._fast_attnres_enabled = bool(
-            self.fast_attnres_startup_report(validate_package=False)["active_reads"]
-        )
+        # Fast-AttnRes v2 is CUDA/BF16-only. Construction happens on CPU, so
+        # the production route is armed only after the caller moves the full
+        # model to its final CUDA/BF16 runtime and calls require_fast_attnres().
+        self._fast_attnres_enabled = False
     def to_mixed_precision(self, dtype=torch.bfloat16):
         # These learned block exponents intentionally remain fp32. Preserve
         # their exact values instead of casting fp32 -> bf16 -> fp32 along with
@@ -864,39 +881,31 @@ class OBPM(nn.Module):
         max_sources = (
             2 * self.config.n_layer + 1
             if self.attnres_type == "full"
-            else min(2 * self.config.n_layer, self.config.attnres_num_blocks) + 1
+            else (
+                min(2 * self.config.n_layer, self.config.attnres_num_blocks)
+                + (2 if self.config.attnres_block_split_sublayers else 1)
+            )
         )
 
         if decision.eligible and (
             parameter is None
             or parameter.dtype not in FAST_ATTNRES_DTYPES
-            or parameter.device.type not in {"cpu", "cuda"}
+            or parameter.device.type != "cuda"
             or operator_width > FAST_ATTNRES_MAX_WIDTH
             or max_sources > FAST_ATTNRES_MAX_SOURCES
         ):
             decision = FastAttnResDecision(
                 "legacy",
                 "unsupported_runtime_envelope",
-                "model dtype, device, width, or source count is outside Fast-AttnRes v1.0.0",
+                "model must be CUDA BF16 and inside the Fast-AttnRes v2.0.1 shape envelope",
             )
 
         if decision.eligible and self.attnres_type == "block":
-            cached = (
-                self._use_block_lrid_attnres_fused_training_path(None, False)
-                if self.use_lrid
-                else self._use_block_attnres_fused_training_path(None, False)
-            )
-            if cached:
-                decision = FastAttnResDecision(
-                    "legacy",
-                    "cached_block_phase_path",
-                    "cached Block phase1/phase2 remains on the legacy backend",
-                )
-            elif self._use_attnres_block_count_prior():
+            if self._use_attnres_block_count_prior():
                 decision = FastAttnResDecision(
                     "legacy",
                     "source_count_prior",
-                    "Fast-AttnRes v1.0.0 has no source-logit-prior API",
+                    "Fast-AttnRes v2.0.1 has no source-logit-prior API",
                 )
 
         active_reads = total_reads if decision.eligible else 0
@@ -912,7 +921,9 @@ class OBPM(nn.Module):
         return {
             **decision.as_dict(),
             "backend": self.config.attnres_backend,
-            "requested_backend": self.config.attnres_backend,
+            "requested_backend": getattr(
+                self.config, "_attnres_backend_requested", self.config.attnres_backend
+            ),
             "resolved_backend": "fast-attnres" if active_reads else "legacy",
             "active_reads": active_reads,
             "total_reads": total_reads,
@@ -925,6 +936,64 @@ class OBPM(nn.Module):
             "uses_exact_key_payload": self._fast_lrid_requires_key_payload(),
             **package,
         }
+
+    def require_fast_attnres(self, validate_package: bool = True):
+        """Arm Fast only if every multi-source routed read is guaranteed Fast."""
+        report = self.fast_attnres_startup_report(validate_package=validate_package)
+        total_reads = int(report["total_reads"])
+        failures = []
+        if self.config.attnres_backend != "fast":
+            failures.append("backend did not resolve to fast")
+        if total_reads <= 0:
+            failures.append("model has no routed reads")
+        if int(report["active_reads"]) != total_reads:
+            failures.append("not every routed read is active")
+        if int(report["fast_reads"]) != total_reads:
+            failures.append("not every routed read resolves to Fast-AttnRes")
+        if int(report["legacy_reads"]) or int(report["legacy_fallback_reads"]):
+            failures.append("a legacy fallback remains")
+        if report["resolved_backend"] != "fast-attnres":
+            failures.append("resolved backend is not Fast-AttnRes")
+        if validate_package:
+            if report.get("version") != FAST_ATTNRES_VERSION:
+                failures.append(f"Fast-AttnRes {FAST_ATTNRES_VERSION} provenance is missing")
+            if report.get("release_commit") != FAST_ATTNRES_RELEASE_COMMIT:
+                failures.append("Fast-AttnRes release commit does not match the qualified release")
+            if report.get("wheel_sha256") != FAST_ATTNRES_WHEEL_SHA256:
+                failures.append("Fast-AttnRes wheel hash does not match the qualified release")
+            if report.get("distribution_source_sha256") != FAST_ATTNRES_SOURCE_SHA256:
+                failures.append("installed Fast-AttnRes source hash is not the qualified release")
+            if not report.get("source_hashes"):
+                failures.append("installed Fast-AttnRes source provenance is incomplete")
+        if failures:
+            self._fast_attnres_enabled = False
+            reason = report.get("reason") or "unknown"
+            detail = report.get("detail") or ""
+            raise RuntimeError(
+                "Fast-AttnRes-only contract failed: "
+                + "; ".join(failures)
+                + f" (reason={reason}: {detail})"
+            )
+        self._fast_attnres_enabled = True
+        return report
+
+    def _assert_fast_runtime_read(
+        self,
+        sources,
+        *,
+        source_counts=None,
+        source_logit_biases=None,
+    ):
+        if not self._fast_attnres_enabled:
+            raise RuntimeError(
+                "Fast-AttnRes model is not armed; call require_fast_attnres() "
+                "after moving it to CUDA BF16"
+            )
+        if source_counts is not None or source_logit_biases is not None:
+            raise RuntimeError("Fast-AttnRes cannot use source priors or logit biases")
+        first = sources[0]
+        if first.device.type != "cuda" or first.dtype not in FAST_ATTNRES_DTYPES:
+            raise RuntimeError("Fast-AttnRes residual reads require CUDA BF16 sources")
 
     def fast_attnres_route_report(self):
         report = self.fast_attnres_startup_report(validate_package=False)
@@ -947,6 +1016,12 @@ class OBPM(nn.Module):
 
     def _fast_attnres_config_decision(self):
         config = self.config
+        if self.use_lrid and config.lrid_logit_scale != 1.0:
+            return FastAttnResDecision(
+                "legacy",
+                "non_neutral_lrid_logit_scale",
+                "the qualified compiled Fast path requires --no-lrid_logit_scale",
+            )
         return fast_attnres_config_decision(
             use_attnres=self.use_attnres,
             use_lrid=self.use_lrid,
@@ -1466,14 +1541,14 @@ class OBPM(nn.Module):
         if len(sources) == 1:
             return norm(sources[0]) if normalize_output else sources[0]
         residual = self.transformer.attn_residuals[self._attnres_query_idx(residual_idx)]
-        if (
-            self._fast_attnres_enabled
-            and residual.use_key_norm
-            and source_counts is None
-            and source_logit_biases is None
-            and sources[0].device.type in {"cpu", "cuda"}
-            and sources[0].dtype in FAST_ATTNRES_DTYPES
-        ):
+        if self.config.attnres_backend == "fast":
+            self._assert_fast_runtime_read(
+                sources,
+                source_counts=source_counts,
+                source_logit_biases=source_logit_biases,
+            )
+            if not residual.use_key_norm:
+                raise RuntimeError("Fast-AttnRes residual reads require key normalization")
             query = residual._query(sources[0].dtype)
             output = self._ensure_fast_attnres_op()(
                 sources,
@@ -2480,6 +2555,7 @@ class OBPM(nn.Module):
     def _use_block_attnres_fused_training_path(self, past_kv, use_cache):
         return (
             self.use_attnres
+            and self.config.attnres_backend != "fast"
             and self.config.use_fused_attnres
             and self.config.attnres_training_cache_phase1
             and not self.use_lrid
@@ -2491,6 +2567,7 @@ class OBPM(nn.Module):
     def _use_block_lrid_attnres_fused_training_path(self, past_kv, use_cache):
         return (
             self.use_attnres
+            and self.config.attnres_backend != "fast"
             and self.config.use_fused_attnres
             and self.config.attnres_training_cache_phase1
             and self.use_lrid
@@ -2595,13 +2672,19 @@ class OBPM(nn.Module):
         if self.config.attn_res_query_norm:
             query = norm(query.float())
 
-        if (
-            self._fast_attnres_enabled
-            and source_counts is None
-            and source_logit_biases is None
-            and value_sources[0].device.type in {"cpu", "cuda"}
-            and value_sources[0].dtype in FAST_ATTNRES_DTYPES
-        ):
+        if self.config.attnres_backend == "fast":
+            self._assert_fast_runtime_read(
+                value_sources,
+                source_counts=source_counts,
+                source_logit_biases=source_logit_biases,
+            )
+            if not self.config.attnres_key_norm:
+                raise RuntimeError("Fast-AttnRes residual reads require key normalization")
+            if self.config.lrid_logit_scale != 1.0:
+                raise RuntimeError(
+                    "Fast-AttnRes LR reads require --no-lrid_logit_scale "
+                    "(the qualified full-graph path uses neutral scale 1.0)"
+                )
             fast_query = query.reshape(-1).to(value_sources[0].dtype)
             fast_values = value_sources
             if self._fast_lrid_requires_key_payload():
@@ -2613,7 +2696,10 @@ class OBPM(nn.Module):
                 fast_values,
                 fast_query,
                 eps=self._fast_attnres_eps(value_sources[0].dtype, lrid=True),
-                scale=self.config.lrid_logit_scale,
+                # Keep this literal. Passing ModelConfig's scalar into the
+                # v2.0.1 public validator becomes symbolic under full-graph
+                # torch.compile and fails at math.isfinite(scale).
+                scale=1.0,
             )
             output = output[..., :self.config.n_embd]
             return norm(output) if normalize_output else output

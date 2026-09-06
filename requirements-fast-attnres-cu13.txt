@@ -1,5 +1,18 @@
-# Qualified Fast-AttnRes environment (Python >=3.10, CUDA 13).
+# End-to-end qualified H100 environment. The FlashAttention wheel fixes Python
+# at 3.12; use scripts/bootstrap_fast_attnres.py to provision it reproducibly.
 --extra-index-url https://download.pytorch.org/whl/cu130
-torch==2.13.0
-triton==3.7.1
-fast-attnres==1.0.0
+torch==2.10.0+cu130
+triton==3.6.0
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl#sha256=910d8db9def162de5b7c15474b933e7e2371e93733b980e9d3c07cd3bf2f568e
+fast-attnres @ https://github.com/jon123boss/fast-attnres/releases/download/v2.0.1/fast_attnres-2.0.1-py3-none-any.whl#sha256=d413bf7f089465f403c98f3177e00e32faacb771150cb8981e4c90bb6460f9d1
+datasets==5.0.0
+einops==0.8.2
+hf-transfer==0.1.9
+hf-xet==1.5.0
+huggingface-hub==1.18.0
+lm-eval==0.4.12
+numpy==2.1.2
+regex==2026.5.9
+tiktoken==0.13.0
+tqdm==4.68.1
+wandb==0.27.1
