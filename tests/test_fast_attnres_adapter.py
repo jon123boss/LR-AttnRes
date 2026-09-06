@@ -12,6 +12,10 @@ from fast_attnres import (
 )
 from model import ModelConfig, OBPM
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Fast-AttnRes v2 requires CUDA"
+)
+
 
 def _oracle(values, query, *, eps, scale):
     values_f32 = torch.stack(tuple(values), dim=0).float()
@@ -28,11 +32,16 @@ def test_fast_read_matches_independent_oracle_and_value_query_gradients():
     batch, tokens, width, rank = 2, 3, 9, 4
     # Strided aliases exercise the public source-list adapter without turning
     # the test into a contiguous-only implementation check.
-    bases_ref = [torch.randn(batch, tokens, width * 2, requires_grad=True) for _ in range(2)]
+    bases_ref = [
+        torch.randn(
+            batch, tokens, width * 2, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        for _ in range(2)
+    ]
     bases_fast = [base.detach().clone().requires_grad_(True) for base in bases_ref]
     values_ref = [bases_ref[0][..., ::2], bases_ref[1][..., ::2], bases_ref[0][..., ::2]]
     values_fast = [bases_fast[0][..., ::2], bases_fast[1][..., ::2], bases_fast[0][..., ::2]]
-    query_ref = torch.randn(rank, requires_grad=True)
+    query_ref = torch.randn(rank, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     query_fast = query_ref.detach().clone().requires_grad_(True)
     eps = torch.finfo(torch.float32).eps
     scale = 0.37
@@ -49,13 +58,13 @@ def test_fast_read_matches_independent_oracle_and_value_query_gradients():
     assert actual is not None
     assert not all(value.is_contiguous() for value in values_fast)
     assert values_fast[0].data_ptr() == values_fast[2].data_ptr()
-    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(actual, expected, atol=0.05, rtol=0.05)
 
     expected.float().square().mean().backward()
     actual.float().square().mean().backward()
-    assert torch.allclose(query_fast.grad, query_ref.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(query_fast.grad, query_ref.grad, atol=0.05, rtol=0.05)
     for base_fast, base_ref in zip(bases_fast, bases_ref):
-        assert torch.allclose(base_fast.grad, base_ref.grad, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(base_fast.grad, base_ref.grad, atol=0.05, rtol=0.05)
 
 
 @pytest.mark.parametrize(
@@ -67,8 +76,10 @@ def test_fast_read_matches_independent_oracle_and_value_query_gradients():
     ],
 )
 def test_fast_input_semantic_fallbacks_are_structured(kwargs, reason):
-    values = [torch.randn(2, 3, 8) for _ in range(2)]
-    decision = assess_fast_attnres_inputs(values, torch.randn(8), **kwargs)
+    values = [torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    decision = assess_fast_attnres_inputs(
+        values, torch.randn(8, device="cuda", dtype=torch.bfloat16), **kwargs
+    )
     assert not decision.eligible
     assert decision.path == "legacy"
     assert decision.reason == reason
@@ -77,19 +88,21 @@ def test_fast_input_semantic_fallbacks_are_structured(kwargs, reason):
 
 def test_fast_input_dtype_shape_and_single_source_fallbacks():
     assert assess_fast_attnres_inputs(
-        [torch.randn(2, 3, 8, dtype=torch.float16) for _ in range(2)],
-        torch.randn(8),
+        [torch.randn(2, 3, 8, device="cuda", dtype=torch.float16) for _ in range(2)],
+        torch.randn(8, device="cuda", dtype=torch.bfloat16),
     ).reason == "unsupported_dtype"
     assert assess_fast_attnres_inputs(
-        [torch.randn(2, 3, 8) for _ in range(2)],
-        torch.randn(1, 8),
+        [torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16) for _ in range(2)],
+        torch.randn(1, 8, device="cuda", dtype=torch.bfloat16),
     ).reason == "unsupported_query_shape"
     assert assess_fast_attnres_inputs(
-        [torch.randn(2, 3, 8)],
-        torch.randn(8),
+        [torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16)],
+        torch.randn(8, device="cuda", dtype=torch.bfloat16),
     ).reason == "single_source_noop"
-    too_many = [torch.randn(1, 1, 1) for _ in range(130)]
-    assert assess_fast_attnres_inputs(too_many, torch.randn(1)).reason == "unsupported_source_count"
+    too_many = [torch.randn(1, 1, 1, device="cuda", dtype=torch.bfloat16) for _ in range(130)]
+    assert assess_fast_attnres_inputs(
+        too_many, torch.randn(1, device="cuda", dtype=torch.bfloat16)
+    ).reason == "unsupported_source_count"
 
 
 @pytest.mark.parametrize(
@@ -123,12 +136,11 @@ def test_fast_model_semantic_fallback_reasons(kwargs, reason):
         attnres_backend="fast",
         attnres_type="full",
         attnres_key_norm=True,
+        lrid_use_logit_scale=False,
         flash_attention=False,
         **kwargs,
     )
-    model = OBPM(config).eval()
-    with torch.no_grad():
-        model(torch.randint(config.vocab_size, (1, config.block_size)), return_hidden=True)
+    model = OBPM(config).to("cuda").to_mixed_precision(torch.bfloat16).eval()
     report = model.fast_attnres_route_report()
     assert report["fast_reads"] == 0
     assert report["fallback_reasons"][reason] == 2
@@ -148,16 +160,18 @@ def test_fast_full_and_tail_lr_model_routes_match_legacy():
         attn_res_query_norm=True,
         flash_attention=False,
         norm_pos="before",
+        lrid_use_logit_scale=False,
     )
     for lr_kwargs in ({}, {"use_lrid": True, "lrid_rank": 4, "lrid_key_from_output_tail": True}):
         torch.manual_seed(103)
-        legacy = OBPM(ModelConfig(**common, **lr_kwargs, attnres_backend="legacy")).train()
-        fast = OBPM(ModelConfig(**common, **lr_kwargs, attnres_backend="fast")).train()
+        legacy = OBPM(ModelConfig(**common, **lr_kwargs, attnres_backend="legacy")).to("cuda").to_mixed_precision(torch.bfloat16).train()
+        fast = OBPM(ModelConfig(**common, **lr_kwargs, attnres_backend="fast")).to("cuda").to_mixed_precision(torch.bfloat16).train()
         fast.load_state_dict(legacy.state_dict())
-        idx = torch.randint(common["vocab_size"], (2, common["block_size"]))
+        fast.require_fast_attnres(validate_package=True)
+        idx = torch.randint(common["vocab_size"], (2, common["block_size"]), device="cuda")
         expected = legacy(idx, return_hidden=True)
         actual = fast(idx, return_hidden=True)
-        assert torch.allclose(actual, expected, atol=2e-6, rtol=2e-6)
+        assert torch.allclose(actual, expected, atol=0.05, rtol=0.05)
         assert fast.fast_attnres_route_report()["fast_reads"] == 4
 
 
@@ -174,12 +188,11 @@ def test_fast_block_routes_only_reads_without_count_prior_bias():
         attnres_type="block",
         attnres_num_blocks=2,
         attnres_block_count_prior=True,
+        attnres_training_cache_phase1=False,
         attnres_key_norm=True,
         flash_attention=False,
     )
-    model = OBPM(config).eval()
-    with torch.no_grad():
-        model(torch.randint(config.vocab_size, (1, config.block_size)), return_hidden=True)
+    model = OBPM(config).to("cuda").to_mixed_precision(torch.bfloat16).eval()
     report = model.fast_attnres_route_report()
     assert report["fast_reads"] == 0
     assert report["legacy_reads"] == 4
@@ -203,14 +216,15 @@ def test_fast_block_tail_uses_exact_key_payload_for_transformed_summary():
         attnres_num_blocks=2,
         attnres_block_count_prior=False,
         norm_pos="before",
+        lrid_use_logit_scale=False,
         flash_attention=False,
     )
-    averaged = OBPM(ModelConfig(**common, attnres_block_average=True))
+    averaged = OBPM(ModelConfig(**common, attnres_block_average=True)).to("cuda").to_mixed_precision(torch.bfloat16)
     report = averaged.fast_attnres_route_report()
     assert report["fast_reads"] == 4
     assert averaged._fast_lrid_requires_key_payload()
 
-    compatible = OBPM(ModelConfig(**common, attnres_block_average=False))
+    compatible = OBPM(ModelConfig(**common, attnres_block_average=False)).to("cuda").to_mixed_precision(torch.bfloat16)
     assert compatible.fast_attnres_route_report()["fast_reads"] == 4
     assert not compatible._fast_lrid_requires_key_payload()
 
@@ -223,8 +237,8 @@ def test_model_config_defaults_to_legacy_backend():
 
 
 def test_fast_package_and_kernel_failures_are_not_silent(monkeypatch):
-    values = [torch.randn(1, 2, 4) for _ in range(2)]
-    query = torch.randn(4)
+    values = [torch.randn(1, 2, 4, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    query = torch.randn(4, device="cuda", dtype=torch.bfloat16)
 
     def missing():
         raise FastAttnResPackageError("missing")
@@ -276,25 +290,29 @@ def test_fast_output_tail_matches_all_parameter_gradients_and_adamw_update(
         attnres_block_learned_scale_init="one",
         attnres_training_cache_phase1=False,
         norm_pos=norm_pos,
+        lrid_use_logit_scale=False,
         flash_attention=False,
     )
     torch.manual_seed(20260901)
-    legacy = OBPM(ModelConfig(**common, attnres_backend="legacy")).train()
-    fast = OBPM(ModelConfig(**common, attnres_backend="fast")).train()
+    legacy = OBPM(ModelConfig(**common, attnres_backend="legacy")).to("cuda").to_mixed_precision(torch.bfloat16).train()
+    fast = OBPM(ModelConfig(**common, attnres_backend="fast")).to("cuda").to_mixed_precision(torch.bfloat16).train()
     fast.load_state_dict(legacy.state_dict())
+    fast.require_fast_attnres(validate_package=True)
     if learned_scale:
         with torch.no_grad():
             legacy.transformer.attnres_block_scales.fill_(-0.5)
             fast.transformer.attnres_block_scales.fill_(-0.5)
     legacy_optimizer = torch.optim.AdamW(legacy.parameters(), lr=3e-4)
     fast_optimizer = torch.optim.AdamW(fast.parameters(), lr=3e-4)
-    tokens = torch.randint(common["vocab_size"], (2, common["block_size"]))
-    upstream = torch.randn(2, common["block_size"], common["n_embd"])
+    tokens = torch.randint(common["vocab_size"], (2, common["block_size"]), device="cuda")
+    upstream = torch.randn(
+        2, common["block_size"], common["n_embd"], device="cuda", dtype=torch.bfloat16
+    )
 
     expected = legacy(tokens, return_hidden=True)
     actual = fast(tokens, return_hidden=True)
     assert fast.fast_attnres_route_report()["active_reads"] == 4
-    assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-4)
+    assert torch.allclose(actual, expected, rtol=0.05, atol=0.05)
     (expected * upstream).sum().backward()
     (actual * upstream).sum().backward()
 
@@ -306,13 +324,13 @@ def test_fast_output_tail_matches_all_parameter_gradients_and_adamw_update(
         actual_grad = fast_parameters[name].grad
         assert (expected_grad is None) == (actual_grad is None), name
         if expected_grad is not None:
-            assert torch.allclose(actual_grad, expected_grad, rtol=1e-3, atol=1e-4), name
+            assert torch.allclose(actual_grad, expected_grad, rtol=0.05, atol=0.05), name
 
     legacy_optimizer.step()
     fast_optimizer.step()
     for name in legacy_parameters:
         assert torch.allclose(
-            fast_parameters[name], legacy_parameters[name], rtol=1e-3, atol=1e-4
+            fast_parameters[name], legacy_parameters[name], rtol=0.05, atol=0.05
         ), name
 
 

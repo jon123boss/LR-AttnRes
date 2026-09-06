@@ -88,7 +88,9 @@ def _profile_kwargs(profile: str, arm: str, shape: Shape) -> dict:
         "lrid_static_embedding_key": False,
         "lrid_add_static_embedding_key": False,
         "lrid_add_static_source_key": False,
-        "lrid_use_logit_scale": True,
+        # The qualified v2 full-graph route keeps the public scalar literal at
+        # 1.0; both Fast and legacy arms therefore use the same neutral scale.
+        "lrid_use_logit_scale": False,
         "attnres_block_count_prior": False,
     }
 
@@ -210,7 +212,7 @@ def _fast_cuda_graph_gate() -> dict:
 def _route_gate(models: dict[str, OBPM], shape: Shape) -> dict:
     if MultiHeadAttention.flash_attn_func is not None or MultiHeadAttention.flash_attn_varlen_func is not None:
         raise RuntimeError("benchmark unexpectedly loaded generic flash-attn")
-    fast = models["fast_attnres"].fast_attnres_startup_report(validate_package=True)
+    fast = models["fast_attnres"].require_fast_attnres(validate_package=True)
     expected_reads = 2 * shape.layers
     if fast["active_reads"] != expected_reads or fast["legacy_fallback_reads"]:
         raise RuntimeError(f"Fast-AttnRes route mismatch: {fast}")
@@ -502,7 +504,7 @@ def run_benchmark(
         raise RuntimeError(f"incomplete samples: got {timed_count}, expected {expected}")
     report = _report(samples, profiles, bootstrap_replicates, bootstrap_seed)
     manifest = {
-        "protocol": "fast_attnres_only_h100_v1",
+        "protocol": "fast_attnres_only_h100_v2",
         "status": "smoke" if smoke else "full",
         "profiles": list(profiles),
         "arms": list(ARMS),

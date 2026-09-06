@@ -60,12 +60,18 @@ def _write_artifacts(result: dict, root: Path) -> Path:
 
 app = modal.App("lr-attnres-fast-only-benchmark")
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
-        "torch==2.13.0",
+        "torch==2.10.0+cu130",
+        "triton==3.6.0",
         index_url="https://download.pytorch.org/whl/cu130",
     )
-    .uv_pip_install("fast-attnres==1.0.0", "numpy==2.2.6")
+    .uv_pip_install(
+        "fast-attnres @ https://github.com/jon123boss/fast-attnres/releases/download/"
+        "v2.0.1/fast_attnres-2.0.1-py3-none-any.whl#sha256="
+        "d413bf7f089465f403c98f3177e00e32faacb771150cb8981e4c90bb6460f9d1",
+        "numpy==2.2.6",
+    )
     .env(
         {
             "PYTHONPATH": "/root/LR-AttnRes",

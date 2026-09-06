@@ -409,8 +409,12 @@ class OBPMWrapper(LM):
 
         if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
-        self.fast_attnres_report = self.model.fast_attnres_startup_report(validate_package=True)
-        self.model._fast_attnres_enabled = bool(self.fast_attnres_report["active_reads"])
+        if config.attnres_backend == "fast":
+            self.fast_attnres_report = self.model.require_fast_attnres(validate_package=True)
+        else:
+            self.fast_attnres_report = self.model.fast_attnres_startup_report(
+                validate_package=False
+            )
         print_fast_attnres_banner(
             self.fast_attnres_report,
             is_rank_zero=self.verbose,
