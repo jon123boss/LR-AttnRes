@@ -23,6 +23,8 @@ import argparse
 import subprocess
 import gc
 import random
+import glob
+import re
 import numpy as np
 from contextlib import nullcontext
 from utils import (
@@ -142,11 +144,13 @@ eval_only = False
 save_checkpoint = True
 ckpt_interval = 2500
 save_ckpt_at_end = True
+max_local_checkpoints = 0
 interactive_after_train = False
 init_from = 'scratch'
 ckpt_file_name = ''
 # wandb logging
 wandb_log = True
+wandb_log_checkpoints = True
 wandb_project = "LR-AttnRes"
 wandb_run_name = "LRID"
 # data
@@ -164,6 +168,8 @@ ddp_find_unused_parameters = False
 torch_compile = True
 torch_compile_max_autotune = True
 torch_compile_cudagraphs = False
+torch_compile_fullgraph = True
+torch_compile_dynamic = False
 torch_compile_cache_dir = _DEFAULT_TORCH_COMPILE_CACHE_DIR
 # Full run automation
 full_run = True
@@ -450,12 +456,35 @@ def release_training_state_for_full_run_eval():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OBPM.")
+    parser.add_argument("--out_dir", type=str, default=out_dir)
+    parser.add_argument("--dataset_dir", type=str, default=dataset_dir)
+    parser.add_argument("--ckpt_interval", type=int, default=ckpt_interval)
+    parser.add_argument(
+        "--max_local_checkpoints",
+        type=int,
+        default=max_local_checkpoints,
+        help="Keep only the newest N local checkpoints; 0 keeps every checkpoint.",
+    )
     parser.add_argument("--eval_only", type=_str_to_bool, nargs="?", const=True, default=eval_only)
     parser.add_argument("--no-eval_only", dest="eval_only", action="store_false")
     parser.add_argument("--init_from", "--init-from", choices=("scratch", "resume"), default=init_from)
     parser.add_argument("--ckpt_file_name", "--ckpt-file-name", type=str, default=ckpt_file_name)
     parser.add_argument("--wandb_log", type=_str_to_bool, nargs="?", const=True, default=wandb_log)
     parser.add_argument("--no-wandb_log", dest="wandb_log", action="store_false")
+    parser.add_argument(
+        "--wandb_log_checkpoints",
+        type=_str_to_bool,
+        nargs="?",
+        const=True,
+        default=wandb_log_checkpoints,
+    )
+    parser.add_argument(
+        "--no-wandb_log_checkpoints",
+        dest="wandb_log_checkpoints",
+        action="store_false",
+    )
+    parser.add_argument("--wandb_project", type=str, default=wandb_project)
+    parser.add_argument("--wandb_run_name", type=str, default=wandb_run_name)
     parser.add_argument("--ddp_preserve_global_batch", type=_str_to_bool, nargs="?", const=True, default=ddp_preserve_global_batch)
     parser.add_argument("--no-ddp_preserve_global_batch", dest="ddp_preserve_global_batch", action="store_false")
     parser.add_argument("--ddp_find_unused_parameters", type=_str_to_bool, nargs="?", const=True, default=ddp_find_unused_parameters)
@@ -594,10 +623,17 @@ def parse_args():
 
 
 args = parse_args()
+out_dir = args.out_dir
+dataset_dir = args.dataset_dir
+ckpt_interval = args.ckpt_interval
+max_local_checkpoints = args.max_local_checkpoints
 eval_only = args.eval_only
 init_from = args.init_from
 ckpt_file_name = args.ckpt_file_name
 wandb_log = args.wandb_log
+wandb_log_checkpoints = args.wandb_log_checkpoints
+wandb_project = args.wandb_project
+wandb_run_name = args.wandb_run_name
 ddp_preserve_global_batch = args.ddp_preserve_global_batch
 ddp_find_unused_parameters = args.ddp_find_unused_parameters
 torch_compile = args.torch_compile
@@ -664,6 +700,10 @@ ce_inplace_backward = args.ce_inplace_backward
 lm_head_chunk_size = args.lm_head_chunk_size
 if lm_head_chunk_size < 0:
     raise ValueError("lm_head_chunk_size must be >= 0")
+if ckpt_interval < 1:
+    raise ValueError("ckpt_interval must be >= 1")
+if max_local_checkpoints < 0:
+    raise ValueError("max_local_checkpoints must be >= 0")
 if distributed and ddp_find_unused_parameters and lm_head_chunk_size > 0:
     raise ValueError(
         "lm_head_chunk_size > 0 computes the LM-head loss outside the DDP forward, "
@@ -753,7 +793,12 @@ if torch_compile:
     compile_kwargs = {}
     if torch_compile_mode is not None:
         compile_kwargs["mode"] = torch_compile_mode
-    model = torch.compile(model, **compile_kwargs)
+    model = torch.compile(
+        model,
+        fullgraph=torch_compile_fullgraph,
+        dynamic=torch_compile_dynamic,
+        **compile_kwargs,
+    )
 
 if distributed:
     ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
@@ -772,6 +817,10 @@ print0(f"Total Batch Size: {total_batch_size}")
 print0(f"Configured gradient accumulation steps: {configured_grad_accum_steps}")
 print0(f"Local gradient accumulation steps: {grad_accum_steps}")
 print0(f"Torch compile: {torch_compile} | mode: {torch_compile_mode or 'default'}")
+print0(
+    f"Torch compile graph: fullgraph={torch_compile_fullgraph} | "
+    f"dynamic={torch_compile_dynamic}"
+)
 print0(f"Torch compile CUDA graphs: {torch_compile_cudagraphs}")
 print0(f"Torch compile cache dir: {torch_compile_cache_dir or 'default'}")
 print0(f"Full run: {full_run} | HF repo: {full_run_hf_repo_id or 'N/A'}")
@@ -865,6 +914,16 @@ def save_training_checkpoint(current_step: int, ckpt_path: str):
     checkpoint_payload = build_checkpoint(current_step, rng_states_by_rank)
     atomic_torch_save(checkpoint_payload, ckpt_path)
     print0(f"Saved checkpoint: {ckpt_path}")
+    if max_local_checkpoints:
+        checkpoint_paths = glob.glob(os.path.join(out_dir, "ckpt_step:*.pt"))
+
+        def checkpoint_step(path):
+            match = re.search(r"ckpt_step:(\d+)\.pt$", os.path.basename(path))
+            return int(match.group(1)) if match else -1
+
+        for stale_path in sorted(checkpoint_paths, key=checkpoint_step)[:-max_local_checkpoints]:
+            os.remove(stale_path)
+            print0(f"Pruned checkpoint: {stale_path}")
     return ckpt_path
 
 
@@ -1039,7 +1098,7 @@ while tokens_processed < max_tokens and step < max_steps:
         if should_save:
             ckpt_path = os.path.join(out_dir, f"ckpt_step:{step}.pt")
             save_training_checkpoint(step, ckpt_path)
-            if wandb_log and master_process:
+            if wandb_log and wandb_log_checkpoints and master_process:
                 logger.log_checkpoint(step, ckpt_path, config=config)
 
     model.train()
@@ -1188,7 +1247,7 @@ final_ckpt_path = None
 if full_run or (checkpointing_enabled and save_ckpt_at_end):
     final_ckpt_path = os.path.join(out_dir, f"ckpt_step:{step}.pt")
     save_training_checkpoint(step, final_ckpt_path)
-    if wandb_log and master_process:
+    if wandb_log and wandb_log_checkpoints and master_process:
         logger.log_checkpoint(step, final_ckpt_path, config=config)
 
 if distributed and dist.is_initialized():

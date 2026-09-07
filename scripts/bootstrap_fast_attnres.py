@@ -14,8 +14,37 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
-REQUIREMENTS = ROOT / "requirements-fast-attnres-cu13.txt"
 STAMP = ROOT / ".runtime" / "fast-attnres-bootstrap.sha256"
+
+
+def select_runtime_profile() -> tuple[Path, str, str, str]:
+    """Select CUDA 12.6 when the host driver cannot initialize CUDA 13."""
+    try:
+        driver_text = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).splitlines()[0]
+        driver_major = int(driver_text.split(".", 1)[0])
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError, IndexError):
+        driver_major = 580
+    if driver_major < 580:
+        return (
+            ROOT / "requirements-fast-attnres-cu126.txt",
+            "2.9.0+cu126",
+            "3.5.0",
+            "cu126-compat",
+        )
+    return (
+        ROOT / "requirements-fast-attnres-cu13.txt",
+        "2.10.0+cu130",
+        "3.6.0",
+        "cu130-qualified",
+    )
 
 
 def run(*args: str) -> None:
@@ -29,7 +58,8 @@ def run(*args: str) -> None:
 
 
 def main() -> None:
-    digest = hashlib.sha256(REQUIREMENTS.read_bytes() + Path(__file__).read_bytes()).hexdigest()
+    requirements, expected_torch, expected_triton, profile = select_runtime_profile()
+    digest = hashlib.sha256(requirements.read_bytes() + Path(__file__).read_bytes()).hexdigest()
     python = VENV / "bin" / "python"
     if python.is_file() and STAMP.is_file() and STAMP.read_text().strip() == digest:
         return
@@ -40,9 +70,9 @@ def main() -> None:
                 str(python),
                 "-c",
                 (
-                    "import pathlib, sys, sysconfig; "
+                    "import pathlib, sys, sysconfig; import torch; "
                     "assert (pathlib.Path(sysconfig.get_paths()['include']) / 'Python.h').is_file(); "
-                    "print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+                    "print(f'{sys.version_info.major}.{sys.version_info.minor}|{torch.__version__}')"
                 ),
             ],
             cwd=ROOT,
@@ -50,7 +80,7 @@ def main() -> None:
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        if probe.returncode or probe.stdout.strip() != "3.12":
+        if probe.returncode or probe.stdout.strip() != f"3.12|{expected_torch}":
             shutil.rmtree(VENV)
     if not python.is_file():
         uv = shutil.which("uv")
@@ -71,15 +101,16 @@ def main() -> None:
                     "could not create .venv; install uv or python3.12-venv"
                 ) from exc
 
-    run(str(python), "-m", "pip", "install", "-r", str(REQUIREMENTS))
+    print(f"Selected Fast-AttnRes runtime profile: {profile}")
+    run(str(python), "-m", "pip", "install", "-r", str(requirements))
     run(
         str(python),
         "-c",
         (
             "import flash_attn, torch, triton; "
             "from importlib.metadata import version; "
-            "assert torch.__version__ == '2.10.0+cu130', torch.__version__; "
-            "assert triton.__version__ == '3.6.0', triton.__version__; "
+            f"assert torch.__version__ == {expected_torch!r}, torch.__version__; "
+            f"assert triton.__version__ == {expected_triton!r}, triton.__version__; "
             "assert flash_attn.__version__ == '2.8.3', flash_attn.__version__; "
             "assert version('fast-attnres') == '2.0.1'"
         ),

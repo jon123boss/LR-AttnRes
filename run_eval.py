@@ -393,6 +393,8 @@ class OBPMWrapper(LM):
         self.max_batch_size = max_batch_size
         self.torch_compile = bool(torch_compile or torch_compile_max_autotune)
         self.torch_compile_mode = "max-autotune" if torch_compile_max_autotune else None
+        self.torch_compile_fullgraph = True
+        self.torch_compile_dynamic = False
         self.torch_compile_cache_dir = torch_compile_cache_dir
         self.verbose = bool(verbose)
 
@@ -424,9 +426,19 @@ class OBPMWrapper(LM):
             if self.verbose:
                 print(
                     f"Torch compile enabled for eval | mode: {self.torch_compile_mode or 'default'} | "
+                    f"fullgraph={self.torch_compile_fullgraph} | "
+                    f"dynamic={self.torch_compile_dynamic} | "
                     f"cache: {self.torch_compile_cache_dir or 'default'}"
                 )
-            self.model = torch.compile(self.model, mode=self.torch_compile_mode)
+            compile_kwargs = {}
+            if self.torch_compile_mode is not None:
+                compile_kwargs["mode"] = self.torch_compile_mode
+            self.model = torch.compile(
+                self.model,
+                fullgraph=self.torch_compile_fullgraph,
+                dynamic=self.torch_compile_dynamic,
+                **compile_kwargs,
+            )
 
         self.model.eval()
 
@@ -761,6 +773,12 @@ def _attach_provenance(
         "cuda_available": torch.cuda.is_available(),
         "attnres_kernel_environment": capture_attnres_kernel_environment(),
         "attnres_backend": lm_obj.attnres_backend,
+        "torch_compile": {
+            "enabled": lm_obj.torch_compile,
+            "mode": lm_obj.torch_compile_mode,
+            "fullgraph": lm_obj.torch_compile_fullgraph,
+            "dynamic": lm_obj.torch_compile_dynamic,
+        },
         "fast_attnres": lm_obj.fast_attnres_report,
     }
 

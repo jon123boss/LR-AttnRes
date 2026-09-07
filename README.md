@@ -27,10 +27,13 @@ python scripts/bootstrap_fast_attnres.py
 source .venv/bin/activate
 ```
 
-The pinned combination is Python 3.12, PyTorch 2.10.0+cu130, Triton 3.6.0,
-FlashAttention 2.8.3's official CUDA-13/Torch-2.10 wheel, and the SHA-256-pinned
-Fast-AttnRes 2.0.1 wheel. Using the wheels avoids local FlashAttention builds;
-managed Python supplies the header Triton's runtime launcher needs.
+The bootstrap selects a driver-compatible profile. Driver 580 or newer uses
+Python 3.12, PyTorch 2.10.0+cu130, Triton 3.6.0, and FlashAttention 2.8.3's
+official CUDA-13/Torch-2.10 wheel. CUDA 12.x drivers use PyTorch 2.9.0+cu126,
+Triton 3.5.0, and the official CUDA-12/Torch-2.9 FlashAttention wheel. Both
+profiles install the same SHA-256-pinned Fast-AttnRes 2.0.1 wheel. Using the
+wheels avoids local FlashAttention builds; managed Python supplies the header
+Triton's runtime launcher needs.
 
 `train.py` defaults to `--attnres_backend auto`. Standard AttnRes (`R=D`) and
 single-head static sliced/output-tail LR-AttnRes (`1<=R<=D`) resolve to Fast.
