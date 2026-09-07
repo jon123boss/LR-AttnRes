@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -89,6 +90,15 @@ def atomic_write_text(path: Path, payload: str) -> None:
     finally:
         if os.path.exists(temporary_name):
             os.remove(temporary_name)
+
+
+def refresh_repository_provenance(state: dict) -> None:
+    runtime = state.setdefault("runtime", {})
+    runtime["git_commit"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    diff = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=ROOT)
+    runtime["git_diff_sha256"] = hashlib.sha256(diff).hexdigest()
 
 
 def write_results_ledger(state: dict) -> None:
@@ -426,6 +436,7 @@ def main() -> int:
         return 0
     with STATE_PATH.open(encoding="utf-8") as source:
         state = json.load(source)
+    refresh_repository_provenance(state)
     migrate_legacy_observations(state)
     atomic_write_json(STATE_PATH, state)
     write_results_ledger(state)
