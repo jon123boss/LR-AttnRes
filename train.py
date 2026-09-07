@@ -181,6 +181,8 @@ full_run_eval_torch_max_autotune = False
 # Document masking (Dataloader)
 use_doc_masking = True
 doc_separator_token = _GPT4_EOT_TOKEN
+doc_mask_cu_seqlens_size = 0
+doc_mask_static_max_seqlen = 0
 num_workers = 8
 pin_memory = True if device.type == "cuda" else False
 persistent_workers = False
@@ -531,6 +533,18 @@ def parse_args():
     parser.add_argument("--no-full_run_eval_torch_max_autotune", dest="full_run_eval_torch_max_autotune", action="store_false")
     parser.add_argument("--use_doc_masking", type=_str_to_bool, nargs="?", const=True, default=use_doc_masking)
     parser.add_argument("--no-use_doc_masking", dest="use_doc_masking", action="store_false")
+    parser.add_argument(
+        "--doc_mask_cu_seqlens_size",
+        type=int,
+        default=doc_mask_cu_seqlens_size,
+        help="Pad document cumulative offsets to this fixed length; 0 keeps variable length.",
+    )
+    parser.add_argument(
+        "--doc_mask_static_max_seqlen",
+        type=int,
+        default=doc_mask_static_max_seqlen,
+        help="Use this fixed FlashAttention maximum document length; 0 uses the batch maximum.",
+    )
     parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--use_fused_attnres", type=_str_to_bool, nargs="?", const=True, default=use_fused_attnres)
@@ -649,6 +663,8 @@ full_run_eval = args.full_run_eval
 full_run_eval_mode = args.full_run_eval_mode
 full_run_eval_torch_max_autotune = args.full_run_eval_torch_max_autotune
 use_doc_masking = args.use_doc_masking
+doc_mask_cu_seqlens_size = args.doc_mask_cu_seqlens_size
+doc_mask_static_max_seqlen = args.doc_mask_static_max_seqlen
 use_attnres = args.use_attnres
 use_fused_attnres = args.use_fused_attnres
 attnres_backend = args.attnres_backend or "auto"

@@ -22,6 +22,8 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
+import numpy as np
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -34,6 +36,11 @@ STOP_PATH = RUNS_DIR / "STOP"
 EXPECTED_FINAL_STEP = 38146
 EXPECTED_TRAIN_SHARDS = 131
 DATASET_REVISION = "2d102ffbc415103c82705a227afba5dad5b9d217"
+BLOCK_SIZE = 2048
+BATCH_SIZE = 16
+DOC_SEPARATOR_TOKEN = 100257
+MAX_SEPARATORS_PER_SEQUENCE = 13
+STATIC_DOC_MASK_CU_SEQLENS_SIZE = BATCH_SIZE * (MAX_SEPARATORS_PER_SEQUENCE + 1) + 1
 REFERENCE_WANDB_RUN = (
     "https://wandb.ai/jonnester-german-swiss-international-school-/"
     "LR-AttnRes/runs/ne0tiqb3"
@@ -176,6 +183,25 @@ def git_output(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
 
+def maximum_separators_per_sequence(paths: list[Path]) -> int:
+    """Verify the corpus bound used by the fixed document-mask representation."""
+    maximum = 0
+    rows_per_chunk = 8192
+    for path in paths:
+        tokens = np.memmap(path, dtype=np.uint32, mode="r")
+        sequence_count = (tokens.size - 1) // BLOCK_SIZE
+        for row_start in range(0, sequence_count, rows_per_chunk):
+            row_end = min(sequence_count, row_start + rows_per_chunk)
+            rows = np.asarray(
+                tokens[row_start * BLOCK_SIZE : row_end * BLOCK_SIZE]
+            ).reshape(-1, BLOCK_SIZE)
+            maximum = max(
+                maximum,
+                int(np.count_nonzero(rows == DOC_SEPARATOR_TOKEN, axis=1).max(initial=0)),
+            )
+    return maximum
+
+
 def preflight() -> dict:
     if not PYTHON.is_file():
         raise RuntimeError(f"Pinned environment is missing: {PYTHON}")
@@ -189,6 +215,13 @@ def preflight() -> dict:
     wrong_sizes = [path for path in train_shards + val_shards if path.stat().st_size != 400_000_000]
     if wrong_sizes:
         raise RuntimeError(f"Dataset contains unexpected shard sizes: {wrong_sizes[:3]}")
+    max_separators = maximum_separators_per_sequence(train_shards + val_shards)
+    if max_separators > MAX_SEPARATORS_PER_SEQUENCE:
+        raise RuntimeError(
+            "Static document-mask capacity is invalid for this corpus: "
+            f"observed {max_separators} separators in one sequence, "
+            f"allowed {MAX_SEPARATORS_PER_SEQUENCE}"
+        )
     probe = subprocess.check_output(
         [
             str(PYTHON),
@@ -211,6 +244,8 @@ def preflight() -> dict:
         "train_shards": len(train_shards),
         "val_shards": len(val_shards),
         "dataset_bytes": sum(path.stat().st_size for path in train_shards + val_shards),
+        "max_doc_separators_per_sequence": max_separators,
+        "doc_mask_cu_seqlens_size": STATIC_DOC_MASK_CU_SEQLENS_SIZE,
         "git_commit": git_output("rev-parse", "HEAD"),
         "git_diff_sha256": sha256_bytes(
             subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=ROOT)
@@ -334,6 +369,10 @@ def command_for(n_blocks: int, rank: int, run_dir: Path, resume: bool) -> list[s
         "--no-lrid_use_logit_scale",
         "--attnres_backend",
         "fast",
+        "--doc_mask_cu_seqlens_size",
+        str(STATIC_DOC_MASK_CU_SEQLENS_SIZE),
+        "--doc_mask_static_max_seqlen",
+        "2048",
         "--no-torch_compile_max_autotune",
         "--no-torch_compile_cudagraphs",
         "--ckpt_interval",
@@ -425,6 +464,8 @@ def run_job(state: dict, n_blocks: int, rank: int, max_retries: int) -> None:
                 "compile_mode": "fullgraph-static-no-cudagraphs",
                 "torch_compile_fullgraph": True,
                 "torch_compile_dynamic": False,
+                "doc_mask_cu_seqlens_size": STATIC_DOC_MASK_CU_SEQLENS_SIZE,
+                "doc_mask_static_max_seqlen": 2048,
                 "dataset_revision": DATASET_REVISION,
                 "reference_wandb_run": REFERENCE_WANDB_RUN,
                 "intentional_recipe_differences": {

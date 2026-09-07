@@ -15,10 +15,19 @@ This workspace runs the sliced low-rank **Block AttnRes** matrix requested for
 - neutral LR routing scale (`1.0`)
 - `fast-attnres==2.0.1`, selected explicitly with `--attnres_backend fast`
 - `torch.compile(fullgraph=True, dynamic=False)` with CUDA graphs disabled
+- fixed-shape document offsets (225 entries) and maximum length 2048
 
 Fast-AttnRes selection is fail closed. Startup must report every multi-source
 routed read as a Fast-AttnRes read; a missing package, unsupported semantic
 option, or legacy fallback stops the run.
+
+The fixed document-mask representation preserves the same masking. The pinned
+corpus has at most 13 separators in any 2048-token sequence, so a batch of 16
+needs at most 225 cumulative offsets. Unused entries repeat the terminal offset
+and therefore describe zero-length sequences, which FlashAttention ignores.
+The controller scans every pinned train and validation shard before launch and
+fails if the bound is ever exceeded. This prevents `dynamic=False` from
+recompiling the 0.5B graph for each batch's document count and maximum length.
 
 ## Scheduling and recovery
 

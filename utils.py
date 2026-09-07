@@ -175,6 +175,8 @@ _EXACT_RESUME_DATA_KEYS = (
     "seed",
     "use_doc_masking",
     "doc_separator_token",
+    "doc_mask_cu_seqlens_size",
+    "doc_mask_static_max_seqlen",
 )
 
 
@@ -440,6 +442,8 @@ def _get_dataloader_config(config):
         grad_accum_steps=config["grad_accum_steps"],
         use_doc_masking=config["use_doc_masking"],
         doc_separator_token=config["doc_separator_token"],
+        doc_mask_cu_seqlens_size=int(config.get("doc_mask_cu_seqlens_size", 0)),
+        doc_mask_static_max_seqlen=int(config.get("doc_mask_static_max_seqlen", 0)),
         num_workers=config["num_workers"],
         pin_memory=config["pin_memory"],
         persistent_workers=config["persistent_workers"],

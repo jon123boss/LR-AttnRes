@@ -2,6 +2,7 @@
 import os
 import glob
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple
 
 import numpy as np
@@ -18,6 +19,8 @@ class DataLoaderConfig:
     grad_accum_steps: int = 1
     use_doc_masking: bool = True
     doc_separator_token: Optional[int] = 100257
+    doc_mask_cu_seqlens_size: int = 0
+    doc_mask_static_max_seqlen: int = 0
     num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -42,6 +45,14 @@ class DataLoaderConfig:
             raise ValueError("world_size must be >= 1")
         if self.rank < 0 or self.rank >= self.world_size:
             raise ValueError("rank must satisfy 0 <= rank < world_size")
+        if self.doc_mask_cu_seqlens_size < 0:
+            raise ValueError("doc_mask_cu_seqlens_size must be >= 0")
+        if self.doc_mask_static_max_seqlen < 0:
+            raise ValueError("doc_mask_static_max_seqlen must be >= 0")
+        if self.doc_mask_cu_seqlens_size == 1:
+            raise ValueError("doc_mask_cu_seqlens_size must be 0 or >= 2")
+        if self.doc_mask_static_max_seqlen > self.block_size:
+            raise ValueError("doc_mask_static_max_seqlen cannot exceed block_size")
         self.dtype = np.dtype(self.dtype)
 
     @property
@@ -311,7 +322,12 @@ class DocumentPackingDataset(Dataset):
         return x, y, cu_doc_len, max_doc_len
 
 
-def collate_with_doc_masking(batch):
+def collate_with_doc_masking(
+    batch,
+    *,
+    cu_seqlens_size: int = 0,
+    static_max_seqlen: int = 0,
+):
     batch_size = len(batch)
     seq_len = batch[0][0].size(0)
     
@@ -319,7 +335,13 @@ def collate_with_doc_masking(batch):
     y_batch = torch.empty(batch_size, seq_len, dtype=torch.int64)
     
     total_cu_len = sum(len(item[2]) for item in batch) - (batch_size - 1)
-    cu_doc_len_batch = torch.empty(total_cu_len, dtype=torch.int32)
+    if cu_seqlens_size and total_cu_len > cu_seqlens_size:
+        raise ValueError(
+            "Document-mask cu_seqlens capacity is too small: "
+            f"need {total_cu_len}, configured {cu_seqlens_size}"
+        )
+    output_cu_len = cu_seqlens_size or total_cu_len
+    cu_doc_len_batch = torch.empty(output_cu_len, dtype=torch.int32)
     
     max_doc_len_batch = 0
     offset = 0
@@ -342,12 +364,31 @@ def collate_with_doc_masking(batch):
         
         offset += seq_len
 
-    return x_batch, y_batch, cu_doc_len_batch[:cu_write_idx], max_doc_len_batch
+    # Repeating the terminal cumulative offset adds zero-length sequences.
+    # FlashAttention ignores them exactly, while the fixed tensor extent avoids
+    # recompiling a full static graph for every document count in a batch.
+    if cu_write_idx < output_cu_len:
+        cu_doc_len_batch[cu_write_idx:].fill_(offset)
+
+    return (
+        x_batch,
+        y_batch,
+        cu_doc_len_batch,
+        static_max_seqlen or max_doc_len_batch,
+    )
 
 
 def collate_simple(batch):
     xs, ys, _, _ = zip(*batch)
     return torch.stack(xs), torch.stack(ys), None, None
+
+
+def _document_collate(config: DataLoaderConfig):
+    return partial(
+        collate_with_doc_masking,
+        cu_seqlens_size=config.doc_mask_cu_seqlens_size,
+        static_max_seqlen=config.doc_mask_static_max_seqlen,
+    )
 
 
 def create_dataloaders(config: DataLoaderConfig):
@@ -372,7 +413,7 @@ def create_dataloaders(config: DataLoaderConfig):
     )
 
     if config.use_doc_masking:
-        collate_fn = collate_with_doc_masking
+        collate_fn = _document_collate(config)
     else:
         collate_fn = collate_simple
 
@@ -456,7 +497,7 @@ def create_training_evaluation_dataloader(
             verbose=(config.rank == 0),
         )
 
-    collate_fn = collate_with_doc_masking if config.use_doc_masking else collate_simple
+    collate_fn = _document_collate(config) if config.use_doc_masking else collate_simple
     loader_kwargs = dict(
         batch_size=config.batch_size,
         num_workers=config.num_workers,
@@ -496,7 +537,7 @@ def create_validation_dataloader(config: DataLoaderConfig):
         verbose=(config.rank == 0),
     )
 
-    collate_fn = collate_with_doc_masking if config.use_doc_masking else collate_simple
+    collate_fn = _document_collate(config) if config.use_doc_masking else collate_simple
     loader_kwargs = dict(
         batch_size=config.batch_size,
         num_workers=config.num_workers,
