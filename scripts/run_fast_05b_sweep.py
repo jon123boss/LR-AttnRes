@@ -41,11 +41,17 @@ REFERENCE_WANDB_RUN = (
 
 # Rank 1024 and rank 64 were reported complete by the owner.  Higher unfinished
 # ranks go first to avoid the separate worker covering the lower ranks.
-JOBS = tuple(
+HIGH_PRIORITY_JOBS = tuple(
     (n_blocks, rank)
     for rank in (768, 512, 256, 128)
     for n_blocks in (16, 8, 4)
 )
+LOWER_RANK_JOBS = tuple(
+    (n_blocks, rank)
+    for rank in (32, 16)
+    for n_blocks in (16, 8, 4)
+)
+ALL_JOBS = HIGH_PRIORITY_JOBS + LOWER_RANK_JOBS
 OWNER_REPORTED_COMPLETE = tuple(
     (n_blocks, rank)
     for rank in (1024, 64)
@@ -420,7 +426,12 @@ def run_job(state: dict, n_blocks: int, rank: int, max_retries: int) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--only", choices=[job_name(n, r) for n, r in JOBS])
+    parser.add_argument("--only", choices=[job_name(n, r) for n, r in ALL_JOBS])
+    parser.add_argument(
+        "--include-lower",
+        action="store_true",
+        help="After the high-priority queue, include missing r=32 and r=16 cells.",
+    )
     return parser.parse_args()
 
 
@@ -443,9 +454,11 @@ def main() -> int:
         save_state(state)
         publish_pending()
         state = load_state()
-        selected_jobs = JOBS
+        selected_jobs = HIGH_PRIORITY_JOBS
+        if args.include_lower:
+            selected_jobs += LOWER_RANK_JOBS
         if args.only:
-            selected_jobs = tuple((n, r) for n, r in JOBS if job_name(n, r) == args.only)
+            selected_jobs = tuple((n, r) for n, r in ALL_JOBS if job_name(n, r) == args.only)
         for n_blocks, rank in selected_jobs:
             if STOP_PATH.exists():
                 state["controller_status"] = "stopped_by_sentinel"
@@ -466,7 +479,9 @@ def main() -> int:
                 save_state(state)
         publish_pending()
         state = load_state()
-        state["controller_status"] = "high_rank_queue_complete"
+        state["controller_status"] = (
+            "full_queue_complete" if args.include_lower else "high_rank_queue_complete"
+        )
         save_state(state)
     return 0
 

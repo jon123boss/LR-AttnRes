@@ -30,6 +30,11 @@ covering lower ranks, so this machine runs 768, 512, 256, and the remaining
 The lower-rank queue is added only after re-auditing W&B to avoid duplicate
 training.
 
+The default controller invocation runs only the high-priority queue. After
+that finishes, re-run the W&B audit and start the remaining lower cells with
+`scripts/run_fast_05b_sweep.py --include-lower`; already completed cells in
+the state ledger remain skipped.
+
 `scripts/run_fast_05b_sweep.py` resumes the newest checkpoint automatically,
 keeps the newest checkpoint to bound disk usage, evaluates the entire
 99,999,744-token validation shard, and records state atomically under
