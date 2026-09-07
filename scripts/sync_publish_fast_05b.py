@@ -30,6 +30,32 @@ REFERENCE_WANDB_RUN = (
     "https://wandb.ai/jonnester-german-swiss-international-school-/"
     "LR-AttnRes/runs/ne0tiqb3"
 )
+REFERENCE_WANDB_RUN_ID = "ne0tiqb3"
+ALLOWED_RECIPE_DIFFERENCES = {
+    # Sweep axes and the requested kernel/compile change.
+    "attnres_backend",
+    "attnres_num_blocks",
+    "lrid_rank",
+    "torch_compile_cache_dir",
+    "torch_compile_dynamic",
+    "torch_compile_fullgraph",
+    "torch_compile_max_autotune",
+    "use_fused_attnres",
+    # Static document-mask representation; this preserves the same masks.
+    "doc_mask_cu_seqlens_size",
+    "doc_mask_static_max_seqlen",
+    # Execution and bookkeeping fields that do not change the recipe.
+    "dataset_dir",
+    "distributed",
+    "grad_accum_steps",
+    "init_from",
+    "max_local_checkpoints",
+    "num_params",
+    "out_dir",
+    "wandb_log_checkpoints",
+    "wandb_run_name",
+    "world_size",
+}
 
 
 def utc_now() -> str:
@@ -147,6 +173,70 @@ def load_runtime_qualification(run_dir: Path) -> dict:
         return json.load(source)
 
 
+def write_recipe_audit(run_dir: Path, reference_run, active_run, job: dict) -> dict:
+    reference = dict(reference_run.config or {})
+    active = dict(active_run.config or {})
+    differences = {
+        key: {"reference": reference.get(key, "<missing>"), "active": active.get(key, "<missing>")}
+        for key in sorted(set(reference) | set(active))
+        if reference.get(key, "<missing>") != active.get(key, "<missing>")
+    }
+    unexpected = sorted(set(differences) - ALLOWED_RECIPE_DIFFERENCES)
+    if unexpected:
+        raise RuntimeError(f"Training recipe has unexpected W&B config differences: {unexpected}")
+
+    required_active = {
+        "attnres_backend": "fast",
+        "attnres_num_blocks": int(job["n"]),
+        "lrid_rank": int(job["rank"]),
+        "lrid_key_from_output_tail": True,
+        "attnres_block_average": False,
+        "attnres_block_count_prior": False,
+        "lrid_use_logit_scale": False,
+        "use_fused_attnres": False,
+        "doc_mask_cu_seqlens_size": 225,
+        "doc_mask_static_max_seqlen": 2048,
+        "torch_compile_fullgraph": True,
+        "torch_compile_dynamic": False,
+        "torch_compile_max_autotune": False,
+        "torch_compile_cudagraphs": False,
+    }
+    wrong_active = {
+        key: {"expected": expected, "observed": active.get(key, "<missing>")}
+        for key, expected in required_active.items()
+        if active.get(key, "<missing>") != expected
+    }
+    if wrong_active:
+        raise RuntimeError(f"Active run violates the Fast sweep contract: {wrong_active}")
+
+    reference_accumulation = int(reference["grad_accum_steps"]) * int(reference.get("world_size", 1))
+    active_accumulation = int(active["grad_accum_steps"]) * int(active.get("world_size", 1))
+    if active_accumulation != reference_accumulation:
+        raise RuntimeError(
+            "Global gradient accumulation drifted: "
+            f"reference={reference_accumulation}, active={active_accumulation}"
+        )
+
+    audit = {
+        "status": "passed",
+        "audited_at_utc": utc_now(),
+        "reference_wandb_run": REFERENCE_WANDB_RUN,
+        "active_wandb_run": active_run.url,
+        "matched_config_keys": len(set(reference) & set(active)) - len(
+            set(differences) & set(reference) & set(active)
+        ),
+        "unexpected_differences": [],
+        "allowed_differences": differences,
+        "invariants": {
+            "reference_effective_gradient_accumulation": reference_accumulation,
+            "active_effective_gradient_accumulation": active_accumulation,
+            "active_contract": required_active,
+        },
+    }
+    atomic_write_json(run_dir / "recipe_audit.json", audit)
+    return audit
+
+
 def write_model_card(run_dir: Path, name: str, job: dict, result: dict) -> Path:
     validation = result["validation_loss"]
     provenance = result["provenance"]
@@ -162,6 +252,15 @@ def write_model_card(run_dir: Path, name: str, job: dict, result: dict) -> Path:
             ),
             f"- Compiled model graphs: `{qualification['model_forward_graph_count']}` forward, "
             f"`{qualification['model_backward_graph_count']}` backward",
+        ]
+    recipe_audit_path = run_dir / "recipe_audit.json"
+    recipe_lines = []
+    if recipe_audit_path.is_file():
+        with recipe_audit_path.open(encoding="utf-8") as source:
+            recipe_audit = json.load(source)
+        recipe_lines = [
+            f"- Recipe audit: `{recipe_audit['status']}` with "
+            f"`{len(recipe_audit['unexpected_differences'])}` unexpected differences",
         ]
     card = run_dir / "README.md"
     card.write_text(
@@ -182,6 +281,7 @@ def write_model_card(run_dir: Path, name: str, job: dict, result: dict) -> Path:
                 f"- Checkpoint SHA256: `{provenance['checkpoint_sha256']}`",
                 "- Compile mode: `fullgraph=True`, `dynamic=False`, CUDA graphs disabled",
                 *benchmark_lines,
+                *recipe_lines,
                 f"- W&B run: {job['wandb_url']}",
                 f"- Reference recipe: {REFERENCE_WANDB_RUN}",
                 "",
@@ -216,6 +316,8 @@ def update_wandb(
             if attempt == 5:
                 raise
             time.sleep(2 ** attempt)
+    reference_run = api.run(f"{entity}/{PROJECT}/{REFERENCE_WANDB_RUN_ID}")
+    recipe_audit = write_recipe_audit(run_dir, reference_run, run, job)
     validation = result["validation_loss"]
     provenance = result["provenance"]
     run.summary["full_validation/loss"] = float(validation["loss"])
@@ -229,6 +331,13 @@ def update_wandb(
     run.summary["compile/fullgraph"] = True
     run.summary["compile/dynamic"] = False
     run.summary["compile/max_autotune"] = False
+    run.summary["sweep/recipe_audit_status"] = recipe_audit["status"]
+    run.summary["sweep/recipe_unexpected_differences"] = len(
+        recipe_audit["unexpected_differences"]
+    )
+    run.summary["sweep/effective_gradient_accumulation"] = int(
+        recipe_audit["invariants"]["active_effective_gradient_accumulation"]
+    )
     qualification = load_runtime_qualification(run_dir)
     if qualification:
         run.summary["sweep/runtime_qualified"] = True
@@ -264,6 +373,9 @@ def publish_hf(hf: HfApi, run_dir: Path, name: str, job: dict, result: dict) -> 
         benchmark_path = Path(qualification.get("benchmark_local_path", ""))
         if benchmark_path.is_file():
             uploads.append((benchmark_path, "fast_vs_legacy_read_benchmark.json"))
+    recipe_audit_path = run_dir / "recipe_audit.json"
+    if recipe_audit_path.is_file():
+        uploads.append((recipe_audit_path, "recipe_audit.json"))
     for local_path, remote_path in uploads:
         hf.upload_file(
             path_or_fileobj=str(local_path),
