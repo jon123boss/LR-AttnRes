@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +22,8 @@ RUNS_DIR = Path("/root/sweep-runs")
 STATE_PATH = RUNS_DIR / "sweep_state.json"
 NAMESPACE = "Jonnester"
 PROJECT = "LR-AttnRes"
+TARGET_BLOCKS = (4, 8, 16)
+TARGET_RANKS = (16, 32, 64, 128, 256, 512, 768, 1024)
 REFERENCE_WANDB_RUN = (
     "https://wandb.ai/jonnester-german-swiss-international-school-/"
     "LR-AttnRes/runs/ne0tiqb3"
@@ -43,6 +47,71 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     finally:
         if os.path.exists(temporary_name):
             os.remove(temporary_name)
+
+
+def atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.remove(temporary_name)
+
+
+def write_results_ledger(state: dict) -> None:
+    fields = (
+        "n",
+        "rank",
+        "status",
+        "backend",
+        "validation_loss",
+        "wandb_url",
+        "huggingface_url",
+    )
+    rows = []
+    for rank in reversed(TARGET_RANKS):
+        for n_blocks in reversed(TARGET_BLOCKS):
+            name = f"sliced-fast-05b-n{n_blocks}-r{rank}"
+            job = state.get("jobs", {}).get(name, {})
+            rows.append(
+                {
+                    "n": n_blocks,
+                    "rank": rank,
+                    "status": job.get("status", "pending"),
+                    "backend": job.get("backend", ""),
+                    "validation_loss": job.get("validation_loss", ""),
+                    "wandb_url": job.get("wandb_url", ""),
+                    "huggingface_url": job.get("huggingface_url", ""),
+                }
+            )
+
+    csv_buffer = io.StringIO()
+    writer = csv.DictWriter(csv_buffer, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_write_text(RUNS_DIR / "results.csv", csv_buffer.getvalue())
+
+    markdown = [
+        "# LR-AttnRes 0.5B sweep results",
+        "",
+        f"Updated: {utc_now()}",
+        "",
+        "| n | rank | status | backend | validation loss | W&B | Hugging Face |",
+        "|---:|---:|---|---|---:|---|---|",
+    ]
+    for row in rows:
+        wandb_link = f"[run]({row['wandb_url']})" if row["wandb_url"] else ""
+        hf_link = f"[model]({row['huggingface_url']})" if row["huggingface_url"] else ""
+        markdown.append(
+            f"| {row['n']} | {row['rank']} | {row['status']} | {row['backend']} | "
+            f"{row['validation_loss']} | {wandb_link} | {hf_link} |"
+        )
+    atomic_write_text(RUNS_DIR / "results.md", "\n".join(markdown) + "\n")
 
 
 def checkpoint_from_job(job: dict) -> Path:
@@ -170,6 +239,7 @@ def main() -> int:
         return 0
     with STATE_PATH.open(encoding="utf-8") as source:
         state = json.load(source)
+    write_results_ledger(state)
     for name, job in state["jobs"].items():
         if job.get("status") not in {"complete_pending_sync_and_upload", "sync_failed"}:
             continue
@@ -184,8 +254,11 @@ def main() -> int:
             job["status"] = "sync_failed"
             job["sync_error"] = f"{type(error).__name__}: {error}"
             atomic_write_json(STATE_PATH, state)
+            write_results_ledger(state)
             raise
         atomic_write_json(STATE_PATH, state)
+        write_results_ledger(state)
+    write_results_ledger(state)
     return 0
 
 

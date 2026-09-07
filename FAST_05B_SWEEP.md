@@ -36,6 +36,10 @@ keeps the newest checkpoint to bound disk usage, evaluates the entire
 `/root/sweep-runs/sweep_state.json`. Create `/root/sweep-runs/STOP` to stop at
 the next job boundary.
 
+The publisher also rewrites `/root/sweep-runs/results.csv` and `results.md`
+as a 24-cell ledger containing status, final full-shard validation loss, W&B
+URL, and public Hugging Face URL.
+
 W&B metrics are logged online. After full-shard validation,
 `scripts/sync_publish_fast_05b.py` records the final loss in the W&B summary
 and publishes each final checkpoint, launch manifest, and evaluation report
