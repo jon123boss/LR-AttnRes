@@ -23,12 +23,12 @@ option, or legacy fallback stops the run.
 ## Scheduling and recovery
 
 The owner reported ranks 1024 and 64 complete for all three block counts. The
-public model inventory also confirms n=4/r=32, n=8/r=32, n=16/r=32, and
-n=8/r=128 checkpoints; these are recorded and skipped. A separate worker is
-covering lower ranks, so this machine runs 768, 512, 256, and the remaining
-128 cells first, in that order. Within each rank it runs n=16, n=8, then n=4.
-The lower-rank queue is added only after re-auditing W&B to avoid duplicate
-training.
+public model inventory also contains legacy-backend n=4/r=32, n=8/r=32,
+n=16/r=32, and n=8/r=128 checkpoints. Those remain visible as reference
+results but do not qualify as completed Fast-AttnRes cells. A separate worker
+is covering lower ranks, so this machine runs 768, 512, 256, and 128 first, in
+that order. Within each rank it runs n=16, n=8, then n=4. The lower-rank queue
+is added only after re-auditing W&B to avoid duplicate training.
 
 The default controller invocation runs only the high-priority queue. After
 that finishes, re-run the W&B audit and start the remaining lower cells with

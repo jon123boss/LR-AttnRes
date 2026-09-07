@@ -114,6 +114,14 @@ def write_results_ledger(state: dict) -> None:
     atomic_write_text(RUNS_DIR / "results.md", "\n".join(markdown) + "\n")
 
 
+def migrate_legacy_observations(state: dict) -> None:
+    """Keep legacy checkpoints visible without counting them as Fast results."""
+    for job in state.get("jobs", {}).values():
+        if job.get("status") == "observed_complete" and job.get("backend") == "legacy":
+            job["status"] = "observed_legacy_result"
+            job["qualifies_fast_sweep"] = False
+
+
 def checkpoint_from_job(job: dict) -> Path:
     checkpoint = Path(job["checkpoint"])
     if not checkpoint.is_file():
@@ -239,6 +247,8 @@ def main() -> int:
         return 0
     with STATE_PATH.open(encoding="utf-8") as source:
         state = json.load(source)
+    migrate_legacy_observations(state)
+    atomic_write_json(STATE_PATH, state)
     write_results_ledger(state)
     for name, job in state["jobs"].items():
         if job.get("status") not in {"complete_pending_sync_and_upload", "sync_failed"}:
@@ -249,6 +259,8 @@ def main() -> int:
             job["wandb_url"] = update_wandb(run_dir, wandb_api, entity, job, result)
             job["huggingface_url"] = publish_hf(hf, run_dir, name, job, result)
             job["status"] = "complete"
+            job["backend"] = result["provenance"]["fast_attnres"]["resolved_backend"]
+            job["qualifies_fast_sweep"] = True
             job["published_at_utc"] = utc_now()
         except Exception as error:
             job["status"] = "sync_failed"

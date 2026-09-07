@@ -65,7 +65,7 @@ OWNER_REPORTED_RESULTS = {
     (8, 64): (2.948, "https://huggingface.co/Jonnester/LR-AttnRes-tail-r64-n8"),
     (16, 64): (2.9494, "https://huggingface.co/Jonnester/LR-AttnRes-tail-r64-n16"),
 }
-PUBLIC_COMPLETED = {
+PUBLIC_LEGACY_RESULTS = {
     (4, 32): {
         "validation_loss": 2.957,
         "huggingface_url": "https://huggingface.co/Jonnester/LR-AttnRes-sliced-05b-n4-r32",
@@ -114,7 +114,12 @@ def atomic_write_json(path: Path, payload: dict) -> None:
 def load_state() -> dict:
     if STATE_PATH.exists():
         with STATE_PATH.open(encoding="utf-8") as source:
-            return json.load(source)
+            state = json.load(source)
+        for job in state.get("jobs", {}).values():
+            if job.get("status") == "observed_complete" and job.get("backend") == "legacy":
+                job["status"] = "observed_legacy_result"
+                job["qualifies_fast_sweep"] = False
+        return state
     state = {
         "schema_version": 1,
         "created_at_utc": utc_now(),
@@ -133,11 +138,12 @@ def load_state() -> dict:
             "validation_loss": validation_loss,
             "huggingface_url": huggingface_url,
         }
-    for (n_blocks, rank), result in PUBLIC_COMPLETED.items():
+    for (n_blocks, rank), result in PUBLIC_LEGACY_RESULTS.items():
         state["jobs"][job_name(n_blocks, rank)] = {
             "n": n_blocks,
             "rank": rank,
-            "status": "observed_complete",
+            "status": "observed_legacy_result",
+            "qualifies_fast_sweep": False,
             **result,
         }
     return state
@@ -415,6 +421,8 @@ def run_job(state: dict, n_blocks: int, rank: int, max_retries: int) -> None:
     job_state.update(
         {
             "status": "complete_pending_sync_and_upload",
+            "backend": "fast-attnres",
+            "qualifies_fast_sweep": True,
             "validation_loss": loss,
             "completed_at_utc": utc_now(),
             "evaluation": str(results_path.with_suffix(".json")),
