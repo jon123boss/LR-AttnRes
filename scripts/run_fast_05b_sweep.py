@@ -218,6 +218,94 @@ def preflight() -> dict:
     }
 
 
+def _wandb_cell(run) -> tuple[int | None, int | None]:
+    config = dict(run.config or {})
+    try:
+        n_blocks = int(config.get("attnres_num_blocks"))
+        rank = int(config.get("lrid_rank"))
+    except (TypeError, ValueError):
+        return None, None
+    if not config.get("use_lrid") or config.get("attnres_type") != "block":
+        return None, None
+    if not config.get("lrid_key_from_output_tail"):
+        return None, None
+    if config.get("attnres_block_average") is not False:
+        return None, None
+    if config.get("attnres_block_count_prior") is not False:
+        return None, None
+    if config.get("lrid_use_logit_scale") is not False:
+        return None, None
+    return n_blocks, rank
+
+
+def _wandb_fast_qualified(run) -> bool:
+    config = dict(run.config or {})
+    return (
+        config.get("attnres_backend") == "fast"
+        and config.get("torch_compile_max_autotune") is False
+        and config.get("torch_compile_fullgraph") is True
+        and config.get("torch_compile_dynamic") is False
+    )
+
+
+def reconcile_external_lower_runs(state: dict) -> None:
+    """Defer lower cells occupied by another worker and record finished Fast runs."""
+    import wandb
+
+    api = wandb.Api(timeout=120)
+    entity = api.default_entity
+    if not entity:
+        raise RuntimeError("W&B has no default entity; cannot guard the lower-rank queue.")
+    by_cell: dict[tuple[int, int], list] = {}
+    for run in api.runs(f"{entity}/LR-AttnRes", order="-created_at", per_page=100):
+        cell = _wandb_cell(run)
+        if cell in LOWER_RANK_JOBS:
+            by_cell.setdefault(cell, []).append(run)
+
+    external_statuses = {"deferred_external_running", "external_fast_finished_pending_import"}
+    for n_blocks, rank in LOWER_RANK_JOBS:
+        name = job_name(n_blocks, rank)
+        job = state["jobs"].setdefault(name, {"n": n_blocks, "rank": rank})
+        if job.get("status") in {"complete", "observed_complete"}:
+            continue
+        runs = by_cell.get((n_blocks, rank), [])
+        finished_fast = next(
+            (
+                run
+                for run in runs
+                if run.state == "finished"
+                and _wandb_fast_qualified(run)
+                and int(dict(run.summary or {}).get("tokens_processed", 0)) >= 9_999_745_024
+            ),
+            None,
+        )
+        live = next((run for run in runs if run.state in {"running", "pending"}), None)
+        if finished_fast is not None:
+            job.update(
+                {
+                    "status": "external_fast_finished_pending_import",
+                    "external_wandb_url": finished_fast.url,
+                    "external_wandb_run_id": finished_fast.id,
+                    "external_backend": dict(finished_fast.config or {}).get("attnres_backend"),
+                }
+            )
+        elif live is not None:
+            job.update(
+                {
+                    "status": "deferred_external_running",
+                    "external_wandb_url": live.url,
+                    "external_wandb_run_id": live.id,
+                    "external_backend": dict(live.config or {}).get("attnres_backend"),
+                }
+            )
+        elif job.get("status") in external_statuses:
+            job["status"] = "pending"
+            job.pop("external_wandb_url", None)
+            job.pop("external_wandb_run_id", None)
+            job.pop("external_backend", None)
+    state["lower_rank_wandb_audited_at_utc"] = utc_now()
+
+
 def command_for(n_blocks: int, rank: int, run_dir: Path, resume: bool) -> list[str]:
     command = [
         str(PYTHON),
@@ -459,6 +547,8 @@ def main() -> int:
         state = load_state()
         state["runtime"] = preflight()
         state["compile_mode"] = "fullgraph-static-no-cudagraphs"
+        if args.include_lower:
+            reconcile_external_lower_runs(state)
         save_state(state)
         publish_pending()
         state = load_state()
@@ -477,6 +567,8 @@ def main() -> int:
                 "complete_pending_sync_and_upload",
                 "complete",
                 "observed_complete",
+                "deferred_external_running",
+                "external_fast_finished_pending_import",
             }:
                 continue
             run_job(state, n_blocks, rank, args.max_retries)
@@ -487,9 +579,19 @@ def main() -> int:
                 save_state(state)
         publish_pending()
         state = load_state()
-        state["controller_status"] = (
-            "full_queue_complete" if args.include_lower else "high_rank_queue_complete"
+        waiting_external = any(
+            job.get("status") in {
+                "deferred_external_running",
+                "external_fast_finished_pending_import",
+            }
+            for job in state["jobs"].values()
         )
+        if args.include_lower and waiting_external:
+            state["controller_status"] = "lower_queue_waiting_external_runs"
+        else:
+            state["controller_status"] = (
+                "full_queue_complete" if args.include_lower else "high_rank_queue_complete"
+            )
         save_state(state)
     return 0
 

@@ -33,7 +33,10 @@ is added only after re-auditing W&B to avoid duplicate training.
 The default controller invocation runs only the high-priority queue. After
 that finishes, re-run the W&B audit and start the remaining lower cells with
 `scripts/run_fast_05b_sweep.py --include-lower`; already completed cells in
-the state ledger remain skipped.
+the state ledger remain skipped. The lower-stage startup also queries W&B and
+defers any cell with another live run. A finished external run is held for
+checkpoint, full-validation, and public-model import rather than being counted
+complete from periodic W&B loss alone.
 
 `scripts/run_fast_05b_sweep.py` resumes the newest checkpoint automatically,
 keeps the newest checkpoint to bound disk usage, evaluates the entire
