@@ -47,7 +47,9 @@ REFERENCE_WANDB_RUN = (
 )
 
 # Rank 1024 and rank 64 were reported complete by the owner.  Higher unfinished
-# ranks go first to avoid the separate worker covering the lower ranks.
+# ranks go first to avoid the separate worker covering the lower ranks. Existing
+# legacy results are also terminal because the owner confirmed the model math is
+# equivalent and does not need to be rerun with the faster execution kernel.
 HIGH_PRIORITY_JOBS = tuple(
     (n_blocks, rank)
     for rank in (768, 512, 256, 128)
@@ -615,6 +617,7 @@ def main() -> int:
                 "complete_pending_sync_and_upload",
                 "complete",
                 "observed_complete",
+                "observed_legacy_result",
                 "deferred_external_running",
                 "external_fast_finished_pending_import",
             }:
