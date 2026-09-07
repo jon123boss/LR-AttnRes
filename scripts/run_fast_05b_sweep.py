@@ -598,11 +598,18 @@ def main() -> int:
             selected_jobs += LOWER_RANK_JOBS
         if args.only:
             selected_jobs = tuple((n, r) for n, r in ALL_JOBS if job_name(n, r) == args.only)
+        lower_rank_reconciled = False
         for n_blocks, rank in selected_jobs:
             if STOP_PATH.exists():
                 state["controller_status"] = "stopped_by_sentinel"
                 save_state(state)
                 return 0
+            if args.include_lower and (n_blocks, rank) in LOWER_RANK_JOBS and not lower_rank_reconciled:
+                # The high-priority queue may take days. Recheck W&B at the
+                # actual handoff so work started meanwhile is not duplicated.
+                reconcile_external_lower_runs(state)
+                save_state(state)
+                lower_rank_reconciled = True
             name = job_name(n_blocks, rank)
             if state["jobs"].get(name, {}).get("status") in {
                 "complete_pending_sync_and_upload",
