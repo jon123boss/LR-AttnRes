@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -19,6 +20,7 @@ import wandb
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS_DIR = Path("/root/sweep-runs")
+CACHE_DIR = Path("/root/sweep-cache")
 STATE_PATH = RUNS_DIR / "sweep_state.json"
 NAMESPACE = "Jonnester"
 PROJECT = "LR-AttnRes"
@@ -137,10 +139,30 @@ def load_evaluation(job: dict) -> tuple[dict, dict]:
     return evaluation, result
 
 
+def load_runtime_qualification(run_dir: Path) -> dict:
+    path = run_dir / "runtime_qualification.json"
+    if not path.is_file():
+        return {}
+    with path.open(encoding="utf-8") as source:
+        return json.load(source)
+
+
 def write_model_card(run_dir: Path, name: str, job: dict, result: dict) -> Path:
     validation = result["validation_loss"]
     provenance = result["provenance"]
     fast = provenance["fast_attnres"]
+    qualification = load_runtime_qualification(run_dir)
+    benchmark_lines = []
+    if qualification:
+        benchmark_lines = [
+            f"- Steady median throughput: `{qualification['steady_median_tokens_per_second']:.2f}` tokens/s",
+            (
+                "- Controlled Fast routed-read speedup over exact compiled legacy: "
+                f"`{qualification['fast_read_speedup_over_exact_legacy']:.3f}x`"
+            ),
+            f"- Compiled model graphs: `{qualification['model_forward_graph_count']}` forward, "
+            f"`{qualification['model_backward_graph_count']}` backward",
+        ]
     card = run_dir / "README.md"
     card.write_text(
         "\n".join(
@@ -159,6 +181,7 @@ def write_model_card(run_dir: Path, name: str, job: dict, result: dict) -> Path:
                 f"- Fast-AttnRes version: `{fast['version']}`",
                 f"- Checkpoint SHA256: `{provenance['checkpoint_sha256']}`",
                 "- Compile mode: `fullgraph=True`, `dynamic=False`, CUDA graphs disabled",
+                *benchmark_lines,
                 f"- W&B run: {job['wandb_url']}",
                 f"- Reference recipe: {REFERENCE_WANDB_RUN}",
                 "",
@@ -206,6 +229,20 @@ def update_wandb(
     run.summary["compile/fullgraph"] = True
     run.summary["compile/dynamic"] = False
     run.summary["compile/max_autotune"] = False
+    qualification = load_runtime_qualification(run_dir)
+    if qualification:
+        run.summary["sweep/runtime_qualified"] = True
+        run.summary["sweep/fast_active_reads"] = int(qualification["fast_active_reads"])
+        run.summary["sweep/legacy_fallback_reads"] = int(qualification["legacy_fallback_reads"])
+        run.summary["sweep/static_cu_seqlens_size"] = int(qualification["static_cu_seqlens_size"])
+        run.summary["sweep/model_forward_graph_count"] = int(qualification["model_forward_graph_count"])
+        run.summary["sweep/model_backward_graph_count"] = int(qualification["model_backward_graph_count"])
+        run.summary["sweep/steady_median_tokens_per_second"] = float(
+            qualification["steady_median_tokens_per_second"]
+        )
+        run.summary["sweep/fast_read_speedup_over_exact_legacy"] = float(
+            qualification["fast_read_speedup_over_exact_legacy"]
+        )
     run.summary.update()
     return run.url
 
@@ -220,6 +257,13 @@ def publish_hf(hf: HfApi, run_dir: Path, name: str, job: dict, result: dict) -> 
         (Path(job["evaluation"]), "evaluation.json"),
         (card, "README.md"),
     ]
+    qualification_path = run_dir / "runtime_qualification.json"
+    if qualification_path.is_file():
+        uploads.append((qualification_path, "runtime_qualification.json"))
+        qualification = load_runtime_qualification(run_dir)
+        benchmark_path = Path(qualification.get("benchmark_local_path", ""))
+        if benchmark_path.is_file():
+            uploads.append((benchmark_path, "fast_vs_legacy_read_benchmark.json"))
     for local_path, remote_path in uploads:
         hf.upload_file(
             path_or_fileobj=str(local_path),
@@ -230,7 +274,30 @@ def publish_hf(hf: HfApi, run_dir: Path, name: str, job: dict, result: dict) -> 
     model = hf.model_info(repo_id=repo_id)
     if model.private:
         raise RuntimeError(f"Published repository is unexpectedly private: {repo_id}")
+    expected_files = {remote_path for _, remote_path in uploads}
+    remote_files = set(hf.list_repo_files(repo_id=repo_id, repo_type="model"))
+    missing_files = sorted(expected_files - remote_files)
+    if missing_files:
+        raise RuntimeError(f"Published repository is missing files: {missing_files}")
     return f"https://huggingface.co/{repo_id}"
+
+
+def cleanup_published_local_artifacts(name: str, job: dict) -> dict:
+    """Reclaim bounded local storage after the public copy is verified."""
+    checkpoint = checkpoint_from_job(job)
+    checkpoint_size = checkpoint.stat().st_size
+    checkpoint.unlink()
+    cache_dir = CACHE_DIR / name
+    cache_size = 0
+    if cache_dir.is_dir():
+        cache_size = sum(path.stat().st_size for path in cache_dir.rglob("*") if path.is_file())
+        shutil.rmtree(cache_dir)
+    return {
+        "local_checkpoint_deleted_at_utc": utc_now(),
+        "local_checkpoint_deleted_path": str(checkpoint),
+        "local_checkpoint_deleted_bytes": checkpoint_size,
+        "local_compile_cache_deleted_bytes": cache_size,
+    }
 
 
 def main() -> int:
@@ -260,6 +327,8 @@ def main() -> int:
             job["huggingface_url"] = publish_hf(hf, run_dir, name, job, result)
             job["status"] = "complete"
             job["backend"] = result["provenance"]["fast_attnres"]["resolved_backend"]
+            job["checkpoint_sha256"] = result["provenance"]["checkpoint_sha256"]
+            job["checkpoint_remote_file"] = "final_model.pt"
             job["qualifies_fast_sweep"] = True
             job["published_at_utc"] = utc_now()
         except Exception as error:
@@ -268,6 +337,16 @@ def main() -> int:
             atomic_write_json(STATE_PATH, state)
             write_results_ledger(state)
             raise
+        atomic_write_json(STATE_PATH, state)
+        write_results_ledger(state)
+        try:
+            job.update(cleanup_published_local_artifacts(name, job))
+            job.pop("checkpoint", None)
+            job.pop("local_cleanup_error", None)
+        except Exception as error:
+            # Upload completion is authoritative even if local reclamation
+            # fails. Preserve the public result and retry cleanup manually.
+            job["local_cleanup_error"] = f"{type(error).__name__}: {error}"
         atomic_write_json(STATE_PATH, state)
         write_results_ledger(state)
     write_results_ledger(state)
