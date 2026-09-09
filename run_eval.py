@@ -711,6 +711,7 @@ def _evaluation_source_sha256():
     source_root = os.path.dirname(os.path.abspath(__file__))
     source_files = (
         "attnres_ops.py",
+        "checkpoint_config.py",
         "fast_attnres.py",
         "criterion.py",
         "dataloader.py",

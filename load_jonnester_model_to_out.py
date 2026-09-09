@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import argparse
 import os
 import re
 import shutil
 import sys
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +32,7 @@ HfApi = huggingface_hub.HfApi
 hf_hub_download = huggingface_hub.hf_hub_download
 
 from model import ModelConfig, OBPM
+from checkpoint_config import model_config_from_checkpoint
 
 
 DEFAULT_REPO_ID = "Jonnester/LR-AttnRes-n16"
@@ -108,14 +111,8 @@ def resolve_checkpoint_path(
     return path, filename
 
 
-def normalize_model_args(model_args):
-    if isinstance(model_args, dict):
-        return asdict(ModelConfig(**model_args))
-    if isinstance(model_args, ModelConfig):
-        return asdict(model_args)
-    if is_dataclass(model_args):
-        return asdict(model_args)
-    raise TypeError(f"Unsupported checkpoint model_args type: {type(model_args)!r}")
+def normalize_model_args(model_args, training_config=None):
+    return asdict(model_config_from_checkpoint(model_args, training_config))
 
 
 def strip_compiled_prefix(state_dict: dict) -> dict:
@@ -158,7 +155,7 @@ def load_and_save_checkpoint(args):
             "This script saves LR-AttnRes training checkpoints, not generic HF models."
         )
 
-    model_args = normalize_model_args(checkpoint.get("model_args", {}))
+    model_args = normalize_model_args(checkpoint["model_args"], checkpoint.get("config"))
     model_config = ModelConfig(**model_args)
     state_dict = strip_compiled_prefix(checkpoint["model"])
 

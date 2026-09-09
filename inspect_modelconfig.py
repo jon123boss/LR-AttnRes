@@ -31,7 +31,7 @@ def require_package(import_name, package_name=None):
 torch = require_package("torch")
 snapshot_download = require_package("huggingface_hub").snapshot_download
 
-from model import ModelConfig
+from checkpoint_config import model_config_from_checkpoint
 
 
 REPO_ID = "Jonnester/LR-AttnRes-n16"
@@ -70,7 +70,7 @@ def main():
     pprint.pp(model_args)
 
     print("\n=== reconstructed ModelConfig ===")
-    model_config = ModelConfig(**model_args) if isinstance(model_args, dict) else model_args
+    model_config = model_config_from_checkpoint(model_args, checkpoint.get("config"))
     pprint.pp(asdict(model_config) if is_dataclass(model_config) else model_config)
 
     print("\n=== raw training config, if present ===")

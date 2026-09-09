@@ -57,6 +57,7 @@ from tqdm import tqdm
 
 from dataloader import DataLoaderConfig, create_validation_dataloader, warmup_boundaries
 from model import OBPM, ModelConfig, norm
+from checkpoint_config import model_config_from_checkpoint
 from utils import get_device
 
 
@@ -253,13 +254,9 @@ def load_model_from_checkpoint(
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    model_args = checkpoint.get("model_args", {})
-    if isinstance(model_args, ModelConfig):
-        model_config = model_args
-    elif isinstance(model_args, dict):
-        model_config = ModelConfig(**model_args)
-    else:
-        raise RuntimeError(f"Unsupported model_args type in checkpoint: {type(model_args)!r}")
+    model_config = model_config_from_checkpoint(
+        checkpoint["model_args"], checkpoint.get("config")
+    )
 
     train_config = dict(checkpoint.get("config", {}))
     state_dict = checkpoint["model"]

@@ -7,6 +7,7 @@ import random
 import tempfile
 import numpy as np
 from model import OBPM, ModelConfig
+from checkpoint_config import model_config_from_checkpoint
 from dataloader import (
     DataLoaderConfig,
     create_dataloaders,
@@ -293,16 +294,9 @@ def load_model_checkpoint(ckpt_path, device, verbose=True, load_training_state=T
     if "model_args" not in checkpoint or "model" not in checkpoint:
         raise KeyError("Checkpoint must contain both 'model_args' and 'model'.")
 
-    checkpoint_model_args = checkpoint["model_args"]
-    if isinstance(checkpoint_model_args, ModelConfig):
-        model_config = checkpoint_model_args
-    elif isinstance(checkpoint_model_args, dict):
-        model_config = ModelConfig(**checkpoint_model_args)
-    else:
-        raise TypeError(
-            "checkpoint['model_args'] must be a dict or ModelConfig, "
-            f"got {type(checkpoint_model_args)!r}"
-        )
+    model_config = model_config_from_checkpoint(
+        checkpoint["model_args"], checkpoint.get("config")
+    )
 
     model = OBPM(model_config)
     model_state_dict = checkpoint["model"]

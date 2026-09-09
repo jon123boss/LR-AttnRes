@@ -241,6 +241,19 @@ New checkpoints also guard the PyTorch/CUDA/device/criterion runtime and every
 Attention-Residual kernel-selection environment variable. Bitwise trajectory
 claims still require the same deterministic hardware and software environment.
 
+Checkpoint loading preserves an explicitly saved `attnres_block_count_prior`.
+If it is missing from `model_args`, the loader uses the saved training config's
+value, or `False` when both omit it, matching checkpoints trained before the
+count prior existed. Evaluation, training resume, analysis, inspection and
+HF import/resave share this migration; new-training defaults are unchanged.
+Imported/resaved models record the resolved value explicitly. Copies already
+resaved by older code with an injected `True` must be checked against their
+original checkpoint metadata, since they look like intentionally prior-trained
+models. Rerun affected checkpoint-based evaluations after updating; original
+in-training validation is unaffected by this loading bug. A continuation trained
+after an incorrect load must restart from its last unaffected checkpoint to
+recover the intended recipe.
+
 ## LR AttnRes
 
 LR AttnRes can be enabled as a block Attention Residuals variant:
