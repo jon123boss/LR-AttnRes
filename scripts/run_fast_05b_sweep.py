@@ -285,6 +285,30 @@ def _wandb_fast_qualified(run) -> bool:
     )
 
 
+def _wandb_public_result(run) -> tuple[float, str, int, int] | None:
+    """Return a finished run's published full-validation result, if present."""
+    if run.state != "finished":
+        return None
+    summary = dict(run.summary or {})
+    if int(summary.get("tokens_processed", 0)) < 9_999_745_024:
+        return None
+    for namespace in ("full_validation", "final_validation"):
+        loss = summary.get(f"{namespace}/loss")
+        tokens = int(summary.get(f"{namespace}/tokens", 0))
+        batches = int(summary.get(f"{namespace}/batches", 0))
+        huggingface_url = summary.get(f"{namespace}/huggingface_url")
+        if (
+            loss is not None
+            and np.isfinite(float(loss))
+            and tokens > 0
+            and batches > 0
+            and isinstance(huggingface_url, str)
+            and huggingface_url.startswith("https://huggingface.co/")
+        ):
+            return float(loss), huggingface_url, tokens, batches
+    return None
+
+
 def reconcile_external_lower_runs(state: dict) -> None:
     """Defer lower cells occupied by another worker and record finished Fast runs."""
     import wandb
@@ -303,9 +327,18 @@ def reconcile_external_lower_runs(state: dict) -> None:
     for n_blocks, rank in LOWER_RANK_JOBS:
         name = job_name(n_blocks, rank)
         job = state["jobs"].setdefault(name, {"n": n_blocks, "rank": rank})
-        if job.get("status") in {"complete", "observed_complete"}:
+        if job.get("status") in {
+            "complete",
+            "observed_complete",
+            "observed_legacy_result",
+            "observed_external_result",
+        }:
             continue
         runs = by_cell.get((n_blocks, rank), [])
+        finished_public = next(
+            (run for run in runs if _wandb_public_result(run) is not None),
+            None,
+        )
         finished_fast = next(
             (
                 run
@@ -317,7 +350,30 @@ def reconcile_external_lower_runs(state: dict) -> None:
             None,
         )
         live = next((run for run in runs if run.state in {"running", "pending"}), None)
-        if finished_fast is not None:
+        if finished_public is not None:
+            loss, huggingface_url, validation_tokens, validation_batches = _wandb_public_result(
+                finished_public
+            )
+            config = dict(finished_public.config or {})
+            job.update(
+                {
+                    "status": "observed_external_result",
+                    "validation_loss": loss,
+                    "validation_tokens": validation_tokens,
+                    "validation_batches": validation_batches,
+                    "huggingface_url": huggingface_url,
+                    "wandb_url": finished_public.url,
+                    "wandb_run_id": finished_public.id,
+                    "backend": config.get("attnres_backend"),
+                    "qualifies_fast_sweep": _wandb_fast_qualified(finished_public),
+                    "observed_compile": {
+                        "max_autotune": config.get("torch_compile_max_autotune"),
+                        "fullgraph": config.get("torch_compile_fullgraph"),
+                        "dynamic": config.get("torch_compile_dynamic"),
+                    },
+                }
+            )
+        elif finished_fast is not None:
             job.update(
                 {
                     "status": "external_fast_finished_pending_import",
@@ -618,6 +674,7 @@ def main() -> int:
                 "complete",
                 "observed_complete",
                 "observed_legacy_result",
+                "observed_external_result",
                 "deferred_external_running",
                 "external_fast_finished_pending_import",
             }:
