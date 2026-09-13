@@ -63,7 +63,7 @@ class CrossEntropyLoss(nn.Module):
             labels,
             label_smoothing=0.0,
             logit_scale=1.0,
-            lse_square_scale=z_loss_weight,
+            lse_square_scale=z_loss_weight if compute_z_loss else 0.0,
             inplace_backward=self.config.inplace_backward,
             process_group=None,
             ignore_index=self.config.ignore_index,
@@ -105,8 +105,8 @@ class CrossEntropyLoss(nn.Module):
                 mask=mask,
             )
 
-            if self.config.z_loss:
-                return loss + z_loss
+            # FlashAttention already includes the regularizer in loss;
+            # its second return value is a detached logging value.
             return loss
 
         return self._standard_ce(logits, labels, mask)
@@ -130,10 +130,8 @@ class CrossEntropyLoss(nn.Module):
                 process_group=None,
                 ignore_index=self.config.ignore_index,
             )
-            loss = loss.sum()
-            if self.config.z_loss:
-                loss = loss + z_loss.sum()
-            return loss
+            # The upstream loss already contains any requested regularizer.
+            return loss.sum()
 
         loss = F.cross_entropy(
             logits,
