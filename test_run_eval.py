@@ -229,7 +229,7 @@ class EvaluationProtocolTests(unittest.TestCase):
                 }
             },
             "n-samples": {"piqa": {"original": 1838, "effective": 1}},
-            "n-shot": {"piqa": 5},
+            "n-shot": {"piqa": 0},
             "versions": {"piqa": 1.0},
         }
         with mock.patch.object(run_eval, "TaskManager", return_value=fake_manager), mock.patch.object(
@@ -243,6 +243,8 @@ class EvaluationProtocolTests(unittest.TestCase):
         self.assertEqual(output["primary_metrics"]["piqa"]["value"], 1.0)
         self.assertEqual(output["protocol"]["completed_tasks"], ["piqa"])
         self.assertEqual(output["protocol"]["limit"], 1)
+        self.assertEqual(output["protocol"]["num_fewshot_override"], 0)
+        self.assertEqual(evaluate.call_args.kwargs["num_fewshot"], 0)
         self.assertEqual(evaluate.call_args.kwargs["fewshot_random_seed"], 1234)
 
     def test_mmlu_group_aggregate_is_preserved_and_reported(self):

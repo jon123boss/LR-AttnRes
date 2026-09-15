@@ -182,9 +182,9 @@ torchrun --standalone --nproc_per_node=2 train.py --init_from resume --ckpt_file
 save the unwrapped model state on rank 0. A normal eval run is single-process:
 
 The downstream suite uses `lm-evaluation-harness` task definitions with a
-5-shot override. It is not the official OLMES protocol (which uses its own
+zero-shot override. It is not the official OLMES protocol (which uses its own
 curated prompts, scoring variants, and aggregation), so label reported numbers
-as generic lm-eval 5-shot results rather than OLMES results.
+as generic lm-eval zero-shot results rather than OLMES results.
 
 ```bash
 python run_eval.py --ckpts out/ckpt_step:1000.pt

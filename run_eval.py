@@ -81,11 +81,11 @@ from utils import (
     unwrap_model,
 )
 
-DEFAULT_NUM_FEWSHOT = 5
+DEFAULT_NUM_FEWSHOT = 0
 DEFAULT_CKPT_DIR = "out"
 CHECKPOINT_PATTERN = "ckpt_step:*.pt"
 DATASET_SCRIPT_ERROR = "Dataset scripts are no longer supported"
-EVAL_PROTOCOL_VERSION = "lr-attnres-lm-eval-5shot-v1"
+EVAL_PROTOCOL_VERSION = "lr-attnres-lm-eval-0shot-v1"
 EVAL_SEEDS = {
     "random_seed": 0,
     "numpy_random_seed": 1234,
