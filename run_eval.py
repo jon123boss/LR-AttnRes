@@ -102,7 +102,6 @@ DEFAULT_TASKS = [
     "openbookqa",
     "piqa",
     "social_iqa",
-    "winogrande",
 ]
 
 # One declared paper-facing metric per task. Several harness tasks emit both
