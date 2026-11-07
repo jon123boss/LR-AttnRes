@@ -5,6 +5,12 @@ git clone https://github.com/jon123boss/LR-AttnRes
 cd LR-AttnRes
 ```
 
+## Residual comparison baselines
+
+The trainer also supports Qwen Gated Residuals, Hy4 iHC and mHC through
+`--residual_type gated|ihc|mhc`. See [RESIDUAL_BASELINES.md](RESIDUAL_BASELINES.md)
+for initialization, matched-backbone controls, optional training kernels and checks.
+
 ## Prerequisites
 
 Install required dependencies via pip:

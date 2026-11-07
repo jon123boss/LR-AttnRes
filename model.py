@@ -77,6 +77,12 @@ class ModelConfig:
     flash_attention: bool = False
     init_std: float = 0.02
     init_cutoff_factor: float = None
+    residual_type: str = "standard"
+    residual_num_streams: int = 4
+    gated_residual_rank: int = None
+    gated_residual_norm_backend: str = "torch"
+    mhc_sinkhorn_iters: int = 20
+    mhc_sinkhorn_backend: str = "torch"
     attnres_type: str = None
     use_attnres: bool = False
     use_fused_attnres: bool = False
@@ -123,6 +129,29 @@ class ModelConfig:
     attnres_backend: str = "legacy"
 
     def __post_init__(self):
+        if self.residual_type not in {"standard", "gated", "ihc", "mhc"}:
+            raise ValueError("residual_type must be one of: standard, gated, ihc, mhc")
+        if self.gated_residual_norm_backend not in {"torch", "fla"}:
+            raise ValueError("gated_residual_norm_backend must be one of: torch, fla")
+        if self.gated_residual_norm_backend == "fla" and self.residual_type != "gated":
+            raise ValueError("The FLA normalization backend requires residual_type='gated'")
+        if self.mhc_sinkhorn_backend not in {"torch", "tile"}:
+            raise ValueError("mhc_sinkhorn_backend must be one of: torch, tile")
+        if self.mhc_sinkhorn_backend == "tile" and self.residual_type != "mhc":
+            raise ValueError("The tile Sinkhorn backend requires residual_type='mhc'")
+        if self.residual_type != "standard":
+            if self.use_attnres or self.use_lrid or self.use_fused_attnres:
+                raise ValueError("Residual baselines cannot be combined with AttnRes or LRID")
+            if self.norm_pos != "before":
+                raise ValueError("Residual baselines require norm_pos='before'")
+            if self.residual_num_streams < 1:
+                raise ValueError("residual_num_streams must be >= 1")
+            if self.gated_residual_rank is not None and self.gated_residual_rank < 1:
+                raise ValueError("gated_residual_rank must be >= 1")
+            if self.mhc_sinkhorn_iters < 1:
+                raise ValueError("mhc_sinkhorn_iters must be >= 1")
+            if self.mhc_sinkhorn_backend == "tile" and self.residual_num_streams != 4:
+                raise ValueError("The tile Sinkhorn backend requires residual_num_streams=4")
         requested_attnres_backend = str(self.attnres_backend or "legacy").lower()
         if requested_attnres_backend not in {"auto", "legacy", "fast"}:
             raise ValueError("attnres_backend must be one of: auto, legacy, fast")
@@ -843,23 +872,57 @@ class OBPM(nn.Module):
             for module in self.modules():
                 if isinstance(module, LRIDFusedProjection):
                     self._init_lrid_dynamic_query_projection(module, config.init_std, config.init_cutoff_factor)
+        # Construct controllers after the backbone so a matched seed gives the
+        # same embedding, attention, MLP and LM-head initialization as PreNorm.
+        if config.residual_type != "standard":
+            if config.residual_type == "gated":
+                from residual_gated import GatedResidual, GatedResidualHead
+                connection, head = GatedResidual, GatedResidualHead
+                options = {
+                    "rank": config.gated_residual_rank,
+                    "norm_backend": config.gated_residual_norm_backend,
+                }
+            elif config.residual_type == "ihc":
+                from residual_ihc import IHCConnection, IHCHead
+                connection, head = IHCConnection, IHCHead
+                options = {}
+            else:
+                from residual_mhc import MHCConnection, MHCHead
+                connection, head = MHCConnection, MHCHead
+                options = {
+                    "sinkhorn_iters": config.mhc_sinkhorn_iters,
+                    "sinkhorn_backend": config.mhc_sinkhorn_backend,
+                }
+            self.transformer["residual_connections"] = nn.ModuleList([
+                connection(config.n_embd, config.residual_num_streams, **options)
+                for _ in range(2 * config.n_layer)
+            ])
+            self.transformer["residual_head"] = head(
+                config.n_embd, config.residual_num_streams,
+                **(options if config.residual_type == "gated" else {}),
+            )
         self._fast_attnres_op = None
         # Fast-AttnRes v2 is CUDA/BF16-only. Construction happens on CPU, so
         # the production route is armed only after the caller moves the full
         # model to its final CUDA/BF16 runtime and calls require_fast_attnres().
         self._fast_attnres_enabled = False
     def to_mixed_precision(self, dtype=torch.bfloat16):
-        # These learned block exponents intentionally remain fp32. Preserve
-        # their exact values instead of casting fp32 -> bf16 -> fp32 along with
-        # the rest of the module, which would silently perturb checkpoints on
-        # resume/evaluation.
+        # Keep block exponents, iHC/mHC controllers and GR norm gains in FP32.
+        # Save before casting so BF16 round trips do not perturb checkpoints.
         preserved_fp32 = {}
         for name in ("attnres_block_alphas", "attnres_block_betas"):
             if hasattr(self.transformer, name):
                 preserved_fp32[name] = getattr(self.transformer, name).detach().clone()
+        if self.config.residual_type != "standard":
+            preserved_fp32.update({
+                name: param.detach().clone()
+                for name, param in self.transformer.named_parameters()
+                if name.startswith(("residual_connections.", "residual_head."))
+                and (self.config.residual_type != "gated" or name.endswith("norm_weight"))
+            })
         self.to(dtype=dtype)
         for name, value in preserved_fp32.items():
-            param = getattr(self.transformer, name)
+            param = self.transformer.get_parameter(name)
             param.data = value.to(device=param.device, dtype=torch.float32)
         return self
     
@@ -2812,6 +2875,33 @@ class OBPM(nn.Module):
     def get_lm_head_bias(self):
         return None
 
+    def _forward_residual_baseline(
+        self, x, past_kv, use_cache, cu_doc_len, max_doc_len, return_hidden,
+    ):
+        state = x.unsqueeze(-2).expand(*x.shape[:-1], self.config.residual_num_streams, x.shape[-1])
+        normalized = self.config.residual_type == "gated"
+        new_kv = [] if use_cache else None
+        for index, block in enumerate(self.transformer.layers):
+            attention = self.transformer.residual_connections[2 * index]
+            mlp = self.transformer.residual_connections[2 * index + 1]
+            x, context = attention.read(state)
+            output = block.forward_attention(
+                x, past_kv=None if past_kv is None else past_kv[index],
+                use_cache=use_cache, cu_doc_len=cu_doc_len, max_doc_len=max_doc_len,
+                x_is_normalized=normalized,
+            )
+            if use_cache:
+                output, present = output
+                new_kv.append(present)
+            state = attention.write(state, output, context)
+            x, context = mlp.read(state)
+            state = mlp.write(state, block.forward_mlp(x, x_is_normalized=normalized), context)
+        x = self.transformer.residual_head(state)
+        if not normalized:
+            x = norm(x)
+        output = x if return_hidden else F.linear(x, self.get_lm_head_weight())
+        return (output, new_kv) if use_cache else output
+
     def forward(
         self,
         idx,
@@ -2825,6 +2915,10 @@ class OBPM(nn.Module):
         assert T <= self.config.block_size, f"Token length {T} exceeds max sequence length {self.config.block_size}"
         
         x = self.transformer.wte(idx)
+        if self.config.residual_type != "standard":
+            return self._forward_residual_baseline(
+                x, past_kv, use_cache, cu_doc_len, max_doc_len, return_hidden,
+            )
         fused_read_norm = (
             self.use_attnres
             and self.config.use_fused_attnres

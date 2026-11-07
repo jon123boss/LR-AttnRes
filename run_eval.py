@@ -405,6 +405,16 @@ class OBPMWrapper(LM):
         )
         self.checkpoint_config = checkpoint.get("config", {})
         self.attnres_backend = config.attnres_backend
+        self.residual_config = {
+            field: getattr(config, field) for field in (
+                "residual_type", "residual_num_streams", "gated_residual_rank",
+                "gated_residual_norm_backend", "mhc_sinkhorn_iters", "mhc_sinkhorn_backend",
+            )
+        }
+        if self.torch_compile and (
+            config.gated_residual_norm_backend == "fla" or config.mhc_sinkhorn_backend == "tile"
+        ):
+            raise ValueError("The pinned FLA/TileKernels residual wrappers require eager evaluation; disable torch_compile and max-autotune")
         self.checkpoint_step = checkpoint.get("step")
         self.checkpoint_tokens_processed = checkpoint.get("tokens_processed")
 
@@ -715,6 +725,9 @@ def _evaluation_source_sha256():
         "criterion.py",
         "dataloader.py",
         "model.py",
+        "residual_gated.py",
+        "residual_ihc.py",
+        "residual_mhc.py",
         "run_eval.py",
         "tokenizer_utils.py",
         "utils.py",
@@ -768,11 +781,15 @@ def _attach_provenance(
             "datasets": _package_version("datasets"),
             "tiktoken": _package_version("tiktoken"),
             "fast-attnres": _package_version("fast-attnres"),
+            "flash-linear-attention": _package_version("flash-linear-attention"),
+            "tile-kernels": _package_version("tile-kernels"),
+            "tilelang": _package_version("tilelang"),
         },
         "device": str(lm_obj._device),
         "cuda_available": torch.cuda.is_available(),
         "attnres_kernel_environment": capture_attnres_kernel_environment(),
         "attnres_backend": lm_obj.attnres_backend,
+        "residual": lm_obj.residual_config,
         "torch_compile": {
             "enabled": lm_obj.torch_compile,
             "mode": lm_obj.torch_compile_mode,

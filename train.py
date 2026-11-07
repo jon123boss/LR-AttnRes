@@ -198,6 +198,12 @@ flash_attention = True
 attnres_backend = "auto"
 init_std = 0.02
 init_cutoff_factor = None
+residual_type = "standard"
+residual_num_streams = 4
+gated_residual_rank = None
+gated_residual_norm_backend = "torch"
+mhc_sinkhorn_iters = 20
+mhc_sinkhorn_backend = "torch"
 # Attention Residuals
 use_attnres = False
 use_fused_attnres = False
@@ -545,6 +551,12 @@ def parse_args():
         default=doc_mask_static_max_seqlen,
         help="Use this fixed FlashAttention maximum document length; 0 uses the batch maximum.",
     )
+    parser.add_argument("--residual_type", choices=("standard", "gated", "ihc", "mhc"), default=None)
+    parser.add_argument("--residual_num_streams", type=int, default=None)
+    parser.add_argument("--gated_residual_rank", type=int, default=gated_residual_rank)
+    parser.add_argument("--gated_residual_norm_backend", choices=("torch", "fla"), default=None)
+    parser.add_argument("--mhc_sinkhorn_iters", type=int, default=None)
+    parser.add_argument("--mhc_sinkhorn_backend", choices=("torch", "tile"), default=None)
     parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--use_fused_attnres", type=_str_to_bool, nargs="?", const=True, default=use_fused_attnres)
@@ -665,6 +677,12 @@ full_run_eval_torch_max_autotune = args.full_run_eval_torch_max_autotune
 use_doc_masking = args.use_doc_masking
 doc_mask_cu_seqlens_size = args.doc_mask_cu_seqlens_size
 doc_mask_static_max_seqlen = args.doc_mask_static_max_seqlen
+residual_type = args.residual_type or residual_type
+residual_num_streams = args.residual_num_streams if args.residual_num_streams is not None else residual_num_streams
+gated_residual_rank = args.gated_residual_rank
+gated_residual_norm_backend = args.gated_residual_norm_backend or gated_residual_norm_backend
+mhc_sinkhorn_iters = args.mhc_sinkhorn_iters if args.mhc_sinkhorn_iters is not None else mhc_sinkhorn_iters
+mhc_sinkhorn_backend = args.mhc_sinkhorn_backend or mhc_sinkhorn_backend
 use_attnres = args.use_attnres
 use_fused_attnres = args.use_fused_attnres
 attnres_backend = args.attnres_backend or "auto"
@@ -763,6 +781,22 @@ interactive_after_train = interactive_after_train and master_process
 
 config = get_config(sys.modules[__name__].__dict__)
 start_step, checkpoint, model, model_config = get_model(config, device)
+for field in (
+    "residual_type", "residual_num_streams", "gated_residual_rank",
+    "gated_residual_norm_backend", "mhc_sinkhorn_iters", "mhc_sinkhorn_backend",
+):
+    requested = getattr(args, field)
+    if requested is not None and requested != getattr(model_config, field):
+        raise ValueError(f"Requested {field} differs from the checkpoint architecture")
+    config[field] = getattr(model_config, field)
+if torch_compile and (
+    model_config.mhc_sinkhorn_backend == "tile"
+    or model_config.gated_residual_norm_backend == "fla"
+):
+    raise ValueError(
+        "The pinned FLA/TileKernels wrappers require eager training; "
+        "use --no-torch_compile --no-torch_compile_max_autotune."
+    )
 attnres_backend = model_config.attnres_backend
 config["attnres_backend"] = model_config.attnres_backend
 if checkpoint is not None:

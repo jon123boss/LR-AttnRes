@@ -38,7 +38,7 @@ def configure_optimizers(model, config: OptimizerConfig):
         for name, p in core_model.transformer.named_parameters():
             if name.startswith("wte."):
                 continue
-            if name.startswith("lrid_queries."):
+            if name.startswith(("lrid_queries.", "residual_connections.", "residual_head.")):
                 adamw_params.append(p)
                 continue
             if p.ndim >= 2:
