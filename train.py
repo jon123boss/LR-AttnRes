@@ -466,6 +466,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train OBPM.")
     parser.add_argument("--out_dir", type=str, default=out_dir)
     parser.add_argument("--dataset_dir", type=str, default=dataset_dir)
+    parser.add_argument("--batch_size", type=int, default=batch_size)
+    parser.add_argument("--grad_accum_steps", type=int, default=grad_accum_steps)
     parser.add_argument("--ckpt_interval", type=int, default=ckpt_interval)
     parser.add_argument(
         "--max_local_checkpoints",
@@ -651,6 +653,10 @@ def parse_args():
 args = parse_args()
 out_dir = args.out_dir
 dataset_dir = args.dataset_dir
+batch_size = args.batch_size
+grad_accum_steps = args.grad_accum_steps
+if batch_size < 1 or grad_accum_steps < 1:
+    raise ValueError("batch_size and grad_accum_steps must be >= 1")
 ckpt_interval = args.ckpt_interval
 max_local_checkpoints = args.max_local_checkpoints
 eval_only = args.eval_only
